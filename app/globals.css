@@ -1,0 +1,319 @@
+@import "tailwindcss";
+
+/*
+ * pumpfun-launchpad design system — ported from v4-launchpad
+ * (which was itself a port of the flap-launchpad system):
+ * exactly two colors (ink #101010 / paper #F2EFE7), square corners,
+ * hard zero-blur shadows, uppercase Courier New for all labels.
+ * Minimalist text: no images, no gradients, no rounded corners.
+ */
+
+@theme {
+  --color-ink: #101010;
+  --color-paper: #f2efe7;
+  --font-sans: Arial, Helvetica, sans-serif;
+  --font-mono: "Courier New", Courier, monospace;
+}
+
+html,
+body {
+  background: var(--color-paper);
+  color: var(--color-ink);
+  font-family: var(--font-sans);
+}
+
+::selection {
+  background: var(--color-ink);
+  color: var(--color-paper);
+}
+
+/* ---- label: the mechanical voice ---- */
+.label-mono {
+  font-family: var(--font-mono);
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  font-weight: 700;
+  font-size: 11px;
+  line-height: 1.2;
+}
+
+/* ---- buttons: ink plate, paper face, hard 3px shadow ---- */
+.btn-brutal {
+  font-family: var(--font-mono);
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  font-weight: 700;
+  font-size: 12px;
+  line-height: 1.2;
+  background: var(--color-ink);
+  color: var(--color-paper);
+  border: 2px solid var(--color-ink);
+  border-radius: 0;
+  padding: 8px 12px;
+  box-shadow: 0 3px 0 var(--color-ink);
+  cursor: pointer;
+  transition: none;
+  white-space: nowrap;
+}
+.btn-brutal:hover:not(:disabled) {
+  background: var(--color-paper);
+  color: var(--color-ink);
+}
+.btn-brutal:active:not(:disabled) {
+  transform: translate(2px, 2px);
+  box-shadow: 0 1px 0 var(--color-ink);
+}
+.btn-brutal:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+/* done acknowledgment: inverted for 1.5s */
+.btn-brutal-done {
+  background: var(--color-paper) !important;
+  color: var(--color-ink) !important;
+}
+/* inverted face variant (secondary / collapse toggles) */
+.btn-brutal-invert {
+  background: var(--color-paper);
+  color: var(--color-ink);
+}
+.btn-brutal-invert:hover:not(:disabled) {
+  background: var(--color-ink);
+  color: var(--color-paper);
+}
+/* pressed variant for toggle groups */
+.btn-brutal-pressed {
+  background: var(--color-paper);
+  color: var(--color-ink);
+  box-shadow: 0 1px 0 var(--color-ink);
+  transform: translate(2px, 2px);
+}
+
+/* ---- inputs: paper wells, 2px ink frame ---- */
+.input-brutal {
+  width: 100%;
+  background: var(--color-paper);
+  border: 2px solid var(--color-ink);
+  border-radius: 0;
+  padding: 8px 10px;
+  font-size: 14px;
+  font-family: var(--font-sans);
+  color: var(--color-ink);
+}
+.input-brutal:focus {
+  outline: none;
+  background: #fffdf6; /* one-step lighter paper, still a paper tone */
+}
+.input-brutal::placeholder {
+  font-family: var(--font-mono);
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  font-size: 11px;
+  opacity: 0.5;
+}
+.input-brutal:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+/* ---- cards: paper plates, 2px frame, 4px shadow ---- */
+.card-brutal {
+  background: var(--color-paper);
+  border: 2px solid var(--color-ink);
+  border-radius: 0;
+  box-shadow: 0 4px 0 var(--color-ink);
+}
+/* the one card allowed to differ: full inversion */
+.card-brutal-inverted {
+  background: var(--color-ink);
+  color: var(--color-paper);
+  border: 2px solid var(--color-paper);
+  border-radius: 0;
+  box-shadow: 0 4px 0 var(--color-ink);
+}
+.card-head {
+  border-bottom: 2px solid var(--color-ink);
+  padding: 10px 12px;
+}
+.card-brutal-inverted .card-head {
+  border-bottom-color: var(--color-paper);
+}
+.card-body {
+  padding: 14px;
+}
+.card-foot {
+  border-top: 2px solid var(--color-ink);
+  padding: 8px 14px 12px;
+}
+.card-brutal-inverted .card-foot {
+  border-top-color: var(--color-paper);
+}
+
+/* ---- masthead: the largest plate, 3px frame, 6px shadow ---- */
+.masthead {
+  border: 3px solid var(--color-ink);
+  border-radius: 0;
+  box-shadow: 0 6px 0 var(--color-ink);
+  background: var(--color-paper);
+}
+.statusbar {
+  background: var(--color-ink);
+  color: var(--color-paper);
+  font-family: var(--font-mono);
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  font-size: 12px;
+  font-weight: 700;
+  padding: 8px 14px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 18px;
+  align-items: center;
+}
+
+/* ---- checkboxes: brutalist squares (roster tables) ---- */
+.checkbox-brutal {
+  appearance: none;
+  -webkit-appearance: none;
+  width: 16px;
+  height: 16px;
+  border: 2px solid var(--color-ink);
+  border-radius: 0;
+  background: var(--color-paper);
+  cursor: pointer;
+  display: inline-block;
+  vertical-align: middle;
+  position: relative;
+  flex-shrink: 0;
+}
+.checkbox-brutal:checked {
+  background: var(--color-ink);
+}
+.checkbox-brutal:checked::after {
+  content: "";
+  position: absolute;
+  left: 3px;
+  top: 0;
+  width: 6px;
+  height: 10px;
+  border: solid var(--color-paper);
+  border-width: 0 2px 2px 0;
+  transform: rotate(45deg);
+}
+/* inverted face for checkboxes sitting on ink rows (table headers) */
+.checkbox-brutal-invert {
+  border-color: var(--color-paper);
+  background: var(--color-ink);
+}
+.checkbox-brutal-invert:checked {
+  background: var(--color-paper);
+}
+.checkbox-brutal-invert:checked::after {
+  border-color: var(--color-ink);
+}
+
+/* ---- stat rows: label/value pairs on one line ---- */
+.stat-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  align-items: baseline;
+  padding: 3px 0;
+  border-bottom: 1px dashed rgba(16, 16, 16, 0.25);
+}
+.stat-row:last-child {
+  border-bottom: none;
+}
+.stat-label {
+  font-family: var(--font-mono);
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  font-size: 10px;
+  font-weight: 700;
+  opacity: 0.7;
+}
+.stat-value {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  font-weight: 700;
+  text-align: right;
+  word-break: break-all;
+}
+
+/* ---- tabs: radio tabs-lift (daisyUI tabs-lift pattern, brutalized) ----
+   Structure: a <label class="tab"> wrapping an <input type="radio"
+   class="sr-only">, immediately followed by its <div class="tab-content">.
+   All radios share one name, so exactly one is checked; the panel shown is
+   the checked tab's adjacent sibling (.tab:has(input:checked) + .tab-content).
+   order: 1 keeps every tab on the first flex line; order: 2 pushes every
+   panel onto a full-width row beneath the tab bar. The checked tab's ink
+   face hangs 2px lower (margin-bottom: -2px) and covers the panel's top
+   border for the lifted, connected look. */
+.tabs-lift {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+}
+.tabs-lift > .tab {
+  order: 1;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  cursor: pointer;
+  font-family: var(--font-mono);
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  font-weight: 700;
+  font-size: 11px;
+  line-height: 1.2;
+  color: var(--color-ink);
+  background: transparent;
+  border: 2px solid var(--color-ink);
+  border-bottom: none;
+  padding: 6px 12px 8px;
+}
+.tabs-lift > .tab:not(:first-child) {
+  margin-left: -2px; /* collapse adjacent 2px borders to a single line */
+}
+.tabs-lift > .tab:hover:not(:has(input:checked)) {
+  background: rgba(16, 16, 16, 0.08);
+}
+.tabs-lift > .tab:has(input:checked) {
+  background: var(--color-ink);
+  color: var(--color-paper);
+  z-index: 1;
+  margin-bottom: -2px; /* ink face overlaps the panel's top border */
+}
+.tabs-lift > .tab:has(input:focus-visible) {
+  outline: 2px dashed var(--color-ink);
+  outline-offset: 2px;
+}
+.tabs-lift > .tab-content {
+  order: 2;
+  display: none;
+  width: 100%;
+  border: 2px solid var(--color-ink);
+  padding: 10px;
+  background: var(--color-paper);
+}
+.tabs-lift > .tab:has(input:checked) + .tab-content {
+  display: block;
+}
+
+/* ---- managed-wallet roster rows: subtle dark tint on hover ---- */
+.roster-row:hover {
+  background: rgba(16, 16, 16, 0.06);
+}
+
+/* ---- toast notifications: timer bar shrinks over the 3s display window ---- */
+@keyframes toast-timer {
+  from {
+    width: 100%;
+  }
+  to {
+    width: 0%;
+  }
+}
+.toast-timer {
+  animation: toast-timer 3s linear forwards;
+}

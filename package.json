@@ -1,0 +1,38 @@
+{
+  "name": "pumpfun-launchpad",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "lint": "eslint"
+  },
+  "dependencies": {
+    "@coral-xyz/anchor": "^0.31.1",
+    "@metaplex-foundation/mpl-token-metadata": "^3.4.0",
+    "@solana/spl-token": "^0.4.15",
+    "@solana/web3.js": "^1.98.4",
+    "bs58": "^6.0.0",
+    "jito-js-rpc": "^0.2.2",
+    "next": "16.3.1",
+    "react": "19.2.8",
+    "react-dom": "19.2.8",
+    "@pump-fun/pump-swap-sdk": "^1.19.0"
+  },
+  "devDependencies": {
+    "@tailwindcss/postcss": "^4",
+    "@types/chai": "^4.3.20",
+    "@types/mocha": "^10.0.10",
+    "@types/node": "^20",
+    "@types/react": "^19",
+    "@types/react-dom": "^19",
+    "chai": "^4.5.0",
+    "eslint": "^9",
+    "eslint-config-next": "16.3.1",
+    "mocha": "^11.8.0",
+    "tailwindcss": "^4",
+    "ts-mocha": "^11.1.0",
+    "typescript": "^5"
+  }
+}

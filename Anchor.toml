@@ -1,0 +1,74 @@
+[workspace]
+members = ["programs/pumpfun"]
+
+[toolchain]
+
+[programs.mainnet]
+pumpfun = "BTE4vdMyUSbvgyyutBWYJsrhxj8XtCHQPjMk4Sfin3xu"
+
+[programs.devnet]
+pumpfun = "BTE4vdMyUSbvgyyutBWYJsrhxj8XtCHQPjMk4Sfin3xu"
+
+[programs.localnet]
+pumpfun = "BTE4vdMyUSbvgyyutBWYJsrhxj8XtCHQPjMk4Sfin3xu"
+
+[provider]
+cluster = "localnet"
+wallet = "~/.config/solana/devnet.json"
+
+[test]
+startup_wait = 60000
+
+[scripts]
+test = "./node_modules/.bin/ts-mocha -p ./tsconfig.test.json -t 1000000 \"tests/**/*.ts\""
+
+[hooks]
+
+# The local validator does not bundle SPL Token-2022 or the Metaplex metadata
+# program; clone them from mainnet so the CPI calls have real programs to hit.
+#
+# PumpSwap (pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA) is mainnet-only and its
+# programdata is exactly 10,485,760 bytes (the max account size), which
+# solana-test-validator's --clone cannot fetch; it is injected from dumped
+# account files instead (tests/fixtures). The programdata JSON has the
+# deployment-slot field (u64 LE at offset 4) patched to 0: the byte-for-byte
+# mainnet copy would carry mainnet's slot (~433M), which the local validator
+# would treat as a not-yet-effective program and reject every load
+# (ProgramCacheHitMaxLimit). global_config is the AMM's own data account and
+# must exist for createPool to deserialize it.
+[test.validator]
+url = "https://api.mainnet-beta.solana.com"
+
+[[test.validator.clone]]
+address = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
+
+[[test.validator.clone]]
+address = "metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s"
+
+[[test.validator.account]]
+address = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA"
+filename = "tests/fixtures/pump_amm_program.json"
+
+[[test.validator.account]]
+address = "6naEzKeUuFh1Jeeu51NXQgr5qkXgXtc9WKNct4xynVJc"
+filename = "tests/fixtures/pump_amm_programdata.json"
+
+[[test.validator.account]]
+address = "ADyA8hdefvWN2dbGGWFotbzWxrAvLW83WG6QCVXvJKqw"
+filename = "tests/fixtures/pump_amm_global_config.json"
+
+# The PumpSwap SELL path (M6) also reads the AMM fee-config account (owned by
+# the fee program) and CPIs into the fee program itself; both must be present
+# for a post-migration sell to simulate. Dumped from mainnet; the programdata
+# deployment-slot fields are patched to 0 like the pump_amm fixtures.
+[[test.validator.account]]
+address = "pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ6VojVZ"
+filename = "tests/fixtures/pump_fee_program.json"
+
+[[test.validator.account]]
+address = "75Uu23mqWBb8LM8vDppqC1mQAnCcBuLXhVaDezVMQLRw"
+filename = "tests/fixtures/pump_fee_programdata.json"
+
+[[test.validator.account]]
+address = "5PHirr8joyTMp9JMm6nW7hNDVyEYdkzDqazxPD7RaTjx"
+filename = "tests/fixtures/pump_amm_fee_config.json"
