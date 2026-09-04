@@ -34,12 +34,22 @@ export default function Board() {
     roster.setTrackedMint(mint);
   };
 
+  // The mint the Launch card's Sell All button sweeps: the Trade panel's
+  // tracked mint when it is a valid base58 pubkey (a launch pre-fills it),
+  // else null (button disabled).
+  const trimmedToken = tradeToken.trim();
+  const sellMint = isValidPubkey(trimmedToken) ? trimmedToken : null;
+
   return (
     <main className="mx-auto w-full px-7 py-7">
       <Masthead />
 
       <div className="mt-6 flex flex-col lg:flex-row gap-6">
-        <LaunchPanel roster={roster} onLaunched={handleLaunched} />
+        <LaunchPanel
+          roster={roster}
+          onLaunched={handleLaunched}
+          mint={sellMint}
+        />
         <TradePanel
           api={roster}
           tokenAddr={tradeToken}

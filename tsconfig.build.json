@@ -16,5 +16,5 @@
     "incremental": false,
     "noEmit": false
   },
-  "include": ["lib/bundle/**/*.ts", "lib/params.ts", "lib/migrate.ts", "lib/auto.ts", "lib/sell-all.ts"]
+  "include": ["lib/bundle/**/*.ts", "lib/params.ts", "lib/migrate.ts", "lib/auto.ts", "lib/sell-all.ts", "lib/metadata.ts", "lib/metadata-publish.ts"]
 }

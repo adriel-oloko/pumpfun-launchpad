@@ -20,8 +20,10 @@
 //         ported to Solana (recursive round timers, shared round lock,
 //         balance-gated random picks, MIN SOL / MIN % gates, roster flash,
 //         countdown, graduation guard).
-//       * SELL ALL tab (replaces v4's Remove LP / Withdraw): sells every
-//         managed wallet's full token balance (Milestone M6, lib/sell-all.ts).
+//       * (Sell All moved OUT of the tab strip 2026-09-04: the M6 engine is
+//         now a single button below the Launch button in the Launch card —
+//         it sells every keyed managed wallet's full balance of THIS mint,
+//         lib/sell-all.ts.)
 //       * DISTRIBUTE tab (M8C, 2026-09-03): SOL ops over the CHECKED
 //         wallets. Disperse funds them from the HUB (the FIRST roster
 //         wallet) in one tx; Withdraw sweeps the checked KEYED wallets to
@@ -65,22 +67,12 @@ import {
 } from "../lib/disperse";
 import { shortAddress } from "../lib/format";
 import { PUMPFUN_IDL, PUMPFUN_PROGRAM_ID } from "../lib/idl";
-import { isValidPubkey, pubkeyFromSecretKey } from "../lib/managed-wallets";
-import { DECIMALS, DUST_SOL_LAMPORTS } from "../lib/params";
-import {
-  formatSolLamports,
-  sellAllManagedWallets,
-  type SellAllReport,
-  type SellOutcome,
-  type SellAllProgram,
-} from "../lib/sell-all";
+import { isValidPubkey } from "../lib/managed-wallets";
+import { DUST_SOL_LAMPORTS } from "../lib/params";
+import { formatSolLamports } from "../lib/sell-all";
 import { Roster, type RosterApi } from "./roster";
 import { useToasts } from "./toast-stack";
 import { Btn, Card, ExplorerLink, Field, Input, StatusLine } from "./ui";
-
-function fmtTokens(raw: bigint): string {
-  return `${(Number(raw) / 10 ** DECIMALS).toFixed(4)}`;
-}
 
 export function TradePanel({
   api,
@@ -110,91 +102,10 @@ export function TradePanel({
   const [autoSellWallets, setAutoSellWallets] = useState("1");
   const [autoSellDuration, setAutoSellDuration] = useState("25");
 
-  // M6 SELL ALL state: the engine (lib/sell-all.ts) sells every keyed
-  // managed wallet's full balance concurrently and reports the final
-  // completed count + per-wallet SOL received + the holder count after.
+  // pushToast serves the manual Buy/Sell + Auto + Distribute tabs. (The M6
+  // Sell All action moved to the Launch card, below the Launch button,
+  // 2026-09-04: it lives in launch-panel.tsx with the report views.)
   const { pushToast } = useToasts();
-  const [sellBusy, setSellBusy] = useState(false);
-  const [sellError, setSellError] = useState<string | null>(null);
-  const [sellReport, setSellReport] = useState<SellAllReport | null>(null);
-  const keyedCount = api.wallets.filter((w) => w.key).length;
-
-  const handleSellAll = async () => {
-    if (sellBusy) return;
-    if (!mint) {
-      setSellError("ENTER A VALID TOKEN MINT ABOVE TO SELL ALL");
-      return;
-    }
-    if (keyedCount === 0) {
-      setSellError(
-        "NO KEYED MANAGED WALLETS TO SELL (IMPORT BASE58 SECRETS IN THE ROSTER FIRST)"
-      );
-      return;
-    }
-    setSellBusy(true);
-    setSellError(null);
-    setSellReport(null);
-    const sigs: string[] = [];
-    try {
-      const connection = makeDevnetConnection();
-      const firstKey = api.wallets.find((w) => w.key)?.key;
-      const anyPub = firstKey ? pubkeyFromSecretKey(firstKey) : null;
-      if (!anyPub) {
-        throw new Error("roster key is not a valid base58 64-byte secret");
-      }
-      // The engine signs every sell with the roster Keypairs; the Program is
-      // only used to encode instructions + fetch accounts, so a minimal
-      // provider suffices (anchor Wallet is Node-only in the browser).
-      const providerPubkey = new PublicKey(anyPub);
-      const provider = {
-        connection,
-        publicKey: providerPubkey,
-        wallet: { publicKey: providerPubkey },
-      } as Provider;
-      const program = new Program(PUMPFUN_IDL, provider) as unknown as SellAllProgram;
-
-      const report = await sellAllManagedWallets({
-        connection,
-        program,
-        mint: new PublicKey(mint),
-        wallets: api.wallets,
-        slippagePct: 5,
-      });
-      setSellReport(report);
-      api.refreshBalances();
-      for (const o of report.outcomes) {
-        if (o.signature) sigs.push(o.signature);
-      }
-      if (report.sold > 0) {
-        pushToast({
-          action: "SELL ALL",
-          amount: `${report.sold} WALLETS SOLD`,
-          txHash: sigs[0],
-        });
-      } else if (report.failed > 0) {
-        pushToast({
-          action: "SELL ALL",
-          amount: "0 SOLD",
-          tone: "error",
-        });
-      } else {
-        pushToast({ action: "SELL ALL", amount: "0 SOLD (ALL SKIPPED)" });
-      }
-    } catch (e) {
-      const raw = e instanceof Error ? e.message : String(e);
-      // M7a: rate-limit / expired blockhash / insufficient-funds / rent map
-      // to actionable text instead of a raw RPC dump in the error line.
-      const msg = friendlyTxError(raw);
-      setSellError(msg);
-      pushToast({
-        action: "SELL ALL FAILED",
-        amount: "TX REVERTED",
-        tone: "error",
-      });
-    } finally {
-      setSellBusy(false);
-    }
-  };
 
   const inputCls = "font-mono text-[12px]";
 
@@ -340,8 +251,8 @@ export function TradePanel({
 
   // The manual engine needs the curve's creator for the buy instruction and
   // must stop when the curve is missing or already graduated (curve buy/sell
-  // revert after graduation; post-graduation PumpSwap trading is the SELL
-  // ALL tab's job, not the manual tab's).
+  // revert after graduation; post-graduation PumpSwap trading is the Sell
+  // All button's job in the Launch card, not the manual tab's).
   const runManualTrade = async (side: "buy" | "sell") => {
     if (manualBusyRef.current) return;
     if (!mint) {
@@ -372,7 +283,7 @@ export function TradePanel({
       }
       if (read.curve.graduated) {
         throw new Error(
-          "CURVE GRADUATED: USE THE SELL ALL TAB (MANUAL BUY/SELL TRADES THE CURVE)"
+          "CURVE GRADUATED: USE THE SELL ALL BUTTON BELOW LAUNCH (MANUAL BUY/SELL TRADES THE CURVE)"
         );
       }
       const result =
@@ -1308,67 +1219,6 @@ export function TradePanel({
                 </div>
               </div>
 
-              {/* ---- Sell All ---- */}
-              <label role="tab" aria-label="Sell All" className="tab">
-                <input
-                  type="radio"
-                  name="managed-tabs"
-                  className="sr-only"
-                />
-                <svg
-                  viewBox="0 0 24 24"
-                  fill="none"
-                  stroke="currentColor"
-                  strokeWidth="2.5"
-                  strokeLinecap="square"
-                  className="h-3.5 w-3.5"
-                  aria-hidden="true">
-                  <path d="M7 17 17 7" />
-                  <path d="M7 7h10v10" />
-                </svg>
-                Sell All
-              </label>
-              <div role="tabpanel" className="tab-content">
-                {/* Sell All (M6): sells EVERY keyed managed wallet's full
-                balance of the mint above, routed by curve state (curve sell
-                while open; PumpSwap swap + WSOL unwrap after graduation).
-                Unlike the manual Buy/Sell tab, this ignores the checkbox
-                selection and sweeps every keyed wallet. */}
-                <div className="flex flex-col gap-2">
-                  
-                  <div className="mt-1 flex flex-col gap-1.5 border-t-2 border-ink pt-2">
-                    <Btn
-                      onClick={() => void handleSellAll()}
-                      disabled={sellBusy || !mint || keyedCount === 0}
-                      className="flex-1 shadow-none!">
-                      {sellBusy ? "Selling..." : "Sell All"}
-                    </Btn>
-                    {!mint ? (
-                      <StatusLine
-                        text="ENTER THE TOKEN MINT ABOVE TO SELL ALL"
-                        tone="idle"
-                      />
-                    ) : null}
-                    {mint && keyedCount === 0 ? (
-                      <StatusLine
-                        text="NO KEYED WALLETS. IMPORT BASE58 SECRETS IN THE ROSTER FIRST"
-                        tone="idle"
-                      />
-                    ) : null}
-                    {sellError ? (
-                      <StatusLine text={`SELL ALL FAILED: ${sellError}`} tone="error" />
-                    ) : null}
-                    {sellBusy ? (
-                      <StatusLine
-                        text="SELLING EVERY KEYED WALLET'S FULL BALANCE (CONCURRENT)..."
-                        tone="idle"
-                      />
-                    ) : null}
-                    {sellReport ? <SellAllReportView report={sellReport} /> : null}
-                  </div>
-                </div>
-              </div>
-
               {/* ---- Distribute (M8C): disperse / withdraw / delete ---- */}
               <label role="tab" aria-label="Distribute" className="tab">
                 <input
@@ -1600,61 +1450,6 @@ export function TradePanel({
         ) : null}
       </div>
     </Card>
-  );
-}
-
-/* ---------- M6 sell-all report (final count, per-wallet SOL, holders) ---------- */
-
-function SellAllReportView({ report }: { report: SellAllReport }) {
-  const routeLabel =
-    report.route === "curve"
-      ? `ROUTE: CURVE SELL (NOT GRADUATED) · creator ${shortAddress(report.creator, 6)}`
-      : `ROUTE: PUMSWAP SELL (GRADUATED) · pool ${shortAddress(report.poolKey ?? "", 6)}`;
-  return (
-    <div className="flex flex-col gap-1 border-2 border-ink px-2 py-1.5">
-      <p className="label-mono !text-[10px] font-bold break-all">{routeLabel}</p>
-      <p className="label-mono !text-[11px] font-bold">
-        SOLD {report.sold}/{report.total} · SKIPPED {report.skipped} · FAILED {report.failed}
-      </p>
-      <div className="flex flex-col gap-0.5">
-        {report.outcomes.map((o) => (
-          <SellOutcomeRow key={o.address} outcome={o} />
-        ))}
-      </div>
-      <p className="label-mono !text-[10px] border-t border-ink/40 pt-1">
-        HOLDERS AFTER:{" "}
-        {report.holderCountAfter === null
-          ? "READ FAILED (RATE-LIMITED); CHECK ROSTER TOKEN COLUMN"
-          : `${report.holderCountAfter}`}
-      </p>
-    </div>
-  );
-}
-
-function SellOutcomeRow({ outcome }: { outcome: SellOutcome }) {
-  const addr = shortAddress(outcome.address, 6);
-  let body;
-  if (outcome.status === "sold") {
-    body = (
-      <span>
-        SOLD {fmtTokens(outcome.tokenSold)} TOK →{" "}
-        {formatSolLamports(outcome.solReceivedLamports)}
-        {outcome.signature ? (
-          <span className="ml-1">
-            <ExplorerLink hash={outcome.signature} />
-          </span>
-        ) : null}
-      </span>
-    );
-  } else if (outcome.status === "skipped") {
-    body = <span>SKIPPED ({outcome.reason ?? "no key / zero balance"})</span>;
-  } else {
-    body = <span>FAILED ({outcome.reason ?? "error"})</span>;
-  }
-  return (
-    <p className="label-mono !text-[10px] break-all opacity-90">
-      {addr} {body}
-    </p>
   );
 }
 

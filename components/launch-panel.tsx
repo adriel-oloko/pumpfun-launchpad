@@ -24,17 +24,19 @@
 // buildLaunchSequence reports via migrationArgsSupported (never silently
 // dropped).
 //
-// METADATA URI / IMAGE (Arweave vs IPFS decision):
-// Production metadata JSON should be uploaded to a permanent store, either
-// Arweave (permanent, paid once) or IPFS (content-addressed, needs a pin),
-// and the resulting URI stored in the on-chain Metaplex metadata account.
-// An upload-service stub is deliberately NOT wired this milestone: devnet
-// verification works with any direct http(s) URI (the create() arg is a
-// plain <=200-byte string; the mpl account stores it verbatim and the
-// explorer renders the image field from that JSON). A future upload stub
-// replaces the direct entry with the Arweave/IPFS URL it produces. The
-// image itself lives INSIDE the metadata JSON (standard `image` field), so
-// this one field covers both image and metadata.
+// METADATA (M9: structured + publish-on-launch):
+// The single URI input is replaced by discrete description / image /
+// social fields. On launch the client posts the fields to the same-origin
+// /api/metadata/publish route, which uploads the composed pump.fun-style
+// JSON (and the image file when one was picked) to the configured backend
+// and returns the on-chain uri. Backend = VPS (preferred,
+// tools/metadata-vps/server.mjs) or IPFS via Pinata; server env, see
+// lib/metadata-publish.ts + .env.local.example. The image lives INSIDE the
+// JSON (standard `image` field), so the stored uri is just the
+// metadata.json URL. A "manual metadata uri" toggle in Advanced keeps the
+// old direct-URI flow (devnet quick launches / no backend configured). The
+// create() arg is still a plain <=200-byte string stored verbatim in the
+// mpl metadata account.
 //
 // M4-UI-MATCH: the layout now mirrors v4-launchpad's Launch card (Card +
 // Field + Input + Collapse primitives, "Launch" card head). The status log
@@ -62,6 +64,7 @@ import {
     withTimeout,
     type BuyAllocation,
 } from '../lib/bundle'
+import { publishTokenMetadata } from '../lib/metadata'
 import {
     JITO_DEVNET_ENDPOINT,
     JitoBundleClient,
@@ -80,7 +83,14 @@ import {
     type CreateMigrationCapability,
 } from '../lib/idl'
 import { pubkeyFromSecretKey } from '../lib/managed-wallets'
-import { DEFAULT_AUTO_MIGRATE, DEFAULT_LOCK_LP } from '../lib/params'
+import { DECIMALS, DEFAULT_AUTO_MIGRATE, DEFAULT_LOCK_LP } from '../lib/params'
+import {
+    formatSolLamports,
+    sellAllManagedWallets,
+    type SellAllProgram,
+    type SellAllReport,
+    type SellOutcome,
+} from '../lib/sell-all'
 import { useToasts } from './toast-stack'
 import {
     Btn,
@@ -102,14 +112,24 @@ function errMsg(e: unknown): string {
     return String(e)
 }
 
+/** Token amount formatter (trade panel's helper moved with Sell All): raw
+ *  base units -> a 4-decimal display string using the program's decimals. */
+function fmtTokens(raw: bigint): string {
+    return `${(Number(raw) / 10 ** DECIMALS).toFixed(4)}`
+}
+
 export function LaunchPanel({
     roster,
     onLaunched,
+    mint,
 }: {
     roster: RosterApi
     /** Called with the mint after a successful launch (pre-fills the trade
      *  panel's token-address input, mirroring v4's LAUNCH -> trade flow). */
     onLaunched?: (mint: string) => void
+    /** The mint the Trade panel tracks (a launch pre-fills it). Drives the
+     *  Sell All button below the Launch button; null disables it. */
+    mint?: string | null
 }) {
     const {
         key: creatorKey,
@@ -122,6 +142,16 @@ export function LaunchPanel({
     const [name, setName] = useState('M4 UI Launch')
     const [symbol, setSymbol] = useState('M4UI')
     const [uri, setUri] = useState('https://example.com/m4-ui-launch.json')
+    // M9 structured metadata: description / image / socials are
+    // auto-published to the configured backend on launch and the returned
+    // URL becomes the create() uri. manualMetadata keeps the old single-URI
+    // flow (devnet quick launches / no backend configured).
+    const [description, setDescription] = useState('')
+    const [imageFile, setImageFile] = useState<File | null>(null)
+    const [website, setWebsite] = useState('')
+    const [twitter, setTwitter] = useState('')
+    const [telegram, setTelegram] = useState('')
+    const [manualMetadata, setManualMetadata] = useState(false)
     const [advancedOpen, setAdvancedOpen] = useState(false)
     const [tier, setTier] = useState<'1' | '2'>('2')
     const [fundFromCreator, setFundFromCreator] = useState(true)
@@ -195,10 +225,6 @@ export function LaunchPanel({
                 throw new Error(
                     `symbol too long (${Buffer.byteLength(symbol, 'utf8')} > 10 bytes)`
                 )
-            if (Buffer.byteLength(uri, 'utf8') > 200)
-                throw new Error(
-                    `uri too long (${Buffer.byteLength(uri, 'utf8')} > 200 bytes)`
-                )
 
             if (selectedWallets.length === 0) {
                 throw new Error('select at least one dev wallet in the roster')
@@ -223,10 +249,58 @@ export function LaunchPanel({
                 })
             }
 
+            // M9 metadata: resolve the final on-chain uri BEFORE anything
+            // hits the chain. Auto mode publishes the structured fields
+            // (description / image / socials) to the configured backend (VPS
+            // preferred, IPFS via Pinata the alt) and uses the returned URL;
+            // manual mode keeps the raw URI field. The create() arg cap is
+            // checked on the RESOLVED uri (200 bytes, the program limit).
+            let finalUri: string
+            if (manualMetadata) {
+                finalUri = uri
+                if (!finalUri.trim()) {
+                    throw new Error(
+                        'manual metadata uri is empty: enter a URI or disable the manual toggle'
+                    )
+                }
+            } else {
+                log('metadata: publishing description / image / socials...')
+                try {
+                    const pub = await publishTokenMetadata({
+                        name,
+                        symbol,
+                        description,
+                        website,
+                        twitter,
+                        telegram,
+                        image: imageFile,
+                    })
+                    finalUri = pub.uri
+                    log(`metadata: published via ${pub.backend} -> ${finalUri}`)
+                    if (pub.imageUrl) log(`image   : ${pub.imageUrl}`)
+                } catch (e) {
+                    const msg = errMsg(e)
+                    if (msg.includes('METADATA BACKEND NOT CONFIGURED')) {
+                        log('NOTE: no metadata backend is configured on the server.')
+                        log('  - set METADATA_BACKEND=vps + METADATA_VPS_UPLOAD_URL /')
+                        log('    METADATA_VPS_BASE_URL / METADATA_VPS_SECRET (preferred,')
+                        log('    see tools/metadata-vps/server.mjs), OR')
+                        log('  - set METADATA_BACKEND=ipfs + PINATA_JWT, OR')
+                        log('  - enable "manual metadata uri" in Advanced for a')
+                        log('    devnet launch with no backend.')
+                    }
+                    throw e
+                }
+            }
+            if (Buffer.byteLength(finalUri, 'utf8') > 200)
+                throw new Error(
+                    `uri too long (${Buffer.byteLength(finalUri, 'utf8')} > 200 bytes)`
+                )
+
             log(`=== pumpfun launch (tier ${tier}) ===`)
             log(`creator : ${creator.publicKey.toBase58()}`)
             log(`name/sym: ${name} / ${symbol}`)
-            log(`uri     : ${uri}`)
+            log(`uri     : ${finalUri}`)
             for (const b of buys) {
                 log(
                     `  dev ${b.wallet.publicKey.toBase58().slice(0, 12)}... buys ${(Number(b.solInLamports) / LAMPORTS_PER_SOL).toFixed(4)} SOL`
@@ -294,7 +368,7 @@ export function LaunchPanel({
                 nonce,
                 name,
                 symbol,
-                uri,
+                uri: finalUri,
                 buys,
                 fundLamportsPerWallet,
                 // Tier 1 has no bundle tip, so the full 1222-byte budget is
@@ -546,6 +620,17 @@ export function LaunchPanel({
         } catch (e) {
             const rawMsg = errMsg(e)
             log(`LAUNCH FAILED: ${rawMsg}`)
+            if (rawMsg.includes('METADATA BACKEND NOT CONFIGURED')) {
+                log(
+                    'NOTE: metadata backend not configured. Enable "manual metadata'
+                )
+                log(
+                    '      uri" in Advanced (devnet) or set METADATA_BACKEND +'
+                )
+                log(
+                    '      METADATA_VPS_* / PINATA_JWT in the server env (mainnet).'
+                )
+            }
             if (e instanceof Error && e.stack) {
                 log(e.stack.split('\n').slice(0, 5).join('\n'))
             }
@@ -597,6 +682,105 @@ export function LaunchPanel({
         }
     }
 
+    // M6 SELL ALL (moved here from the trade card's tab strip 2026-09-04):
+    // one button below Launch sells EVERY keyed managed wallet's full token
+    // balance of the mint the Trade panel tracks (a launch pre-fills that
+    // field). Route on curve state: curve sell while open, PumpSwap pool
+    // sell after graduation (lib/sell-all.ts). Ignores the roster checkbox
+    // selection like the old tab did.
+    const [sellBusy, setSellBusy] = useState(false)
+    const [sellError, setSellError] = useState<string | null>(null)
+    const [sellReport, setSellReport] = useState<SellAllReport | null>(null)
+    const keyedCount = roster.wallets.filter((w) => w.key).length
+
+    const handleSellAll = async () => {
+        if (sellBusy) return
+        if (!mint) {
+            setSellError(
+                'ENTER THE TOKEN MINT IN THE TRADE PANEL TO SELL ALL (A LAUNCH PRE-FILLS IT)'
+            )
+            return
+        }
+        if (keyedCount === 0) {
+            setSellError(
+                'NO KEYED MANAGED WALLETS TO SELL (IMPORT BASE58 SECRETS IN THE ROSTER FIRST)'
+            )
+            return
+        }
+        setSellBusy(true)
+        setSellError(null)
+        setSellReport(null)
+        const sigs: string[] = []
+        try {
+            const connection = makeDevnetConnection()
+            const firstKey = roster.wallets.find((w) => w.key)?.key
+            const anyPub = firstKey ? pubkeyFromSecretKey(firstKey) : null
+            if (!anyPub) {
+                throw new Error(
+                    'roster key is not a valid base58 64-byte secret'
+                )
+            }
+            // The engine signs every sell with the roster Keypairs; the
+            // Program only encodes instructions + fetches accounts, so a
+            // minimal provider suffices (anchor Wallet is Node-only in the
+            // browser build).
+            const providerPubkey = new PublicKey(anyPub)
+            const provider = {
+                connection,
+                publicKey: providerPubkey,
+                wallet: { publicKey: providerPubkey },
+            } as Provider
+            const program = new Program(
+                PUMPFUN_IDL,
+                provider
+            ) as unknown as SellAllProgram
+
+            const report = await sellAllManagedWallets({
+                connection,
+                program,
+                mint: new PublicKey(mint),
+                wallets: roster.wallets,
+                slippagePct: 5,
+            })
+            setSellReport(report)
+            roster.refreshBalances()
+            for (const o of report.outcomes) {
+                if (o.signature) sigs.push(o.signature)
+            }
+            if (report.sold > 0) {
+                pushToast({
+                    action: 'SELL ALL',
+                    amount: `${report.sold} WALLETS SOLD`,
+                    txHash: sigs[0],
+                })
+            } else if (report.failed > 0) {
+                pushToast({
+                    action: 'SELL ALL',
+                    amount: '0 SOLD',
+                    tone: 'error',
+                })
+            } else {
+                pushToast({
+                    action: 'SELL ALL',
+                    amount: '0 SOLD (ALL SKIPPED)',
+                })
+            }
+        } catch (e) {
+            const raw = e instanceof Error ? e.message : String(e)
+            // M7a: rate-limit / expired blockhash / insufficient-funds / rent
+            // map to actionable text instead of a raw RPC dump.
+            const msg = friendlyTxError(raw)
+            setSellError(msg)
+            pushToast({
+                action: 'SELL ALL FAILED',
+                amount: 'TX REVERTED',
+                tone: 'error',
+            })
+        } finally {
+            setSellBusy(false)
+        }
+    }
+
     return (
         <Card
             head={
@@ -631,14 +815,101 @@ export function LaunchPanel({
                     onToggle={() => setAdvancedOpen((v) => !v)}
                     label="Advanced">
                     <div className="lg:col-span-4">
-                        <Field label="Metadata URI">
-                            <Input
-                                value={uri}
-                                onChange={(e) => setUri(e.target.value)}
-                                placeholder="https://.../metadata.json"
-                                spellCheck={false}
-                            />
-                        </Field>
+                        <div className="flex items-center justify-between gap-2">
+                            <span className="label-mono opacity-70">
+                                token metadata · auto-published on launch
+                            </span>
+                            <label className="label-mono flex items-center gap-2 cursor-pointer text-[11px] opacity-80">
+                                <input
+                                    type="checkbox"
+                                    className="checkbox-brutal"
+                                    checked={manualMetadata}
+                                    onChange={(e) =>
+                                        setManualMetadata(e.target.checked)
+                                    }
+                                />
+                                manual metadata uri
+                            </label>
+                        </div>
+                        {manualMetadata ? (
+                            <div className="mt-3">
+                                <Field label="Metadata URI">
+                                    <Input
+                                        value={uri}
+                                        onChange={(e) =>
+                                            setUri(e.target.value)
+                                        }
+                                        placeholder="https://.../metadata.json"
+                                        spellCheck={false}
+                                    />
+                                </Field>
+                            </div>
+                        ) : (
+                            <div className="mt-3 grid gap-3 md:grid-cols-2">
+                                <div className="md:col-span-2">
+                                    <Field label="Description">
+                                        <textarea
+                                            className="input-brutal min-h-[72px] resize-y font-sans"
+                                            value={description}
+                                            onChange={(e) =>
+                                                setDescription(e.target.value)
+                                            }
+                                            placeholder="What the token is for (stored in the metadata JSON)."
+                                            spellCheck={false}
+                                        />
+                                    </Field>
+                                </div>
+                                <Field
+                                    label="Token Image"
+                                    aside={
+                                        imageFile
+                                            ? imageFile.name
+                                            : 'OPTIONAL - png/jpg/gif/webp/svg'
+                                    }>
+                                    <input
+                                        type="file"
+                                        accept="image/png,image/jpeg,image/gif,image/webp,image/svg+xml"
+                                        className="input-brutal cursor-pointer file:mr-2 file:border-0 file:bg-ink file:px-2 file:py-1 file:font-mono file:text-[10px] file:text-paper file:uppercase"
+                                        onChange={(e) => {
+                                            const f = e.target.files
+                                            setImageFile(
+                                                f && f.length > 0 ? f[0] : null
+                                            )
+                                        }}
+                                    />
+                                </Field>
+                                <Field label="Website">
+                                    <Input
+                                        value={website}
+                                        onChange={(e) =>
+                                            setWebsite(e.target.value)
+                                        }
+                                        placeholder="https://yoursite.com"
+                                        spellCheck={false}
+                                    />
+                                </Field>
+                                <Field label="X / Twitter">
+                                    <Input
+                                        value={twitter}
+                                        onChange={(e) =>
+                                            setTwitter(e.target.value)
+                                        }
+                                        placeholder="@handle or https://x.com/handle"
+                                        spellCheck={false}
+                                    />
+                                </Field>
+                                <Field label="Telegram">
+                                    <Input
+                                        value={telegram}
+                                        onChange={(e) =>
+                                            setTelegram(e.target.value)
+                                        }
+                                        placeholder="@handle or https://t.me/group"
+                                        spellCheck={false}
+                                    />
+                                </Field>
+                            </div>
+                        )}
                     </div>
 
                     {/* migration toggles (M3 capability-gated) + funding */}
@@ -682,8 +953,6 @@ export function LaunchPanel({
                         </div>
                     </div>
 
-                   
-
                     {/* per-wallet sol_in for the selected dev wallets */}
                     <div className="lg:col-span-4">
                         <div className="flex items-center gap-3">
@@ -694,11 +963,6 @@ export function LaunchPanel({
                                 {selectedWallets.length} selected
                             </span>
                         </div>
-                        {selectedWallets.length === 0 && (
-                            <p className="label-mono opacity-60 mt-1">
-                                no wallets selected: check rows in the roster
-                            </p>
-                        )}
                     </div>
                     <div className="min-w-full grid md:grid-cols-2 lg:grid-cols-3 gap-4">
                         {selectedWallets.map((w) => (
@@ -748,6 +1012,48 @@ export function LaunchPanel({
                     </span>
                 </div>
 
+                {/* Sell All (M6, moved here from the trade card's tab strip
+                2026-09-04): the SELL ALL tab became this single
+                always-visible button below Launch. It ignores the roster
+                checkbox selection and sweeps every keyed managed wallet's
+                full balance of the mint the Trade panel tracks. */}
+                <div className="flex flex-col gap-2 border-t-2 border-ink pt-3">
+                    <Btn
+                        invert
+                        onClick={() => void handleSellAll()}
+                        disabled={sellBusy || !mint || keyedCount === 0}
+                        className="w-full shadow-none!">
+                        {sellBusy ? 'Selling...' : 'Sell All'}
+                    </Btn>
+                    {!mint ? (
+                        <StatusLine
+                            text="ENTER THE TOKEN MINT IN THE TRADE PANEL TO SELL ALL (A LAUNCH PRE-FILLS IT)"
+                            tone="idle"
+                        />
+                    ) : null}
+                    {mint && keyedCount === 0 ? (
+                        <StatusLine
+                            text="NO KEYED WALLETS. IMPORT BASE58 SECRETS IN THE ROSTER FIRST"
+                            tone="idle"
+                        />
+                    ) : null}
+                    {sellError ? (
+                        <StatusLine
+                            text={`SELL ALL FAILED: ${sellError}`}
+                            tone="error"
+                        />
+                    ) : null}
+                    {sellBusy ? (
+                        <StatusLine
+                            text="SELLING EVERY KEYED WALLET'S FULL BALANCE (CONCURRENT)..."
+                            tone="idle"
+                        />
+                    ) : null}
+                    {sellReport ? (
+                        <SellAllReportView report={sellReport} />
+                    ) : null}
+                </div>
+
                 {/* status log (preserved from M4) */}
                 <div>
                     <div className="mb-1">
@@ -761,5 +1067,60 @@ export function LaunchPanel({
                 </div>
             </div>
         </Card>
+    )
+}
+
+/* ---------- M6 sell-all report (final count, per-wallet SOL, holders) ---------- */
+
+function SellAllReportView({ report }: { report: SellAllReport }) {
+    const routeLabel =
+        report.route === 'curve'
+            ? `ROUTE: CURVE SELL (NOT GRADUATED) · creator ${shortAddress(report.creator, 6)}`
+            : `ROUTE: PUMSWAP SELL (GRADUATED) · pool ${shortAddress(report.poolKey ?? '', 6)}`
+    return (
+        <div className="flex flex-col gap-1 border-2 border-ink px-2 py-1.5">
+            <p className="label-mono !text-[10px] font-bold break-all">{routeLabel}</p>
+            <p className="label-mono !text-[11px] font-bold">
+                SOLD {report.sold}/{report.total} · SKIPPED {report.skipped} · FAILED {report.failed}
+            </p>
+            <div className="flex flex-col gap-0.5">
+                {report.outcomes.map((o) => (
+                    <SellOutcomeRow key={o.address} outcome={o} />
+                ))}
+            </div>
+            <p className="label-mono !text-[10px] border-t border-ink/40 pt-1">
+                HOLDERS AFTER:{' '}
+                {report.holderCountAfter === null
+                    ? 'READ FAILED (RATE-LIMITED); CHECK ROSTER TOKEN COLUMN'
+                    : `${report.holderCountAfter}`}
+            </p>
+        </div>
+    )
+}
+
+function SellOutcomeRow({ outcome }: { outcome: SellOutcome }) {
+    const addr = shortAddress(outcome.address, 6)
+    let body
+    if (outcome.status === 'sold') {
+        body = (
+            <span>
+                SOLD {fmtTokens(outcome.tokenSold)} TOK →{' '}
+                {formatSolLamports(outcome.solReceivedLamports)}
+                {outcome.signature ? (
+                    <span className="ml-1">
+                        <ExplorerLink hash={outcome.signature} />
+                    </span>
+                ) : null}
+            </span>
+        )
+    } else if (outcome.status === 'skipped') {
+        body = <span>SKIPPED ({outcome.reason ?? 'no key / zero balance'})</span>
+    } else {
+        body = <span>FAILED ({outcome.reason ?? 'error'})</span>
+    }
+    return (
+        <p className="label-mono !text-[10px] break-all opacity-90">
+            {addr} {body}
+        </p>
     )
 }
