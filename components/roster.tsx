@@ -129,7 +129,9 @@ export interface RosterApi {
     refreshBalances: () => void
 }
 
-/** Parsed token-account data shape from getTokenAccountsByOwner (jsonParsed). */
+/** Parsed token-account data shape from getParsedTokenAccountsByOwner
+ *  (jsonParsed encoding; getTokenAccountsByOwner defaults to base64 and
+ *  would return raw bytes, not `.parsed`). */
 interface ParsedTokenAccountData {
     parsed?: { info?: { tokenAmount?: { amount?: string } } }
 }
@@ -316,7 +318,10 @@ export function useRoster(): RosterApi {
             const results = await Promise.all(
                 addresses.map(async (a): Promise<[string, bigint] | null> => {
                     try {
-                        const r = await conn.getTokenAccountsByOwner(
+                        // getParsedTokenAccountsByOwner (NOT getTokenAccountsByOwner:
+                        // the base64 default returns raw bytes, so `data.parsed` is
+                        // undefined and every balance reads as 0).
+                        const r = await conn.getParsedTokenAccountsByOwner(
                             new PublicKey(a),
                             { mint },
                             'confirmed'
