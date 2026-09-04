@@ -56,14 +56,27 @@ export const PUMP_GLOBAL = new PublicKey(
   "4wTV1YmiEkRvAtNtsSGPtUrqRYQMe5SKy2uB4Jjaxnjf"
 );
 
-/** pump.fun protocol fee recipient. */
+/** pump.fun protocol fee recipient (DEVNET). The program stores the fee
+ *  recipient(s) inside the global account's `fee_recipient` field, which is
+ *  cluster-specific: mainnet's is `CebN5WGQ4jvEPvsVU4EoHEpgzq1VV2fskvCwf8gCDbZ`,
+ *  devnet's is the value below. A mainnet run MUST switch this. */
 export const PUMP_FEE_RECIPIENT = new PublicKey(
-  "CebN5WGQ4jvEPvsVU4EoHEpgzq1VV2fskvCwf8gCDbZ"
+  "68yFSZxzLWJXkxxRGydZ63C6mHx1NLEDWmwN9Lb5yySg"
 );
 
-/** pump.fun event authority (seeds: ["event-authority"]). */
-export const PUMP_EVENT_AUTHORITY = new PublicKey(
-  "Ce6TQqeHC9p8KetsN6JsjHK7UTZk7nasjjnr7Hx6SgqR"
+/** pump.fun event authority PDA (seeds: ["__event_authority"], double
+ *  underscore). Derived from the program id, NOT a fixed pubkey. */
+export const PUMP_EVENT_AUTHORITY: PublicKey = PublicKey.findProgramAddressSync(
+  [Buffer.from("__event_authority")],
+  PUMP_PROGRAM_ID
+)[0];
+
+/** One of the 8 pump.fun buyback fee recipients (read from the global
+ *  account's `buyback_fee_recipients` array; identical on devnet and
+ *  mainnet). The buy/sell instructions append ANY ONE of them (writable) as
+ *  a remaining account after `bonding_curve_v2`. */
+export const PUMP_BUYBACK_FEE_RECIPIENT = new PublicKey(
+  "5YxQFdt3Tr9zJLvkFccqXVUwhdTWJQc1fFg2YPbxvxeD"
 );
 
 /** pump.fun fee program (creator + protocol fee split; the fee_config PDA
@@ -135,6 +148,7 @@ export function borshString(s: string): Buffer {
 /* ------------------------------------------------------------------ */
 
 const BONDING_CURVE_SEED = Buffer.from("bonding-curve");
+const BONDING_CURVE_V2_SEED = Buffer.from("bonding-curve-v2");
 const CREATOR_VAULT_SEED = Buffer.from("creator-vault");
 const GLOBAL_VOLUME_SEED = Buffer.from("global_volume_accumulator");
 const USER_VOLUME_SEED = Buffer.from("user_volume_accumulator");
@@ -146,6 +160,16 @@ const METADATA_SEED = Buffer.from("metadata");
 export function pumpBondingCurvePda(mint: PublicKey): [PublicKey, number] {
   return PublicKey.findProgramAddressSync(
     [BONDING_CURVE_SEED, mint.toBuffer()],
+    PUMP_PROGRAM_ID
+  );
+}
+
+/** bonding_curve_v2 = PDA(["bonding-curve-v2", mint], PUMP_PROGRAM): a
+ *  remaining account required on buy/sell since the Apr 2026 program
+ *  upgrade (BREAKING_FEE_RECIPIENT.md), appended AFTER the fee-program leg. */
+export function pumpBondingCurveV2Pda(mint: PublicKey): [PublicKey, number] {
+  return PublicKey.findProgramAddressSync(
+    [BONDING_CURVE_V2_SEED, mint.toBuffer()],
     PUMP_PROGRAM_ID
   );
 }
@@ -179,10 +203,12 @@ export function pumpUserVolumeAccumulatorPda(
   );
 }
 
-/** fee_config = PDA(["fee_config"], FEE_PROGRAM). */
+/** fee_config = PDA(["fee_config", PUMP_PROGRAM], FEE_PROGRAM). The second
+ *  seed is the pump program id (a const in the fee program's IDL), NOT
+ *  absent — ["fee_config"] alone resolves to a different (AMM/default) config. */
 export function pumpFeeConfigPda(): [PublicKey, number] {
   return PublicKey.findProgramAddressSync(
-    [FEE_CONFIG_SEED],
+    [FEE_CONFIG_SEED, PUMP_PROGRAM_ID.toBuffer()],
     PUMP_FEE_PROGRAM_ID
   );
 }
@@ -397,13 +423,14 @@ export function quotePumpSell(opts: {
 
 /**
  * Builds the pump.fun `create` instruction: a fresh legacy-SPL mint (the
- * caller's `mintKeypair` signs the tx alongside the creator), name/symbol/
- * uri as the ONLY args (never append `.pump` to the symbol — indexers add
- * the suffix because the token is on pump.fun's program). The account order
- * below is the official IDL order (mint, mint_authority, bonding_curve,
- * associated_bonding_curve, global, mpl_token_metadata, metadata,
- * user/creator, system_program, associated_token_program, rent,
- * event_authority, program).
+ * caller's `mintKeypair` signs the tx alongside the creator), with FOUR args
+ * (name/symbol/uri AND the `creator` pubkey — the program records the creator
+ * explicitly for the fee-sharing config) — never append `.pump` to the symbol
+ * (indexers add the suffix because the token is on pump.fun's program). The
+ * account order below is the official current IDL order (14 accounts: mint,
+ * mint_authority, bonding_curve, associated_bonding_curve, global,
+ * mpl_token_metadata, metadata, user/creator, system_program, token_program,
+ * associated_token_program, rent, event_authority, program).
  */
 export function buildPumpCreateIx(opts: {
   creator: PublicKey;
@@ -436,6 +463,7 @@ export function buildPumpCreateIx(opts: {
     { pubkey: metadata, isSigner: false, isWritable: true },
     { pubkey: creator, isSigner: true, isWritable: true },
     { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
+    { pubkey: TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },
     { pubkey: PUMP_ATA_PROGRAM_ID, isSigner: false, isWritable: false },
     { pubkey: SYSVAR_RENT_PUBKEY, isSigner: false, isWritable: false },
     { pubkey: PUMP_EVENT_AUTHORITY, isSigner: false, isWritable: false },
@@ -446,6 +474,7 @@ export function buildPumpCreateIx(opts: {
     borshString(name),
     borshString(symbol),
     borshString(uri),
+    creator.toBuffer(),
   ]);
   return new TransactionInstruction({
     keys,
@@ -459,9 +488,10 @@ export function buildPumpCreateIx(opts: {
  *   [createAssociatedTokenAccountIdempotent (buyer ATA, legacy SPL), buy]
  * The ATA-create is harmless when the ATA already exists (the proven SDKs do
  * exactly this). buy data = discriminator ++ u64le(tokens_out) ++
- * u64le(max_sol_cost). The account order below is the official current buy
- * layout (16 accounts, incl. the fee-program leg: creator_vault, volume
- * accumulators, fee_config, fee_program).
+ * u64le(max_sol_cost) ++ u8(track_volume=1). The account order below is the
+ * official current buy layout (18 accounts, incl. the fee-program leg:
+ * creator_vault, volume accumulators, fee_config, fee_program, and the two
+ * remaining accounts bonding_curve_v2 + one buyback fee recipient).
  */
 export function buildPumpBuyIx(opts: {
   mint: PublicKey;
@@ -480,6 +510,7 @@ export function buildPumpBuyIx(opts: {
   const [globalVolumeAccumulator] = pumpGlobalVolumeAccumulatorPda();
   const [userVolumeAccumulator] = pumpUserVolumeAccumulatorPda(buyer);
   const [feeConfig] = pumpFeeConfigPda();
+  const [bondingCurveV2] = pumpBondingCurveV2Pda(mint);
 
   const ataIx = createAssociatedTokenAccountIdempotentInstruction(
     buyer,
@@ -507,11 +538,14 @@ export function buildPumpBuyIx(opts: {
     { pubkey: userVolumeAccumulator, isSigner: false, isWritable: true },
     { pubkey: feeConfig, isSigner: false, isWritable: false },
     { pubkey: PUMP_FEE_PROGRAM_ID, isSigner: false, isWritable: false },
+    { pubkey: bondingCurveV2, isSigner: false, isWritable: false },
+    { pubkey: PUMP_BUYBACK_FEE_RECIPIENT, isSigner: false, isWritable: true },
   ];
   const data = Buffer.concat([
     Buffer.from(PUMP_BUY_DISCRIMINATOR),
     u64leBytes(tokensOut),
     u64leBytes(maxSolCost),
+    Buffer.from([1]), // track_volume: OptionBool (1 byte; 1 = Some(true)/track)
   ]);
   const buyIx = new TransactionInstruction({
     keys,
@@ -525,8 +559,9 @@ export function buildPumpBuyIx(opts: {
  * Builds the pump.fun `sell` instruction pair for one seller:
  *   [createAssociatedTokenAccountIdempotent (seller ATA, legacy SPL), sell]
  * sell data = discriminator ++ u64le(tokens_in) ++ u64le(min_sol_output).
- * The account order below is the official current sell layout (14 accounts,
- * incl. the fee-program leg: creator_vault, fee_config, fee_program).
+ * The account order below is the official current sell layout (16 accounts,
+ * incl. the fee-program leg: creator_vault, fee_config, fee_program, and the
+ * two remaining accounts bonding_curve_v2 + one buyback fee recipient).
  */
 export function buildPumpSellIx(opts: {
   mint: PublicKey;
@@ -543,6 +578,7 @@ export function buildPumpSellIx(opts: {
   const associatedUser = pumpUserAta(mint, seller);
   const [creatorVault] = pumpCreatorVaultPda(creator);
   const [feeConfig] = pumpFeeConfigPda();
+  const [bondingCurveV2] = pumpBondingCurveV2Pda(mint);
 
   const ataIx = createAssociatedTokenAccountIdempotentInstruction(
     seller,
@@ -568,6 +604,8 @@ export function buildPumpSellIx(opts: {
     { pubkey: PUMP_PROGRAM_ID, isSigner: false, isWritable: false },
     { pubkey: feeConfig, isSigner: false, isWritable: false },
     { pubkey: PUMP_FEE_PROGRAM_ID, isSigner: false, isWritable: false },
+    { pubkey: bondingCurveV2, isSigner: false, isWritable: false },
+    { pubkey: PUMP_BUYBACK_FEE_RECIPIENT, isSigner: false, isWritable: true },
   ];
   const data = Buffer.concat([
     Buffer.from(PUMP_SELL_DISCRIMINATOR),
