@@ -58,6 +58,7 @@ import { useCallback, useMemo, useState } from 'react'
 import {
     ataRentLamports,
     buildLaunchSequence,
+    ensurePumpLookupTable,
     holderCount,
     postBuyFloorLamports,
     preflightLaunch,
@@ -362,7 +363,14 @@ export function LaunchPanel({
             }
 
             log('preflight: simulating create + buy txs...')
-            const pre = await preflightLaunch(connection, seq)
+            // The create+buy sandbox overflows the 1232-byte legacy limit after
+            // pump.fun's upgrade, so the pre-flight sims use a shared address
+            // lookup table (created once, reused). Cheap on devnet.
+            const { account: lookupTable } = await ensurePumpLookupTable(
+                connection,
+                creator
+            )
+            const pre = await preflightLaunch(connection, seq, lookupTable)
             log(`   create: ${pre.create.unitsConsumed} CU, ok`)
             for (const c of pre.buyChunks) {
                 log(
@@ -460,6 +468,7 @@ export function LaunchPanel({
                     tipIx,
                     creator,
                     mintKeypair: seq.mintKeypair,
+                    lookupTable,
                 })
                 for (const s of sims)
                     log(`   ${s.label}: ${s.unitsConsumed} CU, ok`)

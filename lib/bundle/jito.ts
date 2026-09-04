@@ -25,7 +25,8 @@ import {
   Transaction,
   TransactionInstruction,
 } from "@solana/web3.js";
-import { MAX_COMPUTE_UNITS, setBlockhash, signTx } from "./launch";
+import type { AddressLookupTableAccount } from "@solana/web3.js";
+import { MAX_COMPUTE_UNITS, buildSandboxV0, setBlockhash, signTx } from "./launch";
 import { ComputeBudgetProgram } from "@solana/web3.js";
 import { DEFAULT_JITO_TIP_LAMPORTS } from "../fees";
 
@@ -327,9 +328,10 @@ export async function simulateBundle(
     tipIx?: TransactionInstruction | null;
     creator: Keypair;
     mintKeypair: Keypair;
+    lookupTable?: AddressLookupTableAccount;
   }
 ): Promise<{ label: string; unitsConsumed: number | null }[]> {
-  const { createIx, buyTxs, fundIx, fundIxPerWallet, tipIx, creator, mintKeypair } = opts;
+  const { createIx, buyTxs, fundIx, fundIxPerWallet, tipIx, creator, mintKeypair, lookupTable } = opts;
   const fundIxs = fundIx ?? [];
   const latest = await connection.getLatestBlockhash("confirmed");
   const results: { label: string; unitsConsumed: number | null }[] = [];
@@ -352,11 +354,29 @@ export async function simulateBundle(
         ? [fundIxPerWallet[walletOffset + w]]
         : [];
       const isLast = i === buyTxs.length - 1 && w === bt.wallets.length - 1;
-      const tx = new Transaction({ feePayer: creator.publicKey, blockhash: latest.blockhash, lastValidBlockHeight: 0 });
-      tx.add(ComputeBudgetProgram.setComputeUnitLimit({ units: MAX_COMPUTE_UNITS }));
-      tx.add(...chunkFundIx, createIx, ...chunkIxs);
-      if (isLast && tipIx) tx.add(tipIx);
-      const sim = await connection.simulateTransaction(tx, [creator, mintKeypair, wallet]);
+      const instructions = [
+        ComputeBudgetProgram.setComputeUnitLimit({ units: MAX_COMPUTE_UNITS }),
+        ...chunkFundIx,
+        createIx,
+        ...chunkIxs,
+      ];
+      if (isLast && tipIx) instructions.push(tipIx);
+
+      let sim: Awaited<ReturnType<Connection["simulateTransaction"]>>;
+      if (lookupTable) {
+        const v0 = buildSandboxV0({
+          payerKey: creator.publicKey,
+          recentBlockhash: latest.blockhash,
+          instructions,
+          lookupTable,
+          signers: [creator, mintKeypair, wallet],
+        });
+        sim = await connection.simulateTransaction(v0);
+      } else {
+        const tx = new Transaction({ feePayer: creator.publicKey, blockhash: latest.blockhash, lastValidBlockHeight: 0 });
+        tx.add(...instructions);
+        sim = await connection.simulateTransaction(tx, [creator, mintKeypair, wallet]);
+      }
       if (sim.value.err) {
         throw new Error(
           `bundle sim: buy tx ${i} wallet ${w} failed: ${JSON.stringify(sim.value.err)}`

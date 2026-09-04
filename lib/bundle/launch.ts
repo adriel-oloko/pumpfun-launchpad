@@ -44,7 +44,10 @@ import {
   SystemProgram,
   Transaction,
   TransactionInstruction,
+  TransactionMessage,
+  VersionedTransaction,
 } from "@solana/web3.js";
+import type { AddressLookupTableAccount } from "@solana/web3.js";
 import {
   PUMP_METAPLEX_PROGRAM_ID,
   buildPumpBuyIx,
@@ -535,20 +538,41 @@ export async function simulateTx(
   };
 }
 
+/** Builds a versioned (V0) sandbox tx for pre-flight simulation. The
+ *  create+buy sandbox exceeds the 1232-byte legacy limit (the upgraded
+ *  pump.fun instructions are bigger); the ALT shrinks the constant accounts
+ *  to 1-byte indexes so the same sandbox (CU-limit ix KEPT) fits. */
+export function buildSandboxV0(opts: {
+  payerKey: PublicKey;
+  recentBlockhash: string;
+  instructions: TransactionInstruction[];
+  lookupTable: AddressLookupTableAccount;
+  signers: Keypair[];
+}): VersionedTransaction {
+  const message = new TransactionMessage({
+    payerKey: opts.payerKey,
+    recentBlockhash: opts.recentBlockhash,
+    instructions: opts.instructions,
+  }).compileToV0Message([opts.lookupTable]);
+  const v0 = new VersionedTransaction(message);
+  v0.sign(opts.signers);
+  return v0;
+}
+
 /**
  * Pre-flight simulation of the whole launch. The create tx simulates
  * standalone against the live chain (signed by the creator + the mint
  * keypair). Buy txs cannot simulate standalone on a fresh mint (the curve
  * does not exist yet), so each wallet's buy is validated in a sandbox tx
- * that runs the funding transfer + the create instruction first. Measured
- * (M10): the pump.fun create ix (~500 bytes) plus ONE wallet's
- * ATA-create+buy ixs already reach ~1120 bytes with funding, so the sandbox
- * chunk size is 1 wallet — 2 would overflow the 1232-byte limit. A failed
- * simulation is a hard error.
+ * that runs the funding transfer + the create instruction first. The
+ * create+buy sandbox overflows the 1232-byte legacy limit, so when an
+ * address lookup table is supplied each sandbox is built as a V0 tx (see
+ * buildSandboxV0). A failed simulation is a hard error.
  */
 export async function preflightLaunch(
   connection: Connection,
-  seq: LaunchSequence
+  seq: LaunchSequence,
+  lookupTable?: AddressLookupTableAccount
 ): Promise<{
   create: SimResult;
   buyChunks: { buyTxIndex: number; walletCount: number; result: SimResult }[];
@@ -586,18 +610,40 @@ export async function preflightLaunch(
       const chunkFundIx = seq.fundIxPerWallet
         ? [seq.fundIxPerWallet[walletOffset + w]]
         : [];
-      const tx = new Transaction({
-        feePayer: seq.creator.publicKey,
-        blockhash: latest.blockhash,
-        lastValidBlockHeight: 0,
-      });
-      tx.add(ComputeBudgetProgram.setComputeUnitLimit({ units: MAX_COMPUTE_UNITS }));
-      tx.add(...chunkFundIx, seq.createIx, ...walletIxs);
-      const result = await simulateTx(connection, tx, [
-        seq.creator,
-        seq.mintKeypair,
-        wallet,
-      ]);
+      const instructions = [
+        ComputeBudgetProgram.setComputeUnitLimit({ units: MAX_COMPUTE_UNITS }),
+        ...chunkFundIx,
+        seq.createIx,
+        ...walletIxs,
+      ];
+      let result: SimResult;
+      if (lookupTable) {
+        const v0 = buildSandboxV0({
+          payerKey: seq.creator.publicKey,
+          recentBlockhash: latest.blockhash,
+          instructions,
+          lookupTable,
+          signers: [seq.creator, seq.mintKeypair, wallet],
+        });
+        const r = await connection.simulateTransaction(v0);
+        result = {
+          err: r.value.err ?? null,
+          unitsConsumed: r.value.unitsConsumed ?? null,
+          logs: r.value.logs ?? null,
+        };
+      } else {
+        const tx = new Transaction({
+          feePayer: seq.creator.publicKey,
+          blockhash: latest.blockhash,
+          lastValidBlockHeight: 0,
+        });
+        tx.add(...instructions);
+        result = await simulateTx(connection, tx, [
+          seq.creator,
+          seq.mintKeypair,
+          wallet,
+        ]);
+      }
       if (result.err) {
         throw new Error(
           `preflight: buy tx ${i} wallet ${w} simulation failed: ${JSON.stringify(result.err)}`
