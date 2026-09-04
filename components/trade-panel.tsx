@@ -1566,11 +1566,7 @@ export function TradePanel({
                   placeholder="BASE58... (WITHDRAW DESTINATION)"
                   className="mt-1 font-mono text-[12px]"
                 />
-                {hubAddr && withdrawDest.trim() === hubAddr ? (
-                  <p className="label-mono mt-1 text-[10px] opacity-60">
-                    FIRST WALLET: DESTINATION ONLY, NOT A SWEEP SOURCE
-                  </p>
-                ) : null}
+                
                 {withdrawDest.trim() && !isValidPubkey(withdrawDest.trim()) ? (
                   <p className="label-mono mt-1 text-[10px] font-bold">
                     NOT A VALID BASE58 ADDRESS

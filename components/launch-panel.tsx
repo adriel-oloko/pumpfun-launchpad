@@ -123,7 +123,7 @@ export function LaunchPanel({
     const [symbol, setSymbol] = useState('M4UI')
     const [uri, setUri] = useState('https://example.com/m4-ui-launch.json')
     const [advancedOpen, setAdvancedOpen] = useState(false)
-    const [tier, setTier] = useState<'1' | '2'>('1')
+    const [tier, setTier] = useState<'1' | '2'>('2')
     const [fundFromCreator, setFundFromCreator] = useState(true)
     const [solIns, setSolIns] = useState<Record<string, string>>({})
     const [autoMigrate, setAutoMigrate] = useState(DEFAULT_AUTO_MIGRATE)
@@ -641,7 +641,7 @@ export function LaunchPanel({
                         </Field>
                     </div>
 
-                    {/* migration toggles (M3 capability-gated) */}
+                    {/* migration toggles (M3 capability-gated) + funding */}
                     <div className="lg:col-span-4">
                         <div className="flex flex-wrap items-center gap-4 border-2 border-ink px-3 py-2">
                             <label className="label-mono flex items-center gap-2 cursor-pointer">
@@ -668,35 +668,6 @@ export function LaunchPanel({
                                 />
                                 lp-lock
                             </label>
-                        </div>
-                    </div>
-
-                    {/* tier + funding */}
-                    <div className="lg:col-span-4">
-                        <div className="flex flex-wrap items-center gap-4 border-2 border-ink px-3 py-2">
-                            <span className="label-mono opacity-70">
-                                send path
-                            </span>
-                            <div className="flex gap-2">
-                                <Btn
-                                    type="button"
-                                    invert={tier !== '1'}
-                                    pressed={tier === '1'}
-                                    onClick={() => setTier('1')}
-                                    disabled={busy}
-                                    className="!px-3 !py-1 !text-[10px]">
-                                    Tier 1 Send
-                                </Btn>
-                                <Btn
-                                    type="button"
-                                    invert={tier !== '2'}
-                                    pressed={tier === '2'}
-                                    onClick={() => setTier('2')}
-                                    disabled={busy}
-                                    className="!px-3 !py-1 !text-[10px]">
-                                    Tier 2 Bundle
-                                </Btn>
-                            </div>
                             <label className="label-mono flex items-center gap-2 cursor-pointer opacity-80">
                                 <input
                                     type="checkbox"
@@ -710,6 +681,8 @@ export function LaunchPanel({
                             </label>
                         </div>
                     </div>
+
+                   
 
                     {/* per-wallet sol_in for the selected dev wallets */}
                     <div className="lg:col-span-4">

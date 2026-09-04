@@ -20,14 +20,15 @@ import { homedir } from 'node:os'
 import { join } from 'node:path'
 
 const DEVNET_RPC =
-  process.env.SOLANA_DEVNET_RPC || 'https://api.devnet.solana.com'
+    process.env.SOLANA_DEVNET_RPC ||
+    'https://devnet.helius-rpc.com/?api-key=6fd05d57-a073-4cc6-8b5b-4314a652e487'
 
 const keypairPath =
-  process.argv[2] || join(homedir(), '.config', 'solana', 'devnet.json')
+    process.argv[2] || join(homedir(), '.config', 'solana', 'devnet.json')
 
 const lamports = process.argv[3]
-  ? Number(process.argv[3])
-  : 2 * LAMPORTS_PER_SOL
+    ? Number(process.argv[3])
+    : 2 * LAMPORTS_PER_SOL
 
 const secret = JSON.parse(readFileSync(keypairPath, 'utf8'))
 const keypair = Keypair.fromSecretKey(Uint8Array.from(secret))
@@ -43,14 +44,17 @@ const before = await connection.getBalance(keypair.publicKey)
 console.log(`balance before : ${before / LAMPORTS_PER_SOL} SOL`)
 
 try {
-  const signature = await connection.requestAirdrop(keypair.publicKey, lamports)
-  console.log(`airdrop tx     : ${signature}`)
-  await connection.confirmTransaction(signature)
-  console.log(`airdrop status : confirmed`)
+    const signature = await connection.requestAirdrop(
+        keypair.publicKey,
+        lamports
+    )
+    console.log(`airdrop tx     : ${signature}`)
+    await connection.confirmTransaction(signature)
+    console.log(`airdrop status : confirmed`)
 } catch (err) {
-  // The public devnet faucet rate-limits per IP ("reached your airdrop limit
-  // today or the faucet has run dry"). Report it and still read the balance.
-  console.log(`airdrop status : FAILED (${err.message})`)
+    // The public devnet faucet rate-limits per IP ("reached your airdrop limit
+    // today or the faucet has run dry"). Report it and still read the balance.
+    console.log(`airdrop status : FAILED (${err.message})`)
 }
 
 const after = await connection.getBalance(keypair.publicKey)

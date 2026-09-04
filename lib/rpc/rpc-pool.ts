@@ -17,7 +17,7 @@
  *   NEXT_PUBLIC_SOLANA_RPC_MAINNET / NEXT_PUBLIC_SOLANA_RPC_DEVNET. Each may
  *   be a comma-separated list; every entry is prepended to that network's
  *   pool ahead of the public defaults.
- * - The public defaults (api.mainnet-beta.solana.com / api.devnet.solana.com,
+ * - The public defaults (api.mainnet-beta.solana.com / devnet.helius-rpc.com/?api-key=6fd05d57-a073-4cc6-8b5b-4314a652e487,
  *   operated by Triton) act as keyless failover.
  * - NEXT_PUBLIC_ vars are inlined identically at build time in every module
  *   that reads them, so the pool is stable per build.
@@ -51,9 +51,7 @@ function envEndpoints(envName: string): string[] {
 
 /** Env override first, public defaults last, de-duplicated. */
 function buildPool(envName: string, defaults: string[]): string[] {
-    return [
-        ...new Set([...envEndpoints(envName), ...defaults].map(normalize)),
-    ]
+    return [...new Set([...envEndpoints(envName), ...defaults].map(normalize))]
 }
 
 /** Mainnet pool: env NEXT_PUBLIC_SOLANA_RPC_MAINNET + Triton public default. */
@@ -65,7 +63,9 @@ export const MAINNET_RPC_POOL: string[] = buildPool(
 /** Devnet pool: env NEXT_PUBLIC_SOLANA_RPC_DEVNET + Triton public default. */
 export const DEVNET_RPC_POOL: string[] = buildPool(
     'NEXT_PUBLIC_SOLANA_RPC_DEVNET',
-    ['https://api.devnet.solana.com']
+    [
+        'https://devnet.helius-rpc.com/?api-key=6fd05d57-a073-4cc6-8b5b-4314a652e487',
+    ]
 )
 
 /** How long a failing URL is taken out of rotation (ms). */
@@ -163,5 +163,7 @@ export async function rotatingFetch(
     }
     throw lastError instanceof Error
         ? lastError
-        : new Error('RPC pool exhausted: every endpoint failed or is cooling down')
+        : new Error(
+              'RPC pool exhausted: every endpoint failed or is cooling down'
+          )
 }

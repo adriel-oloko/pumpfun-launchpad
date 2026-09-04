@@ -13,19 +13,25 @@
 // node_modules (transitive dep of web3.js v1); this just mirrors it onto
 // globalThis when the bundler did not.
 
-import { Connection } from "@solana/web3.js";
-import { Buffer } from "buffer";
-import { DEVNET_RPC_POOL, rotatingFetch } from "./rpc/rpc-pool";
+import { Connection } from '@solana/web3.js'
+import { Buffer } from 'buffer'
+import { DEVNET_RPC_POOL, rotatingFetch } from './rpc/rpc-pool'
 
-if (typeof globalThis !== "undefined" && typeof (globalThis as { Buffer?: unknown }).Buffer === "undefined") {
-  (globalThis as { Buffer: typeof Buffer }).Buffer = Buffer;
+if (
+    typeof globalThis !== 'undefined' &&
+    typeof (globalThis as { Buffer?: unknown }).Buffer === 'undefined'
+) {
+    ;(globalThis as { Buffer: typeof Buffer }).Buffer = Buffer
 }
 
 /** Builds a devnet Connection with the rotating RPC pool as its transport. */
 export function makeDevnetConnection(): Connection {
-  return new Connection("https://api.devnet.solana.com", {
-    commitment: "confirmed",
-    fetch: (input: RequestInfo | URL, init?: RequestInit) =>
-      rotatingFetch(DEVNET_RPC_POOL, input, init),
-  });
+    return new Connection(
+        'https://devnet.helius-rpc.com/?api-key=6fd05d57-a073-4cc6-8b5b-4314a652e487',
+        {
+            commitment: 'confirmed',
+            fetch: (input: RequestInfo | URL, init?: RequestInit) =>
+                rotatingFetch(DEVNET_RPC_POOL, input, init),
+        }
+    )
 }
