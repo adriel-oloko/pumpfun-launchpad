@@ -52,5 +52,11 @@ HANDOFF.md
 
 # Solana / Anchor (generated build artifacts + deploy secrets)
 .anchor/
-target/
+/target/*
+# The client imports the IDL JSON directly (lib/idl.ts) and CI (Vercel) has
+# no anchor toolchain, so the generated IDL must be committed. Everything
+# else under target/ stays ignored.
+!/target/idl/
+/target/idl/*
+!/target/idl/pumpfun.json
 .verify-shots/
