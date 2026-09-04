@@ -64,7 +64,7 @@ export const MAINNET_RPC_POOL: string[] = buildPool(
 export const DEVNET_RPC_POOL: string[] = buildPool(
     'NEXT_PUBLIC_SOLANA_RPC_DEVNET',
     [
-        'https://devnet.helius-rpc.com/?api-key=6fd05d57-a073-4cc6-8b5b-4314a652e487',
+        'https://api.devnet.solana.com',
     ]
 )
 
