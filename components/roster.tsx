@@ -38,7 +38,6 @@
 // stale (last-known-good) balance state when the last poll hit a transport/
 // RPC error.
 
-import { Program, type Provider } from '@coral-xyz/anchor'
 import { OnlinePumpAmmSdk } from '@pump-fun/pump-swap-sdk'
 import { LAMPORTS_PER_SOL, PublicKey } from '@solana/web3.js'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
@@ -46,7 +45,6 @@ import { readAutoCurveState } from '../lib/auto'
 import { makeDevnetConnection } from '../lib/connection'
 import { exportPksBackup, generateRandomWallets } from '../lib/distribute'
 import { shortAddress } from '../lib/format'
-import { PUMPFUN_IDL, PUMPFUN_PROGRAM_ID } from '../lib/idl'
 import {
     type ManagedWallet,
     freshKeyExpiry,
@@ -164,16 +162,16 @@ function fmtSolValue(lamports: bigint): string {
  *     solReserve * 10^DECIMALS / tokenReserve (raw units).
  *   - GRADUATED: the migrated PumpSwap pool's actual base/quote token
  *     account balances (quoteReserve * 10^DECIMALS / baseReserve); the pool
- *     is derived exactly like migrateToPumpSwap seeded it.
+ *     is derived from the pump.fun curve's recorded creator exactly like
+ *     pump.fun's auto-migration seeded it.
  * Returns null when the mint has no curve/pool to price against; throws on
  * transport/RPC errors so the caller can flag the balances stale.
  */
 async function readSolPerTokenRaw(
     connection: ReturnType<typeof makeDevnetConnection>,
-    program: Program,
     mint: PublicKey
 ): Promise<bigint | null> {
-    const read = await readAutoCurveState(program, mint)
+    const read = await readAutoCurveState(connection, mint)
     if (read.kind !== 'ok') return null
     const curve = read.curve
     if (curve.graduated) {
@@ -233,11 +231,6 @@ export function useRoster(): RosterApi {
     const connRef = useRef<ReturnType<typeof makeDevnetConnection> | null>(null)
     if (connRef.current === null) connRef.current = makeDevnetConnection()
     const connection = connRef.current
-
-    /** Minimal-provider anchor Program for the curve/pool price reads (anchor
-     *  Wallet is Node-only in the browser; every tx here is signed manually
-     *  with Keypairs, so a fake publicKey suffices, same as the trade panel). */
-    const programRef = useRef<Program | null>(null)
 
     /** Monotonic tick sequence: a slower in-flight tick that started before a
      *  mint change must never overwrite the newer tick's state. */
@@ -354,18 +347,9 @@ export function useRoster(): RosterApi {
         // missing price read yields null so the raw balance alone is shown).
         let price: bigint | null = null
         if (trackedMint) {
-            if (!programRef.current) {
-                const provider = {
-                    connection,
-                    publicKey: PUMPFUN_PROGRAM_ID,
-                    wallet: { publicKey: PUMPFUN_PROGRAM_ID },
-                } as Provider
-                programRef.current = new Program(PUMPFUN_IDL, provider)
-            }
             try {
                 price = await readSolPerTokenRaw(
                     conn,
-                    programRef.current,
                     new PublicKey(trackedMint)
                 )
             } catch {

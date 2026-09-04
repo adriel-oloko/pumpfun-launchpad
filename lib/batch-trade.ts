@@ -1,12 +1,13 @@
-// Milestone M8A (2026-09-03): the MANUAL Buy/Sell engine (Feature 1).
+// Milestone M8A (2026-09-03): the MANUAL Buy/Sell engine (Feature 1), now on
+// pump.fun's NATIVE program (M10).
 //
 // One click trades every SELECTED keyed managed wallet at a % of that
 // wallet's own balance, mirroring the exact semantics of v4-launchpad's
-// "Buy / Sell" tab but on the pumpfun Solana client:
+// "Buy / Sell" tab but on the pump.fun Solana client:
 //
 //   - Buy: for every selected keyed wallet, buy buyPct% of the wallet's
 //     SPENDABLE SOL balance (the fireAutoBuy spendable formula: live SOL
-//     minus the rent-exempt floor, the tx fee reserve, and the Token-2022
+//     minus the rent-exempt floor, the tx fee reserve, and the legacy-SPL
 //     ATA rent when the ATA does not exist yet). Skipped when there is
 //     nothing tradeable after those reserves.
 //   - Sell: for every selected keyed wallet, sell sellPct% of the wallet's
@@ -17,10 +18,15 @@
 // trade is its OWN signed tx (the wallet is the fee payer), fired
 // concurrently with Promise.allSettled, and only the final completed count
 // plus the confirmed signatures are reported. Instructions come from
-// lib/auto.ts's buildAutoBuyIx / buildAutoSellIx (buy carries the creator
-// account pair from the fetched curve; sell does not) and sends go through
-// lib/bundle/launch.ts's sendAndConfirmWithRetry (expiry-safe re-sends
-// only, never a blind double-fire).
+// lib/auto.ts's buildAutoBuyIx / buildAutoSellIx (lib/pump.ts hand-built
+// pump.fun ixs: buy/sell take tokens_out/tokens_in quoted client-side with
+// slippage; the curve's creator feeds the creator_vault fee leg) and sends
+// go through lib/bundle/launch.ts's sendAndConfirmWithRetry (expiry-safe
+// re-sends only, never a blind double-fire).
+//
+// The curve state (creator + VIRTUAL reserves) is read by the CALLER before
+// this module runs (the trade panel's round gate) and passed in, so both
+// the gate and the batch quote against the same snapshot.
 //
 // Step 2 of the M8A spec (the optional mainnet atomic Jito-bundle path) is
 // deliberately NOT implemented here: this launchpad is devnet-only in the
@@ -31,16 +37,11 @@
 // submitBundleViaFanoutWithRetry when a mainnet connection exists. TODO
 // (M8A step 2): add a bundle path for 1..5 selected wallets on mainnet.
 //
-// All amounts are bigint (no bigint literals, project target is ES2017).
-// The anchor Program is used ONLY to encode instructions from the IDL; every
-// tx is signed manually with the wallet's Keypair (anchor Wallet is
-// Node-only in the browser).
+// All amounts are bigint (no bigint literals, project target is ES2017);
+// every tx is signed manually with the wallet's Keypair (anchor Wallet is
+// Node-only in the browser, and the anchor Program is gone entirely).
 
-import type { Program } from "@coral-xyz/anchor";
-import {
-  TOKEN_2022_PROGRAM_ID,
-  getAssociatedTokenAddress,
-} from "@solana/spl-token";
+import { TOKEN_PROGRAM_ID, getAssociatedTokenAddressSync } from "@solana/spl-token";
 import bs58 from "bs58";
 import { Connection, Keypair, PublicKey, Transaction } from "@solana/web3.js";
 import {
@@ -71,11 +72,10 @@ export interface ManualBatchResult {
 
 export interface BuySelectedOptions {
   connection: Connection;
-  program: Program;
-  /** The curve mint being bought (Token-2022). */
+  /** The curve mint being bought (legacy SPL). */
   mint: PublicKey;
-  /** Fetched curve state; the creator feeds the buy instruction's creator
-   *  account pair (validated on-chain on every buy). */
+  /** Fetched curve state; the creator feeds the buy instruction's
+   *  creator_vault leg and the VIRTUAL reserves feed the tokens_out quote. */
   curve: AutoCurveInfo;
   /** Selected keyed managed wallets to buy for. */
   wallets: AutoWallet[];
@@ -86,9 +86,12 @@ export interface BuySelectedOptions {
 
 export interface SellSelectedOptions {
   connection: Connection;
-  program: Program;
   /** The curve mint being sold. */
   mint: PublicKey;
+  /** Fetched curve state; the creator feeds the sell instruction's
+   *  creator_vault leg and the VIRTUAL reserves feed the min_sol_output
+   *  quote. */
+  curve: AutoCurveInfo;
   /** Selected keyed managed wallets to sell for. */
   wallets: AutoWallet[];
   /** % of each wallet's OWN token balance to sell, clamped to (0, 100].
@@ -117,7 +120,6 @@ function pctNum(pct: number): number {
  *  reports the wallet as failed. */
 async function buyOne(
   connection: Connection,
-  program: Program,
   mint: PublicKey,
   curve: AutoCurveInfo,
   wallet: AutoWallet,
@@ -127,11 +129,11 @@ async function buyOne(
 ): Promise<string | null> {
   const kp = Keypair.fromSecretKey(bs58.decode(wallet.key));
   const live = BigInt(await connection.getBalance(kp.publicKey, "confirmed"));
-  const ata = await getAssociatedTokenAddress(
+  const ata = getAssociatedTokenAddressSync(
     mint,
     kp.publicKey,
     false,
-    TOKEN_2022_PROGRAM_ID
+    TOKEN_PROGRAM_ID
   );
   const ataInfo = await connection.getAccountInfo(ata, "confirmed");
   const reserveAta = ataInfo ? BigInt(0) : BigInt(ataRent);
@@ -144,13 +146,20 @@ async function buyOne(
   const solIn = (spendable * BigInt(pctNum(pct))) / BigInt(10_000);
   if (solIn <= BigInt(0)) return null;
   const creator = new PublicKey(curve.creator);
-  const ix = await buildAutoBuyIx(program, kp.publicKey, mint, solIn, creator);
+  const ixs = buildAutoBuyIx({
+    buyer: kp.publicKey,
+    mint,
+    creator,
+    solInLamports: solIn,
+    solReserve: curve.solReserve,
+    tokenReserve: curve.tokenReserve,
+  });
   const tx = new Transaction({
     feePayer: kp.publicKey,
     blockhash: latest.blockhash,
     lastValidBlockHeight: latest.lastValidBlockHeight,
   });
-  tx.add(ix);
+  tx.add(...ixs);
   const { signature } = await sendAndConfirmWithRetry(connection, tx, [kp], {
     attempts: 2,
     confirmTimeoutMs: AUTO_CONFIRM_TIMEOUT_MS,
@@ -165,8 +174,8 @@ async function buyOne(
  *  wallet as failed. */
 async function sellOne(
   connection: Connection,
-  program: Program,
   mint: PublicKey,
+  curve: AutoCurveInfo,
   wallet: AutoWallet,
   pct: number,
   latest: { blockhash: string; lastValidBlockHeight: number }
@@ -176,13 +185,21 @@ async function sellOne(
   if (balance <= BigInt(0)) return null;
   const tokenIn = (balance * BigInt(pctNum(pct))) / BigInt(10_000);
   if (tokenIn <= BigInt(0)) return null;
-  const ix = await buildAutoSellIx(program, kp.publicKey, mint, tokenIn);
+  const creator = new PublicKey(curve.creator);
+  const ixs = buildAutoSellIx({
+    seller: kp.publicKey,
+    mint,
+    creator,
+    tokenIn,
+    solReserve: curve.solReserve,
+    tokenReserve: curve.tokenReserve,
+  });
   const tx = new Transaction({
     feePayer: kp.publicKey,
     blockhash: latest.blockhash,
     lastValidBlockHeight: latest.lastValidBlockHeight,
   });
-  tx.add(ix);
+  tx.add(...ixs);
   const { signature } = await sendAndConfirmWithRetry(connection, tx, [kp], {
     attempts: 2,
     confirmTimeoutMs: AUTO_CONFIRM_TIMEOUT_MS,
@@ -222,19 +239,19 @@ function tally(
 export async function buySelectedWallets(
   opts: BuySelectedOptions
 ): Promise<ManualBatchResult> {
-  const { connection, program, mint, curve, wallets } = opts;
+  const { connection, mint, curve, wallets } = opts;
   const buyPct = clampPct(opts.buyPct ?? 95, 95);
   if (wallets.length === 0) {
     return { completed: 0, failed: 0, skipped: 0, signatures: [] };
   }
   const ataRent = await connection.getMinimumBalanceForRentExemption(
-    170,
+    165,
     "confirmed"
   );
   const latest = await connection.getLatestBlockhash("confirmed");
   const settled = await Promise.allSettled(
     wallets.map((w) =>
-      buyOne(connection, program, mint, curve, w, buyPct, ataRent, latest)
+      buyOne(connection, mint, curve, w, buyPct, ataRent, latest)
     )
   );
   return tally(settled);
@@ -250,7 +267,7 @@ export async function buySelectedWallets(
 export async function sellSelectedWallets(
   opts: SellSelectedOptions
 ): Promise<ManualBatchResult> {
-  const { connection, program, mint, wallets } = opts;
+  const { connection, mint, curve, wallets } = opts;
   const sellPct = clampPct(opts.sellPct ?? 100, 100);
   if (wallets.length === 0) {
     return { completed: 0, failed: 0, skipped: 0, signatures: [] };
@@ -258,7 +275,7 @@ export async function sellSelectedWallets(
   const latest = await connection.getLatestBlockhash("confirmed");
   const settled = await Promise.allSettled(
     wallets.map((w) =>
-      sellOne(connection, program, mint, w, sellPct, latest)
+      sellOne(connection, mint, curve, w, sellPct, latest)
     )
   );
   return tally(settled);

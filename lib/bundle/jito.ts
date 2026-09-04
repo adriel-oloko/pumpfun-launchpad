@@ -310,60 +310,60 @@ export class JitoBundleClient {
 
 /**
  * Pre-flight simulation of the assembled bundle txs against the live chain.
- * The create tx simulates standalone; each buy tx (and the tip-carrying last
- * tx) simulates inside a sandbox that runs the create instruction first, in
- * chunks of up to 3 wallets so the sandbox tx stays under the 1232-byte
- * serialization limit. Any failed simulation is a hard error.
+ * The create tx simulates standalone; each buy wallet simulates inside a
+ * sandbox that runs the create instruction first (one wallet per sandbox:
+ * measured M10 — the pump.fun create ix plus ONE wallet's ATA-create + buy
+ * ixs already reach ~1120 bytes, so 2 wallets overflow the 1232-byte
+ * serialization limit). Every sandbox/standalone create is signed by the
+ * creator AND the mint keypair. Any failed simulation is a hard error.
  */
 export async function simulateBundle(
   connection: Connection,
   opts: {
     createIx: TransactionInstruction;
-    buyTxs: { wallets: Keypair[]; instructions: TransactionInstruction[] }[];
+    buyTxs: { wallets: Keypair[]; walletIxs: TransactionInstruction[][] }[];
     fundIx?: TransactionInstruction[] | null;
     fundIxPerWallet?: TransactionInstruction[] | null;
     tipIx?: TransactionInstruction | null;
     creator: Keypair;
+    mintKeypair: Keypair;
   }
 ): Promise<{ label: string; unitsConsumed: number | null }[]> {
-  const { createIx, buyTxs, fundIx, fundIxPerWallet, tipIx, creator } = opts;
+  const { createIx, buyTxs, fundIx, fundIxPerWallet, tipIx, creator, mintKeypair } = opts;
   const fundIxs = fundIx ?? [];
   const latest = await connection.getLatestBlockhash("confirmed");
   const results: { label: string; unitsConsumed: number | null }[] = [];
 
   const createTx = new Transaction({ feePayer: creator.publicKey, blockhash: latest.blockhash, lastValidBlockHeight: 0 });
-  createTx.add(...fundIxs, createIx);
-  const r = await connection.simulateTransaction(createTx, [creator]);
+  createTx.add(...fundIxs.slice(0, 2), createIx);
+  const r = await connection.simulateTransaction(createTx, [creator, mintKeypair]);
   if (r.value.err) {
     throw new Error(`bundle sim: create failed: ${JSON.stringify(r.value.err)}`);
   }
   results.push({ label: "create", unitsConsumed: r.value.unitsConsumed ?? null });
 
-  // With funding the sandbox must fund each chunk's wallets too (chunk 2 fits
-  // under 1232 bytes); without funding chunk 3 fits.
-  const chunkSize = fundIxPerWallet ? 2 : 3;
   let walletOffset = 0;
   for (let i = 0; i < buyTxs.length; i++) {
     const bt = buyTxs[i];
-    for (let s = 0; s < bt.wallets.length; s += chunkSize) {
-      const chunkWallets = bt.wallets.slice(s, s + chunkSize);
-      const chunkIxs = bt.instructions.slice(s, s + chunkSize);
+    for (let w = 0; w < bt.wallets.length; w++) {
+      const wallet = bt.wallets[w];
+      const chunkIxs = bt.walletIxs[w];
       const chunkFundIx = fundIxPerWallet
-        ? fundIxPerWallet.slice(walletOffset + s, walletOffset + s + chunkSize)
+        ? [fundIxPerWallet[walletOffset + w]]
         : [];
-      const isLast = i === buyTxs.length - 1 && s + chunkSize >= bt.wallets.length;
+      const isLast = i === buyTxs.length - 1 && w === bt.wallets.length - 1;
       const tx = new Transaction({ feePayer: creator.publicKey, blockhash: latest.blockhash, lastValidBlockHeight: 0 });
       tx.add(ComputeBudgetProgram.setComputeUnitLimit({ units: MAX_COMPUTE_UNITS }));
       tx.add(...chunkFundIx, createIx, ...chunkIxs);
       if (isLast && tipIx) tx.add(tipIx);
-      const sim = await connection.simulateTransaction(tx, [creator, ...chunkWallets]);
+      const sim = await connection.simulateTransaction(tx, [creator, mintKeypair, wallet]);
       if (sim.value.err) {
         throw new Error(
-          `bundle sim: buy tx ${i} chunk ${s / chunkSize} failed: ${JSON.stringify(sim.value.err)}`
+          `bundle sim: buy tx ${i} wallet ${w} failed: ${JSON.stringify(sim.value.err)}`
         );
       }
       results.push({
-        label: `buy${i + 1}[${chunkWallets.length}]${isLast && tipIx ? "+tip" : ""}`,
+        label: `buy${i + 1}[${wallet.publicKey.toBase58().slice(0, 4)}]${isLast && tipIx ? "+tip" : ""}`,
         unitsConsumed: sim.value.unitsConsumed ?? null,
       });
     }

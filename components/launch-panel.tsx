@@ -1,12 +1,13 @@
 'use client'
 
-// Milestone M4: the launch panel (M4-UI-MATCH restyle).
+// Milestone M4: the launch panel (M4-UI-MATCH restyle), M10: native
+// pump.fun program.
 //
 // Form: token name / symbol / metadata URI (direct entry; see the
 // Arweave/IPFS decision comment below), the connected creator key (the
 // SAME wallet the masthead connects via pumpfun.creatorKey.v1), the
-// selected dev wallets with a per-wallet sol_in, the M3 migration toggles,
-// and a Launch button that drives lib/bundle:
+// selected dev wallets with a per-wallet sol_in, and a Launch button that
+// drives lib/bundle:
 //
 //   Tier 1 (default): buildLaunchSequence + preflightLaunch +
 //                     sendSequentially as normal devnet txs.
@@ -17,12 +18,16 @@
 //                     land; the panel reports that honestly after proving
 //                     the construction.
 //
-// M3 capability: the create() args auto_migrate + lock_lp are sent ONLY
-// when the loaded IDL declares them (createMigrationCapability). On a
-// pre-M3 IDL the toggles are disabled behind a "requires program upgrade"
-// note and the launch proceeds with the pre-M3 4-arg create, exactly as
-// buildLaunchSequence reports via migrationArgsSupported (never silently
-// dropped).
+// M10 (native pump.fun): the launch talks to pump.fun's OWN program
+// (6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P), so every token launched is
+// a real pump.fun token: indexed everywhere with the `.pump` suffix (the
+// suffix is indexer-applied; the symbol is passed PLAIN). The create args
+// are ONLY name/symbol/uri — the old M3 capability gate (auto_migrate /
+// lock_lp create args on the CUSTOM program) is GONE: pump.fun
+// auto-migrates its curves to PumpSwap on graduation, so the launch panel
+// no longer carries migration toggles and no anchor Program/IDL exists
+// anymore (every instruction is hand-built in lib/pump.ts; the mint is a
+// fresh Keypair generated at sequence build time).
 //
 // METADATA (M9: structured + publish-on-launch):
 // The single URI input is replaced by discrete description / image /
@@ -42,7 +47,6 @@
 // Field + Input + Collapse primitives, "Launch" card head). The status log
 // and ALL M4 launch logic are preserved unchanged.
 
-import { Program, type Provider } from '@coral-xyz/anchor'
 import {
     Keypair,
     LAMPORTS_PER_SOL,
@@ -76,18 +80,12 @@ import { submitBundleViaFanoutWithRetry } from '../lib/bundle/fanout-submit'
 import { bundleDropMessage, friendlyTxError } from '../lib/tx-errors'
 import { makeDevnetConnection } from '../lib/connection'
 import { useCreatorWallet } from '../lib/creator-wallet'
-import {
-    createMigrationCapability,
-    PUMPFUN_IDL,
-    PUMPFUN_PROGRAM_ID,
-    type CreateMigrationCapability,
-} from '../lib/idl'
 import { pubkeyFromSecretKey } from '../lib/managed-wallets'
-import { DECIMALS, DEFAULT_AUTO_MIGRATE, DEFAULT_LOCK_LP } from '../lib/params'
+import { DECIMALS } from '../lib/params'
+import { readPumpCurveState } from '../lib/pump'
 import {
     formatSolLamports,
     sellAllManagedWallets,
-    type SellAllProgram,
     type SellAllReport,
     type SellOutcome,
 } from '../lib/sell-all'
@@ -156,18 +154,10 @@ export function LaunchPanel({
     const [tier, setTier] = useState<'1' | '2'>('2')
     const [fundFromCreator, setFundFromCreator] = useState(true)
     const [solIns, setSolIns] = useState<Record<string, string>>({})
-    const [autoMigrate, setAutoMigrate] = useState(DEFAULT_AUTO_MIGRATE)
-    const [lockLp, setLockLp] = useState(DEFAULT_LOCK_LP)
     const [busy, setBusy] = useState(false)
     const [statusLines, setStatusLines] = useState<string[]>([])
     const [launchError, setLaunchError] = useState<string | null>(null)
     const [lastMint, setLastMint] = useState<string | null>(null)
-
-    const capability: CreateMigrationCapability = useMemo(
-        () => createMigrationCapability(PUMPFUN_IDL),
-        []
-    )
-    const migrationSupported = capability.autoMigrate && capability.lockLp
 
     const selectedWallets = useMemo(
         () => roster.wallets.filter((w) => roster.checked.has(w.address)),
@@ -306,29 +296,13 @@ export function LaunchPanel({
                     `  dev ${b.wallet.publicKey.toBase58().slice(0, 12)}... buys ${(Number(b.solInLamports) / LAMPORTS_PER_SOL).toFixed(4)} SOL`
                 )
             }
-            log(
-                `migrate : auto_migrate=${autoMigrate} lock_lp=${lockLp} (idl ${capability.autoMigrate && capability.lockLp ? 'supports' : 'PRE-M3, not supported'})`
-            )
-
             const connection = makeDevnetConnection()
-            // The anchor Wallet class is Node-only (dist/browser does not export
-            // it), and the browser launch flow signs every tx manually with the
-            // Keypairs (buildLaunchSequence -> signTx -> sendRawTransaction). The
-            // Program instance is used only to encode instructions from the IDL
-            // and fetch accounts, so a minimal provider object suffices.
-            const provider = {
-                connection,
-                publicKey: creator.publicKey,
-                wallet: { publicKey: creator.publicKey },
-            } as Provider
-            const program = new Program(PUMPFUN_IDL, provider)
-
-            const nonce = BigInt(Date.now())
-            log(`nonce   : ${nonce}`)
             log(
-                `mint    : ${EXPLORER}/address/${PUMPFUN_PROGRAM_ID.toBase58()} (program) — pda below`
+                `program : pump.fun native (6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P)`
             )
-
+            log(
+                `migrate : automatic (pump.fun migrates to PumpSwap on graduation; create args = name/symbol/uri only)`
+            )
             // Funding math mirrors scripts/launch-bundle.mjs: each wallet needs
             // sol_in + ATA rent + the rent-exempt floor it must retain post-buy.
             const ataRent = await ataRentLamports(connection)
@@ -362,26 +336,25 @@ export function LaunchPanel({
             }
 
             const seq = await buildLaunchSequence({
-                program,
                 connection,
                 creator,
-                nonce,
                 name,
                 symbol,
                 uri: finalUri,
                 buys,
                 fundLamportsPerWallet,
                 // Tier 1 has no bundle tip, so the full 1222-byte budget is
-                // available (5 wallets = 1173 bytes fit one buy tx). Tier 2 keeps
-                // the default 1150 + 90 tip reserve.
+                // available. Tier 2 keeps the default 1150 + 90 tip reserve.
+                // Measured (M10): pump.fun buy ixs pack 2 wallets per tx max.
                 ...(tier === '1'
                     ? { maxBuyTxBytes: 1222, tipReserveBytes: 0 }
                     : {}),
-                autoMigrate,
-                lockLp,
             })
             log(
-                `create args: ${seq.migrationArgsSupported ? 'auto_migrate + lock_lp SENT (M3 idl)' : 'pre-M3 create() (flags NOT sent; toggles disabled)'}`
+                `mint    : ${EXPLORER}/address/${seq.pda.mint.toBase58()}?cluster=devnet (fresh pump.fun mint keypair; the .pump suffix is indexer-applied)`
+            )
+            log(
+                `curve   : ${EXPLORER}/address/${seq.pda.curveState.toBase58()}?cluster=devnet`
             )
             log(`packing : ${seq.buyTxs.length} buy tx(s):`)
             for (const bt of seq.buyTxs) {
@@ -448,6 +421,17 @@ export function LaunchPanel({
                     ...seq.buyTxs.map((b) => b.tx),
                 ].filter((t): t is NonNullable<typeof t> => t !== null)
                 const bundleSigners = seq.signersByTx
+                // M10: pump.fun buy ixs pack 2 wallets per tx (measured), so a
+                // launch over ~6 funded wallets produces more buy txs than the
+                // 5-tx Jito bundle cap. Surface that BEFORE assembleBundle's
+                // cryptic cap error with the actionable fix.
+                if (bundleTxs.length > 5) {
+                    const nonBuyTxs = bundleTxs.length - seq.buyTxs.length;
+                    const maxWallets = 2 * (5 - nonBuyTxs);
+                    throw new Error(
+                        `TIER 2 BUNDLE CAP: ${bundleTxs.length} txs > the 5-tx Jito bundle limit (pump.fun buy ixs pack 2 wallets per tx). Reduce the selected dev wallets to at most ${maxWallets} or use Tier 1 (sequential sends).`
+                    );
+                }
                 const assembled = await jito.assembleBundle({
                     txs: bundleTxs,
                     signersByTx: bundleSigners,
@@ -471,10 +455,11 @@ export function LaunchPanel({
                     fundIxPerWallet: seq.fundIxPerWallet,
                     buyTxs: seq.buyTxs.map((bt) => ({
                         wallets: bt.wallets,
-                        instructions: bt.instructions,
+                        walletIxs: bt.walletIxs,
                     })),
                     tipIx,
                     creator,
+                    mintKeypair: seq.mintKeypair,
                 })
                 for (const s of sims)
                     log(`   ${s.label}: ${s.unitsConsumed} CU, ok`)
@@ -573,26 +558,20 @@ export function LaunchPanel({
                 )
             }
             try {
-                // The loose Idl cast makes the account namespace untyped; the
-                // runtime key follows the IDL account name (CurveStateAccount).
-                const curveAccount = (
-                    program.account as unknown as {
-                        curveStateAccount: {
-                            fetch: (key: PublicKey) => Promise<{
-                                solReserve: { toString(): string }
-                                tokenReserve: { toString(): string }
-                                supplyOut: { toString(): string }
-                            }>
-                        }
-                    }
-                ).curveStateAccount
-                const curve = await curveAccount.fetch(seq.pda.curveState)
-                log(
-                    `curve state: solReserve=${curve.solReserve.toString()} tokenReserve=${curve.tokenReserve.toString()} supplyOut=${curve.supplyOut.toString()}`
-                )
-                log(
-                    `price      : ${(Number(curve.solReserve.toString()) / Number(curve.tokenReserve.toString())).toFixed(6)} lamports/token`
-                )
+                // M10: pump.fun curve state (bonding-curve PDA parsed in
+                // lib/pump.ts; virtual reserves + the complete flag).
+                const curveRead = await readPumpCurveState(connection, mintPk)
+                if (curveRead.kind === 'ok') {
+                    const c = curveRead.curve
+                    log(
+                        `curve state: virtualSol=${c.virtualSolReserves} virtualToken=${c.virtualTokenReserves} complete=${c.complete ? 1 : 0}`
+                    )
+                    log(
+                        `price      : ${(Number(c.virtualSolReserves) / Number(c.virtualTokenReserves)).toFixed(6)} lamports/token`
+                    )
+                } else {
+                    log('curve state: not found (create tx did not land?)')
+                }
             } catch (e) {
                 log(`curve state read failed: ${errMsg(e)}`)
             }
@@ -633,29 +612,6 @@ export function LaunchPanel({
             }
             if (e instanceof Error && e.stack) {
                 log(e.stack.split('\n').slice(0, 5).join('\n'))
-            }
-            // The pre-M3 deployed program rejects the M3 buy shape (its Buy
-            // account list is 8, the new one is 10) with InvalidProgramId 3008
-            // at the system_program slot. The flags were NOT silently dropped:
-            // they are encoded per the loaded IDL. The launch works the moment
-            // M3's anchor deploy lands (verified against the M3 .so on a local
-            // validator). Surface that instead of the cryptic chain error.
-            if (
-                rawMsg.includes('InvalidProgramId') ||
-                rawMsg.includes('Custom":3008')
-            ) {
-                log(
-                    'NOTE: this is the pre-M3 deployed program rejecting the M3 buy shape'
-                )
-                log(
-                    '      (the on-chain program predates the M3 upgrade; M3 anchor deploy pending).'
-                )
-                log(
-                    '      The migration flags were encoded but the old program cannot execute the new'
-                )
-                log(
-                    '      buy accounts. Re-launch after M3 deploys; no code change needed.'
-                )
             }
             // M7a error surfacing: rate-limit / expired blockhash / insufficient
             // funds / rent map to actionable text; the raw message stays in the log
@@ -713,31 +669,11 @@ export function LaunchPanel({
         const sigs: string[] = []
         try {
             const connection = makeDevnetConnection()
-            const firstKey = roster.wallets.find((w) => w.key)?.key
-            const anyPub = firstKey ? pubkeyFromSecretKey(firstKey) : null
-            if (!anyPub) {
-                throw new Error(
-                    'roster key is not a valid base58 64-byte secret'
-                )
-            }
-            // The engine signs every sell with the roster Keypairs; the
-            // Program only encodes instructions + fetches accounts, so a
-            // minimal provider suffices (anchor Wallet is Node-only in the
-            // browser build).
-            const providerPubkey = new PublicKey(anyPub)
-            const provider = {
-                connection,
-                publicKey: providerPubkey,
-                wallet: { publicKey: providerPubkey },
-            } as Provider
-            const program = new Program(
-                PUMPFUN_IDL,
-                provider
-            ) as unknown as SellAllProgram
-
+            // M10: sellAllManagedWallets signs every sell with the roster
+            // Keypairs and hand-builds the pump.fun sell ixs itself (no anchor
+            // Program, no IDL) — only the connection + mint + roster are needed.
             const report = await sellAllManagedWallets({
                 connection,
-                program,
                 mint: new PublicKey(mint),
                 wallets: roster.wallets,
                 slippagePct: 5,
@@ -912,34 +848,17 @@ export function LaunchPanel({
                         )}
                     </div>
 
-                    {/* migration toggles (M3 capability-gated) + funding */}
+                    {/* M10: pump.fun auto-migrates on graduation (the old M3
+                    custom-program toggles are gone; the create args are ONLY
+                    name/symbol/uri) + funding */}
                     <div className="lg:col-span-4">
                         <div className="flex flex-wrap items-center gap-4 border-2 border-ink px-3 py-2">
-                            <label className="label-mono flex items-center gap-2 cursor-pointer">
-                                <input
-                                    type="checkbox"
-                                    className="checkbox-brutal"
-                                    checked={autoMigrate}
-                                    disabled={!migrationSupported}
-                                    onChange={(e) =>
-                                        setAutoMigrate(e.target.checked)
-                                    }
-                                />
-                                auto-migrate
-                            </label>
-                            <label className="label-mono flex items-center gap-2 cursor-pointer">
-                                <input
-                                    type="checkbox"
-                                    className="checkbox-brutal"
-                                    checked={lockLp}
-                                    disabled={!migrationSupported}
-                                    onChange={(e) =>
-                                        setLockLp(e.target.checked)
-                                    }
-                                />
-                                lp-lock
-                            </label>
-                            <label className="label-mono flex items-center gap-2 cursor-pointer opacity-80">
+                            <span className="label-mono !text-[10px] opacity-80">
+                                migration: AUTOMATIC (pump.fun migrates to
+                                PumpSwap when the curve graduates — no launch
+                                flags, the `.pump` suffix is indexer-applied)
+                            </span>
+                            <label className="label-mono flex items-center gap-2 cursor-pointer opacity-80 ml-auto">
                                 <input
                                     type="checkbox"
                                     className="checkbox-brutal"

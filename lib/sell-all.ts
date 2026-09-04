@@ -1,18 +1,21 @@
-// Milestone M6: the SELL ALL engine.
+// Milestone M6: the SELL ALL engine, on pump.fun's NATIVE program (M10).
 //
 // One call sells every managed wallet's full token balance of a mint,
 // routed by the on-chain curve state (the key part):
 //
-//   - NOT GRADUATED: the curve is still open, so each wallet sells through
-//     the pumpfun program's sell(token_in) instruction (100% of its token
-//     balance, per the bonding-curve math).
-//   - GRADUATED: the curve is closed (sell reverts with AlreadyGraduated);
-//     each wallet instead swaps its full balance to WSOL on the PumpSwap
-//     pool via the official @pump-fun/pump-swap-sdk (sellBaseInput quotes a
-//     fresh minAmountOut from the pool reserves under the slippage band).
-//     The SDK's sell instruction stream closes the WSOL account in the same
-//     transaction (quote mint = native mint), so each wallet ends up with
-//     native SOL, no leftover WSOL ATA.
+//   - NOT GRADUATED (`complete` = 0): the curve is still open, so each
+//     wallet sells through pump.fun's sell(tokens_in, min_sol_output)
+//     instruction (100% of its token balance, quoted client-side against
+//     the VIRTUAL reserves with a slippage floor).
+//   - GRADUATED (`complete` = 1): the curve is closed (sell reverts; pump.fun
+//     auto-migrated it to PumpSwap at graduation — the client never calls a
+//     migrate instruction anymore); each wallet instead swaps its full
+//     balance to WSOL on the PumpSwap pool via the official
+//     @pump-fun/pump-swap-sdk (sellBaseInput quotes a fresh minAmountOut
+//     from the pool reserves under the slippage band). The SDK's sell
+//     instruction stream closes the WSOL account in the same transaction
+//     (quote mint = native mint), so each wallet ends up with native SOL,
+//     no leftover WSOL ATA.
 //
 // Wallets without a key (watch-only) or with a zero token balance are
 // skipped. The per-wallet sells run CONCURRENTLY (Promise.allSettled, the
@@ -21,77 +24,29 @@
 // received) and the holder count measured after the run.
 //
 // Browser-safe: this module only builds/signs with Keypairs and reads the
-// chain through the passed Connection/Program; it never imports the anchor
-// Wallet class (Node-only).
+// chain through the passed Connection; it never imports the anchor Wallet
+// class or the anchor Program (M10: the curve sell is a hand-built
+// lib/pump.ts instruction over the LEGACY SPL token program — pump.fun
+// mints are not Token-2022).
 
-import { BN } from "@coral-xyz/anchor";
-import {
-  TOKEN_2022_PROGRAM_ID,
-  getAssociatedTokenAddressSync,
-} from "@solana/spl-token";
-import { OnlinePumpAmmSdk, PumpAmmSdk } from "@pump-fun/pump-swap-sdk";
 import {
   Connection,
   Keypair,
   LAMPORTS_PER_SOL,
   PublicKey,
-  SystemProgram,
   Transaction,
-  TransactionInstruction,
 } from "@solana/web3.js";
+import { OnlinePumpAmmSdk, PumpAmmSdk } from "@pump-fun/pump-swap-sdk";
+import { BN } from "@coral-xyz/anchor";
 import bs58 from "bs58";
 import { holderCount, walletTokenBalance } from "./bundle/launch";
-import { friendlyTxError } from "./tx-errors";
 import {
-  CANONICAL_POOL_INDEX,
-  curveStatePda,
-  lookupMigratedPool,
-  sendRawWithRetry,
-  type CurveProgram,
-} from "./migrate";
-
-/** The curve account fields this engine quotes against (structural; anchor
- *  account fetches return camelCase names at runtime). */
-export interface CurveAccountLike {
-  creator: PublicKey;
-  graduated: boolean;
-  lockLp: boolean;
-  /** Virtual + real SOL reserve, lamports. */
-  solReserve: BN | bigint;
-  /** Virtual token reserve, raw units. */
-  tokenReserve: BN | bigint;
-  /** Cumulative tokens minted (monotonic). */
-  supplyOut: BN | bigint;
-  /** Protocol fee, basis points (100 = 1%). */
-  feeBps: BN | bigint;
-}
-
-/** Narrow program surface the engine needs: encode the curve sell
- *  instruction (program.methods.sell(...).accounts(...).instruction()) and
- *  fetch the curve account. The real anchor Program satisfies this shape;
- *  call sites cast at the boundary (same pattern as lib/migrate's
- *  CurveProgram). */
-export interface SellAllProgram extends CurveProgram {
-  account: {
-    curveStateAccount: {
-      fetch(address: PublicKey): Promise<CurveAccountLike>;
-    };
-  };
-  methods: {
-    sell: (tokenIn: BN) => {
-      accounts(args: {
-        seller: PublicKey;
-        mint: PublicKey;
-        curveState: PublicKey;
-        sellerAta: PublicKey;
-        systemProgram: PublicKey;
-        token2022Program: PublicKey;
-      }): {
-        instruction(): Promise<TransactionInstruction>;
-      };
-    };
-  };
-}
+  buildPumpSellIx,
+  quotePumpSell,
+  readPumpCurveState,
+} from "./pump";
+import { CANONICAL_POOL_INDEX, lookupMigratedPool, sendRawWithRetry } from "./migrate";
+import { friendlyTxError } from "./tx-errors";
 
 /** A managed roster wallet the engine can sell for (key optional: wallets
  *  without a base58 secret are skipped, watch-only rows never sign). */
@@ -121,12 +76,12 @@ export interface SellOutcome {
 
 export interface SellAllOptions {
   connection: Connection;
-  program: SellAllProgram;
   /** The token mint to sell (curve mint = PumpSwap base mint). */
   mint: PublicKey;
   /** The managed roster; keyed wallets are sold, watch-only skipped. */
   wallets: SellableWallet[];
-  /** PumpSwap slippage percent for the graduated leg (default 5). */
+  /** Slippage percent for the quotes (default 5), applied to the curve
+   *  leg's min_sol_output AND passed to the PumpSwap SDK's sell leg. */
   slippagePct?: number;
   /** PumpSwap pool index seed (default CANONICAL_POOL_INDEX = 0). */
   poolIndex?: number;
@@ -134,7 +89,7 @@ export interface SellAllOptions {
 
 export interface SellAllReport {
   route: SellRoute;
-  /** Curve graduated flag that chose the route. */
+  /** Curve `complete` flag that chose the route. */
   graduated: boolean;
   /** The curve creator (the PumpSwap pool creator once graduated). */
   creator: string;
@@ -151,59 +106,6 @@ export interface SellAllReport {
   outcomes: SellOutcome[];
   /** Holder count after the run (null when the RPC read failed). */
   holderCountAfter: number | null;
-}
-
-/** Converts a BN or bigint curve field to a plain bigint. */
-function toBig(v: BN | bigint): bigint {
-  return typeof v === "bigint" ? v : BigInt(v.toString());
-}
-
-/** Mirrors programs/pumpfun/src/curve_math.rs sell(): fee is charged on the
- *  token input, then sol_out = solReserve * effective / (tokenReserve +
- *  effective). Returns null when the sell would revert on chain (zero
- *  effective input, or effective >= tokenReserve draining the curve). */
-export function quoteCurveSellLamports(
-  curve: CurveAccountLike,
-  tokenIn: bigint
-): bigint | null {
-  if (tokenIn <= BigInt(0)) return null;
-  const solReserve = toBig(curve.solReserve);
-  const tokenReserve = toBig(curve.tokenReserve);
-  const feeBps = toBig(curve.feeBps);
-  const keepBps = BigInt(10000) - feeBps;
-  const effective = (tokenIn * keepBps) / BigInt(10000);
-  if (effective <= BigInt(0)) return null;
-  if (effective >= tokenReserve) return null;
-  if (solReserve <= BigInt(0)) return null;
-  return (solReserve * effective) / (tokenReserve + effective);
-}
-
-/** Builds the bonding-curve sell instruction for one wallet's full balance
- *  (the NOT-graduated route). */
-async function buildCurveSellIx(
-  program: SellAllProgram,
-  seller: PublicKey,
-  mint: PublicKey,
-  curveState: PublicKey,
-  tokenIn: bigint
-): Promise<TransactionInstruction> {
-  const sellerAta = getAssociatedTokenAddressSync(
-    mint,
-    seller,
-    false,
-    TOKEN_2022_PROGRAM_ID
-  );
-  return program.methods
-    .sell(new BN(tokenIn.toString()))
-    .accounts({
-      seller,
-      mint,
-      curveState,
-      sellerAta,
-      systemProgram: SystemProgram.programId,
-      token2022Program: TOKEN_2022_PROGRAM_ID,
-    })
-    .instruction();
 }
 
 /** True when a failure is a transient RPC/pool condition worth retrying
@@ -258,18 +160,27 @@ function failedOutcome(
   };
 }
 
-/** Sells one keyed wallet's full balance on the bonding curve, confirming
- *  the tx and measuring the native SOL the wallet received. Retries
- *  transient RPC failures with backoff. */
+/**
+ * Sells one keyed wallet's full balance on the open pump.fun bonding curve
+ * (the NOT-graduated route). The sell ix is hand-built (lib/pump.ts): the
+ * full token balance goes in with a min_sol_output quoted client-side
+ * against the curve's VIRTUAL reserves under the slippage band. Confirms
+ * the tx and measures the native SOL the wallet received. Retries transient
+ * RPC failures with backoff.
+ */
 async function sellOneCurve(
   connection: Connection,
-  program: SellAllProgram,
   mint: PublicKey,
-  curveState: PublicKey,
-  curve: CurveAccountLike,
-  wallet: Keypair
+  curve: {
+    creator: PublicKey;
+    virtualSolReserves: bigint;
+    virtualTokenReserves: bigint;
+  },
+  wallet: Keypair,
+  slippagePct: number
 ): Promise<SellOutcome> {
   const address = wallet.publicKey.toBase58();
+  const slippageBps = BigInt(Math.round(slippagePct * 100));
   let firstBalance = BigInt(0);
   let lastSolBefore = BigInt(0);
   let lastErr: unknown = null;
@@ -305,15 +216,21 @@ async function sellOneCurve(
       lastSolBefore = BigInt(
         await connection.getBalance(wallet.publicKey, "confirmed")
       );
-      const ix = await buildCurveSellIx(
-        program,
-        wallet.publicKey,
+      const quote = quotePumpSell({
+        tokensIn: balance,
+        virtualSolReserves: curve.virtualSolReserves,
+        virtualTokenReserves: curve.virtualTokenReserves,
+        slippageBps,
+      });
+      const ixs = buildPumpSellIx({
         mint,
-        curveState,
-        balance
-      );
+        seller: wallet.publicKey,
+        creator: curve.creator,
+        tokensIn: balance,
+        minSolOutput: quote.minSolOutput,
+      });
       const tx = new Transaction({ feePayer: wallet.publicKey });
-      tx.add(ix);
+      tx.add(...ixs);
       const signature = await sendRawWithRetry(connection, tx, [wallet], {
         confirmTimeoutMs: 90_000,
       });
@@ -344,7 +261,8 @@ async function sellOneCurve(
  *  SDK sellBaseInput quotes a fresh minQuoteAmountOut from the pool state
  *  under the slippage band and returns the instruction stream, which closes
  *  the wallet's WSOL account so the proceeds land as native SOL. Retries
- *  transient RPC failures with backoff. */
+ *  transient RPC failures with backoff. UNCHANGED by M10 (pump.fun
+ *  auto-migrated the curve; the pool + WSOL quote mint stay legacy). */
 async function sellOnePumpSwap(
   connection: Connection,
   mint: PublicKey,
@@ -437,33 +355,36 @@ async function sellOnePumpSwap(
   return failedOutcome(address, "pumpSwap", lastErr ?? new Error("sell failed"));
 }
 
-/** The SELL ALL entry point. Reads the curve state once to choose the route,
- *  then sells every keyed wallet's full balance concurrently. Never throws
- *  for a per-wallet failure: each wallet's error is captured in its outcome
- *  and the final report carries the completed count. */
+/** The SELL ALL entry point. Reads the pump.fun curve state once to choose
+ *  the route, then sells every keyed wallet's full balance concurrently.
+ *  Never throws for a per-wallet failure: each wallet's error is captured in
+ *  its outcome and the final report carries the completed count. */
 export async function sellAllManagedWallets(
   opts: SellAllOptions
 ): Promise<SellAllReport> {
   const {
     connection,
-    program,
     mint,
     wallets,
     slippagePct = 5,
     poolIndex = CANONICAL_POOL_INDEX,
   } = opts;
 
-  // ROUTING: read the curve state once. NOT graduated -> the curve sell
-  // instruction; graduated -> the PumpSwap pool the curve migrated to
+  // ROUTING: read the pump.fun curve state once. `complete` = 0 -> the curve
+  // sell instruction (creator + virtual reserves come from the same read);
+  // `complete` = 1 -> the PumpSwap pool the curve auto-migrated to
   // (derived from the recorded creator, index 0).
-  const curveState = curveStatePda(program.programId, mint);
-  const curve = await program.account.curveStateAccount.fetch(curveState);
-  const graduated = curve.graduated;
+  const read = await readPumpCurveState(connection, mint);
+  if (read.kind === "missing") {
+    throw new Error(`curve for mint ${mint.toBase58()} not found (not a pump.fun token?)`);
+  }
+  const curve = read.curve;
+  const graduated = curve.complete;
   const creator = curve.creator.toBase58();
 
   let poolKey: PublicKey | null = null;
   if (graduated) {
-    const lookup = await lookupMigratedPool(program, mint, poolIndex);
+    const lookup = await lookupMigratedPool(connection, mint, poolIndex);
     poolKey = lookup.poolKey;
   }
   const route: SellRoute = graduated ? "pumpSwap" : "curve";
@@ -479,11 +400,14 @@ export async function sellAllManagedWallets(
         if (route === "curve") {
           return await sellOneCurve(
             connection,
-            program,
             mint,
-            curveState,
-            curve,
-            wallet
+            {
+              creator: curve.creator,
+              virtualSolReserves: curve.virtualSolReserves,
+              virtualTokenReserves: curve.virtualTokenReserves,
+            },
+            wallet,
+            slippagePct
           );
         }
         return await sellOnePumpSwap(

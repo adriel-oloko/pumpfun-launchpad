@@ -2,7 +2,7 @@
 //
 // Public surface:
 //   launch.ts   - buildLaunchSequence, packBuyTxs, preflightLaunch,
-//                 sendSequentially, derivePdas, walletTokenBalance,
+//                 sendSequentially, walletTokenBalance,
 //                 holderCount, ataRentLamports, MAX_TX_BYTES, MAX_COMPUTE_UNITS
 //   jito.ts     - JitoBundleClient (getTipAccounts, assembleBundle, sendBundle,
 //                 submitWithRetry), simulateBundle, JITO_*_ENDPOINT,

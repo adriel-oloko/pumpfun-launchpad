@@ -1,19 +1,20 @@
-// Milestone M5: the auto buy/sell engine (Feature 2).
+// Milestone M5: the auto buy/sell engine (Feature 2), now on pump.fun's
+// NATIVE program (M10).
 //
-// Port of v4-launchpad's auto engine to the pumpfun Solana client, with the
-// exact agreed semantics:
+// Port of v4-launchpad's auto engine to the Solana client, with the exact
+// agreed semantics:
 //
 //   - Auto BUY: on/off, wallet count, duration (seconds), MIN SOL. Each round
 //     picks `count` RANDOM keyed wallets with a known SOL balance > 0 and
 //     >= MIN SOL (below min = SKIP), and buys a % of the wallet's spendable
-//     SOL balance (v4 default 95) from the curve via the program's buy
+//     SOL balance (v4 default 95) from the curve via pump.fun's buy
 //     instruction. The spendable base is the live balance minus the
 //     rent-exempt floor, the tx fee margin, and (on a wallet's very first buy
-//     of this mint) the Token-2022 ATA rent, so a buy tx can never leave the
+//     of this mint) the legacy-SPL ATA rent, so a buy tx can never leave the
 //     wallet below rent or fail for lack of ATA rent.
 //   - Auto SELL: on/off, wallet count, duration, MIN %. Each round picks
 //     `count` RANDOM keyed wallets with token balance > 0 and sells a % of
-//     their OWN holdings (v4 default 100) via the program's sell instruction.
+//     their OWN holdings (v4 default 100) via pump.fun's sell instruction.
 //     MIN % is a per-wallet dust gate measured against the token's TOTAL
 //     SUPPLY: a wallet holding below (MIN % of total supply) is SKIPPED, so
 //     the bot never burns rounds/txs dumping dust. MIN % = 0 or blank
@@ -21,6 +22,16 @@
 //   - Trade execution: each picked wallet's trade is its own signed tx (the
 //     wallet is the fee payer), fired concurrently with Promise.allSettled,
 //     reporting only the final completed count (the v4 batch pattern).
+//
+// M10 (native pump.fun):
+//   - pump.fun's buy takes TOKENS OUT (+ max_sol_cost) and sell takes
+//     TOKENS IN (+ min_sol_output), so every trade is quoted client-side
+//     against the curve's VIRTUAL reserves (constant product + 1% fee +
+//     slippage headroom). Quotes chain across the round's wallets so each
+//     wallet quotes the state the preceding fills leave behind.
+//   - Every instruction is built by hand (lib/pump.ts); the mint's ATAs are
+//     LEGACY SPL (pump.fun mints are not Token-2022). No anchor Program, no
+//     IDL, no BN.
 //
 // The graduation guard lives in the scheduler (components/trade-panel.tsx):
 // before each round it fetches the curve state and stops the bot when
@@ -30,16 +41,13 @@
 // Round serialization (one shared autoLockRef) lives in the trade panel, not
 // here: this module's fire functions are pure per-round workers.
 //
-// All amounts are bigint (no bigint literals, project target is ES2017).
-// The anchor Program is used ONLY to encode instructions from the IDL and
-// fetch accounts, exactly like the M4 launch flow (minimal provider; every
-// tx is signed manually with the wallet's Keypair).
+// All amounts are bigint (no bigint literals, project target is ES2017);
+// every tx is signed manually with the wallet's Keypair (anchor Wallet is
+// Node-only in the browser, and the anchor Program is gone entirely).
 
-import { Program, BN } from "@coral-xyz/anchor";
 import {
-  ASSOCIATED_TOKEN_PROGRAM_ID,
-  TOKEN_2022_PROGRAM_ID,
-  getAssociatedTokenAddress,
+  TOKEN_PROGRAM_ID,
+  getAssociatedTokenAddressSync,
 } from "@solana/spl-token";
 import bs58 from "bs58";
 import {
@@ -47,17 +55,22 @@ import {
   Keypair,
   LAMPORTS_PER_SOL,
   PublicKey,
-  SystemProgram,
   Transaction,
   TransactionInstruction,
 } from "@solana/web3.js";
 import {
-  CURVE_SEED,
-  MINT_AUTHORITY_SEED,
   RENT_EXEMPT_FLOOR,
   sendAndConfirmWithRetry,
   walletTokenBalance,
 } from "./bundle/launch";
+import {
+  buildPumpBuyIx,
+  buildPumpSellIx,
+  quotePumpBuy,
+  quotePumpSell,
+  readPumpCurveState,
+  type PumpCurveState,
+} from "./pump";
 import { TOTAL_SUPPLY } from "./params";
 
 /** % of a wallet's spendable SOL balance bought per auto-buy round (v4's
@@ -92,16 +105,17 @@ export interface AutoWallet {
   key: string;
 }
 
-/** Decoded curve state for the auto engine's gates. */
+/** Decoded curve state for the auto engine's gates (pump.fun bonding curve;
+ *  sol/token reserves are the VIRTUAL reserves the program quotes on). */
 export interface AutoCurveInfo {
-  /** Base58 creator pubkey; the buy instruction validates this against
-   *  curve_state.creator and needs the creator's ATA for auto-graduation. */
+  /** Base58 creator pubkey; every buy/sell carries the creator_vault
+   *  derived from it (the fee-program creator leg). */
   creator: string;
-  /** True once the curve graduated; buy/sell revert and the bot stops. */
+  /** True once the curve graduated (`complete` flag); buy/sell revert and
+   *  the bot stops. */
   graduated: boolean;
   solReserve: bigint;
   tokenReserve: bigint;
-  supplyOut: bigint;
 }
 
 /** Fetch result that distinguishes "mint has no curve" from RPC errors. */
@@ -109,100 +123,31 @@ export type AutoCurveRead =
   | { kind: "ok"; curve: AutoCurveInfo }
   | { kind: "missing" };
 
-/** Derives the two PDAs an existing mint's curve needs for trading. */
-export function deriveAutoPdas(
-  programId: PublicKey,
-  mint: PublicKey
-): { curveState: PublicKey; mintAuthority: PublicKey } {
-  const [curveState] = PublicKey.findProgramAddressSync(
-    [CURVE_SEED, mint.toBuffer()],
-    programId
-  );
-  const [mintAuthority] = PublicKey.findProgramAddressSync(
-    [MINT_AUTHORITY_SEED, mint.toBuffer()],
-    programId
-  );
-  return { curveState, mintAuthority };
-}
-
-function normPubkey(v: unknown): string | null {
-  if (v && typeof v === "object" && "toBase58" in v) {
-    return (v as { toBase58: () => string }).toBase58();
-  }
-  return typeof v === "string" ? v : null;
-}
-
-function normBig(v: unknown): bigint {
-  if (v === null || v === undefined) return BigInt(0);
-  if (typeof v === "bigint") return v;
-  if (typeof v === "number") return BigInt(Math.trunc(v));
-  if (typeof v === "object" && "toString" in v) {
-    const s = (v as { toString: () => string }).toString();
-    if (/^-?\d+$/.test(s)) return BigInt(s);
-  }
-  return BigInt(0);
-}
-
-function normBool(v: unknown): boolean {
-  return v === true || v === 1;
-}
-
-/** Raw curve account shape returned by program.account.curveStateAccount
- *  (anchor decodes account fields to camelCase; a couple of defensive
- *  spellings are accepted through normalization). */
-interface CurveAccountFetch {
-  creator?: unknown;
-  graduated?: unknown;
-  solReserve?: unknown;
-  tokenReserve?: unknown;
-  supplyOut?: unknown;
+/** Converts a parsed pump.fun curve state to the engine's AutoCurveInfo. */
+export function toAutoCurveInfo(curve: PumpCurveState): AutoCurveInfo {
+  return {
+    creator: curve.creator.toBase58(),
+    graduated: curve.complete,
+    solReserve: curve.virtualSolReserves,
+    tokenReserve: curve.virtualTokenReserves,
+  };
 }
 
 /**
- * Fetches the curve state for a mint via the anchor account namespace.
+ * Fetches the pump.fun curve state for a mint (bonding-curve PDA under
+ * pump.fun's program; the account layout is parsed in lib/pump.ts).
  * Returns { kind: "missing" } when the curve account does not exist or does
  * not decode (e.g. a random mint with no curve behind the token address);
  * throws on transport/RPC errors so the caller can retry instead of treating
  * a transient failure as a dead curve.
  */
 export async function readAutoCurveState(
-  program: Program,
+  connection: Connection,
   mint: PublicKey
 ): Promise<AutoCurveRead> {
-  const { curveState } = deriveAutoPdas(program.programId, mint);
-  const account = (
-    program.account as unknown as {
-      curveStateAccount: {
-        fetch: (key: PublicKey) => Promise<CurveAccountFetch>;
-      };
-    }
-  ).curveStateAccount;
-  let fetched: CurveAccountFetch;
-  try {
-    fetched = await account.fetch(curveState);
-  } catch (e) {
-    // Anchor throws AccountDoesNotExist / deserialization errors for a mint
-    // with no curve; transport errors surface as fetch failures too, so
-    // distinguish by probing the account directly.
-    const info = await program.provider.connection.getAccountInfo(
-      curveState,
-      "confirmed"
-    );
-    if (!info) return { kind: "missing" };
-    throw e;
-  }
-  const creator = normPubkey(fetched.creator);
-  if (!creator) return { kind: "missing" };
-  return {
-    kind: "ok",
-    curve: {
-      creator,
-      graduated: normBool(fetched.graduated),
-      solReserve: normBig(fetched.solReserve),
-      tokenReserve: normBig(fetched.tokenReserve),
-      supplyOut: normBig(fetched.supplyOut),
-    },
-  };
+  const read = await readPumpCurveState(connection, mint);
+  if (read.kind === "missing") return { kind: "missing" };
+  return { kind: "ok", curve: toAutoCurveInfo(read.curve) };
 }
 
 /* ------------------------------------------------------------------ */
@@ -296,77 +241,93 @@ export function pickRandomKeyedWallets(
 }
 
 /* ------------------------------------------------------------------ */
-/* Instruction builders (IDL-driven, mirror lib/bundle/launch.ts)     */
+/* Instruction builders (hand-built pump.fun ixs, lib/pump.ts)         */
 /* ------------------------------------------------------------------ */
 
-/** One auto-buy instruction: buyer = the wallet, curve accounts resolved
- *  from the mint, creator accounts from the fetched curve state (validated
- *  on-chain on every buy; used if the fill buy auto-graduates). */
-export async function buildAutoBuyIx(
-  program: Program,
-  buyer: PublicKey,
-  mint: PublicKey,
-  solInLamports: bigint,
-  creator: PublicKey
-): Promise<TransactionInstruction> {
-  const { curveState, mintAuthority } = deriveAutoPdas(
-    program.programId,
-    mint
-  );
-  const buyerAta = await getAssociatedTokenAddress(
-    mint,
-    buyer,
-    false,
-    TOKEN_2022_PROGRAM_ID
-  );
-  const creatorAta = await getAssociatedTokenAddress(
-    mint,
-    creator,
-    false,
-    TOKEN_2022_PROGRAM_ID
-  );
-  return program.methods
-    .buy(new BN(solInLamports.toString()))
-    .accounts({
-      buyer,
-      mint,
-      curveState,
-      buyerAta,
-      creatorAccount: creator,
-      creatorAta,
-      mintAuthority,
-      systemProgram: SystemProgram.programId,
-      token2022Program: TOKEN_2022_PROGRAM_ID,
-      associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
-    })
-    .instruction();
+export interface AutoBuyIxOptions {
+  buyer: PublicKey;
+  mint: PublicKey;
+  /** The curve's recorded creator (public key). */
+  creator: PublicKey;
+  solInLamports: bigint;
+  /** The curve's VIRTUAL reserves at quote time (readAutoCurveState). */
+  solReserve: bigint;
+  tokenReserve: bigint;
+  slippageBps?: bigint;
 }
 
-/** One auto-sell instruction (6 accounts, no creator leg on sell). */
-export async function buildAutoSellIx(
-  program: Program,
-  seller: PublicKey,
-  mint: PublicKey,
-  tokenIn: bigint
-): Promise<TransactionInstruction> {
-  const { curveState } = deriveAutoPdas(program.programId, mint);
-  const sellerAta = await getAssociatedTokenAddress(
+/**
+ * One auto-buy instruction pair: buyer = the wallet, curve accounts resolved
+ * from the mint, creator accounts from the curve state (the creator_vault
+ * leg of pump.fun's fee program). The SOL amount is quoted client-side to
+ * tokens_out + max_sol_cost (pump.fun's buy takes TOKENS OUT).
+ */
+export function buildAutoBuyIx(opts: AutoBuyIxOptions): TransactionInstruction[] {
+  const {
+    buyer,
+    mint,
+    creator,
+    solInLamports,
+    solReserve,
+    tokenReserve,
+    slippageBps,
+  } = opts;
+  const quote = quotePumpBuy({
+    solInLamports,
+    virtualSolReserves: solReserve,
+    virtualTokenReserves: tokenReserve,
+    slippageBps,
+  });
+  return buildPumpBuyIx({
+    mint,
+    buyer,
+    creator,
+    tokensOut: quote.tokensOut,
+    maxSolCost: quote.maxSolCost,
+  });
+}
+
+export interface AutoSellIxOptions {
+  seller: PublicKey;
+  mint: PublicKey;
+  /** The curve's recorded creator (public key); feeds the creator_vault
+   *  account of pump.fun's sell. */
+  creator: PublicKey;
+  tokenIn: bigint;
+  /** The curve's VIRTUAL reserves at quote time. */
+  solReserve: bigint;
+  tokenReserve: bigint;
+  slippageBps?: bigint;
+}
+
+/**
+ * One auto-sell instruction pair: seller = the wallet. The token amount is
+ * handed over with a min_sol_output quoted client-side (pump.fun's sell
+ * takes TOKENS IN + a SOL floor).
+ */
+export function buildAutoSellIx(opts: AutoSellIxOptions): TransactionInstruction[] {
+  const {
+    seller,
+    mint,
+    creator,
+    tokenIn,
+    solReserve,
+    tokenReserve,
+    slippageBps,
+  } = opts;
+  const quote = quotePumpSell({
+    tokensIn: tokenIn,
+    virtualSolReserves: solReserve,
+    virtualTokenReserves: tokenReserve,
+    slippageBps,
+  });
+  return buildPumpSellIx({
     mint,
     seller,
-    false,
-    TOKEN_2022_PROGRAM_ID
-  );
-  return program.methods
-    .sell(new BN(tokenIn.toString()))
-    .accounts({
-      seller,
-      mint,
-      curveState,
-      sellerAta,
-      systemProgram: SystemProgram.programId,
-      token2022Program: TOKEN_2022_PROGRAM_ID,
-    })
-    .instruction();
+    creator,
+    tokensIn: tokenIn,
+    minSolOutput: quote.minSolOutput,
+  });
 }
 
 /* ------------------------------------------------------------------ */
@@ -382,8 +343,8 @@ export interface AutoRoundResult {
 
 export interface FireAutoBuyOptions {
   connection: Connection;
-  program: Program;
   mint: PublicKey;
+  /** Curve state read at round start; quotes chain across the round. */
   curve: AutoCurveInfo;
   wallets: AutoWallet[];
   /** % of the wallet's spendable SOL balance to buy (default 95). */
@@ -396,14 +357,15 @@ export interface FireAutoBuyOptions {
  * Fires one auto-buy round: every picked wallet buys `buyPct`% of its own
  * spendable SOL balance as its own signed tx, concurrently. The spendable
  * base keeps the rent-exempt floor, a fee margin, and (first buy of this
- * mint only) the ATA rent unspent, so the tx is always landable on tiny
- * devnet balances. Skipped = live balance under MIN SOL or nothing tradeable;
- * failed = build/send/confirm error. Completed = confirmed on-chain.
+ * mint only) the legacy-SPL ATA rent unspent, so the tx is always landable
+ * on tiny devnet balances. Skipped = live balance under MIN SOL or nothing
+ * tradeable; failed = build/send/confirm error. Completed = confirmed
+ * on-chain.
  */
 export async function fireAutoBuy(
   opts: FireAutoBuyOptions
 ): Promise<AutoRoundResult> {
-  const { connection, program, mint, curve, wallets, minSolLamports } = opts;
+  const { connection, mint, curve, wallets, minSolLamports } = opts;
   const buyPct = opts.buyPct ?? AUTO_BUY_PCT;
   if (wallets.length === 0) {
     return { completed: 0, failed: 0, skipped: 0 };
@@ -411,10 +373,16 @@ export async function fireAutoBuy(
   const pctNum = Math.round(buyPct * 100);
   const creator = new PublicKey(curve.creator);
   const ataRent = await connection.getMinimumBalanceForRentExemption(
-    170,
+    165,
     "confirmed"
   );
   const latest = await connection.getLatestBlockhash("confirmed");
+
+  // Chain the round's quotes across the simulated reserves: wallet i quotes
+  // the state wallets 0..i-1 leave behind (their fills land within the
+  // round), so the quotes stay tight under the slippage band.
+  let vsr = curve.solReserve;
+  let vtr = curve.tokenReserve;
 
   const results = await Promise.allSettled(
     wallets.map(async (w): Promise<"ok" | "skipped"> => {
@@ -426,11 +394,11 @@ export async function fireAutoBuy(
       if (live < minSolLamports) return "skipped";
       // Reserve the ATA rent only when the ATA account does not exist yet
       // (the wallet's first buy of this mint creates it on demand).
-      const ata = await getAssociatedTokenAddress(
+      const ata = getAssociatedTokenAddressSync(
         mint,
         kp.publicKey,
         false,
-        TOKEN_2022_PROGRAM_ID
+        TOKEN_PROGRAM_ID
       );
       const ataInfo = await connection.getAccountInfo(ata, "confirmed");
       const reserveAta = ataInfo ? BigInt(0) : BigInt(ataRent);
@@ -442,19 +410,26 @@ export async function fireAutoBuy(
       if (spendable <= BigInt(0)) return "skipped";
       const solIn = (spendable * BigInt(pctNum)) / BigInt(10_000);
       if (solIn <= BigInt(0)) return "skipped";
-      const ix = await buildAutoBuyIx(
-        program,
-        kp.publicKey,
+      const quote = quotePumpBuy({
+        solInLamports: solIn,
+        virtualSolReserves: vsr,
+        virtualTokenReserves: vtr,
+      });
+      vsr = quote.nextVirtualSolReserves;
+      vtr = quote.nextVirtualTokenReserves;
+      const ixs = buildPumpBuyIx({
         mint,
-        solIn,
-        creator
-      );
+        buyer: kp.publicKey,
+        creator,
+        tokensOut: quote.tokensOut,
+        maxSolCost: quote.maxSolCost,
+      });
       const tx = new Transaction({
         feePayer: kp.publicKey,
         blockhash: latest.blockhash,
         lastValidBlockHeight: latest.lastValidBlockHeight,
       });
-      tx.add(ix);
+      tx.add(...ixs);
       // M7a: send + confirm with an automatic fresh-blockhash retry when the
       // blockhash expires (an expired tx can never land, so re-sending is
       // safe). Confirm timeouts surface as failures (the tx may still land),
@@ -481,8 +456,10 @@ export async function fireAutoBuy(
 
 export interface FireAutoSellOptions {
   connection: Connection;
-  program: Program;
   mint: PublicKey;
+  /** Curve state read at round start: the creator feeds the sell's
+   *  creator_vault leg and the reserves feed the min_sol_output quote. */
+  curve: AutoCurveInfo;
   wallets: AutoWallet[];
   /** % of each wallet's OWN holdings to sell (default 100). */
   sellPct?: number;
@@ -499,13 +476,18 @@ export interface FireAutoSellOptions {
 export async function fireAutoSell(
   opts: FireAutoSellOptions
 ): Promise<AutoRoundResult> {
-  const { connection, program, mint, wallets, minSellRaw } = opts;
+  const { connection, mint, curve, wallets, minSellRaw } = opts;
   const sellPct = opts.sellPct ?? AUTO_SELL_PCT;
   if (wallets.length === 0) {
     return { completed: 0, failed: 0, skipped: 0 };
   }
   const pctNum = Math.round(sellPct * 100);
+  const creator = new PublicKey(curve.creator);
   const latest = await connection.getLatestBlockhash("confirmed");
+
+  // Chain the round's min_sol_output quotes across the simulated reserves.
+  let vsr = curve.solReserve;
+  let vtr = curve.tokenReserve;
 
   const results = await Promise.allSettled(
     wallets.map(async (w): Promise<"ok" | "skipped"> => {
@@ -519,13 +501,26 @@ export async function fireAutoSell(
       if (balance < minSellRaw) return "skipped";
       const tokenIn = (balance * BigInt(pctNum)) / BigInt(10_000);
       if (tokenIn <= BigInt(0)) return "skipped";
-      const ix = await buildAutoSellIx(program, kp.publicKey, mint, tokenIn);
+      const quote = quotePumpSell({
+        tokensIn: tokenIn,
+        virtualSolReserves: vsr,
+        virtualTokenReserves: vtr,
+      });
+      vsr = vsr + quote.netSolOut;
+      vtr = vtr - tokenIn;
+      const ixs = buildPumpSellIx({
+        mint,
+        seller: kp.publicKey,
+        creator,
+        tokensIn: tokenIn,
+        minSolOutput: quote.minSolOutput,
+      });
       const tx = new Transaction({
         feePayer: kp.publicKey,
         blockhash: latest.blockhash,
         lastValidBlockHeight: latest.lastValidBlockHeight,
       });
-      tx.add(ix);
+      tx.add(...ixs);
       // M7a: expiry-safe send + confirm, same semantics as the buy worker.
       await sendAndConfirmWithRetry(connection, tx, [kp], {
         attempts: 2,

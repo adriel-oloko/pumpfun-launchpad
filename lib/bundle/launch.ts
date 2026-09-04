@@ -1,34 +1,40 @@
-// Milestone M2: multi-wallet atomic launch construction.
+// Milestone M2 + M10: multi-wallet atomic launch construction on pump.fun's
+// NATIVE program.
 //
-// This module builds the launch sequence for the M1 pumpfun program:
+// This module builds the launch sequence:
 //
 //   [optional fund tx] -> [create tx] -> [buy tx 1] -> [buy tx 2] -> ...
 //
-// - The create transaction is signed by the creator only.
-// - Each buy transaction packs as many dev-wallet buys as fit the 1232-byte
-//   transaction limit (measured: ~155 bytes per extra wallet, so 5 wallets per
-//   buy tx is the byte ceiling; the tip-carrying last bundle tx holds 4).
-//   Every selected dev wallet signs its own buy; the creator signs each buy tx
-//   as fee payer only.
-// - First buys create each wallet's Token-2022 ATA on demand (rent 0.001887
-//   SOL, 170 bytes, paid by the buyer). Measured devnet CU: ~33-37k per buy
-//   with ATA creation, ~72k for create, so 5 buys in one tx is ~185k CU, far
-//   under the 1.4M ceiling: bytes are the binding constraint, not compute.
+// - The create transaction is signed by the creator AND the fresh mint
+//   Keypair (pump.fun mints are generated client-side at launch, NOT PDAs;
+//   the mint keypair must never be lost mid-launch — it stays in the same
+//   signer set as the creator).
+// - pump.fun's buy takes TOKENS OUT (+ max_sol_cost), so each wallet's SOL
+//   amount is quoted client-side against the VIRTUAL reserves (constant
+//   product + 1% fee + slippage headroom) before the txs are packed. The
+//   curve starts at the known initial reserves (30 SOL / 1.073B virtual),
+//   so pre-fill buys quote against the initial state, then each subsequent
+//   buy quotes against the state the preceding fills leave behind.
+// - Every buy instruction is built by hand (lib/pump.ts) over pump.fun's
+//   program; the LEGACY SPL token program is used for the mint's ATAs
+//   (pump.fun mints are NOT Token-2022). No anchor Program, no IDL.
+// - Each buy tx packs as many dev-wallet buys as fit the 1232-byte
+//   transaction limit. Measured (M10): one buy = an ATA-create-idempotent
+//   ix + a 16-account buy ix ≈ 200 bytes/wallet, so 2 wallets fit a buy tx
+//   (1060 signed bytes under the default 1150 - 90 tip budget); 3 overflow.
+//   Every selected dev wallet signs its own buy; the creator signs each buy
+//   tx as fee payer only. The tip-carrying last bundle tx holds <= 2.
 // - The sequence can be sent as normal transactions (Tier 1, no Jito) or
 //   assembled into a Jito bundle (Tier 2, see jito.ts).
 //
-// The anchor client is consumed exactly as verified against
-// target/idl/pumpfun.json: program.methods.buy|create with the IDL account
-// names, .instruction() emits the 8-byte discriminator + borsh args and the
-// IDL account order. No account list is hardcoded anywhere.
+// The curve economics are identical to the old custom program (30 SOL
+// virtual reserve, 1.073B virtual token reserve, 1% fee, 85 SOL graduation,
+// 6 decimals, 1e9 supply — lib/params.ts, unchanged).
 
 import {
-  ASSOCIATED_TOKEN_PROGRAM_ID,
-  TOKEN_2022_PROGRAM_ID,
-  getAssociatedTokenAddress,
+  TOKEN_PROGRAM_ID,
+  getAssociatedTokenAddressSync,
 } from "@solana/spl-token";
-import { Buffer } from "buffer";
-import { BN, Program } from "@coral-xyz/anchor";
 import {
   ComputeBudgetProgram,
   Connection,
@@ -36,25 +42,25 @@ import {
   LAMPORTS_PER_SOL,
   PublicKey,
   SystemProgram,
-  SYSVAR_INSTRUCTIONS_PUBKEY,
-  SYSVAR_RENT_PUBKEY,
   Transaction,
   TransactionInstruction,
 } from "@solana/web3.js";
-import { DEFAULT_AUTO_MIGRATE, DEFAULT_LOCK_LP } from "../params";
+import {
+  PUMP_METAPLEX_PROGRAM_ID,
+  buildPumpBuyIx,
+  buildPumpCreateIx,
+  pumpBondingCurvePda,
+  pumpMetadataPda,
+  pumpMintAuthorityPda,
+  quotePumpBuy,
+} from "../pump";
+import { VIRTUAL_SOL_RESERVE, VIRTUAL_TOKEN_RESERVE } from "../params";
 import { DEFAULT_PRIORITY_FEE_MICRO_LAMPORTS } from "../fees";
 import { isBlockhashExpiredError } from "../tx-errors";
 
-/** Metaplex token metadata program id (from target/idl/pumpfun.json). */
-export const METAPLEX_PROGRAM_ID = new PublicKey(
-  "metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s"
-);
-
-/** PDA seed prefixes, replicated exactly from programs/pumpfun/src/lib.rs. */
-export const MINT_SEED = Buffer.from("mint");
-export const CURVE_SEED = Buffer.from("curve");
-export const MINT_AUTHORITY_SEED = Buffer.from("mint_authority");
-export const METADATA_SEED = Buffer.from("metadata");
+/** Metaplex token metadata program id (pump.fun's create metadata PDA is
+ *  derived under it). */
+export const METAPLEX_PROGRAM_ID: PublicKey = PUMP_METAPLEX_PROGRAM_ID;
 
 /** Hard Solana limits (lamport-free, spec constants). */
 export const MAX_TX_BYTES = 1232;
@@ -73,7 +79,9 @@ export const DEFAULT_TIP_RESERVE_BYTES = 90;
  *  overhead), the well-known 890,880 lamport floor. */
 export const RENT_EXEMPT_FLOOR = 890_880;
 
-/** All derived addresses for one launch. */
+/** All derived addresses for one launch (pump.fun derivations: the mint is a
+ *  fresh Keypair; curveState is the pump "bonding-curve" PDA; mintAuthority
+ *  is the GLOBAL pump mint-authority PDA; metadata is the mpl metadata PDA). */
 export interface LaunchPdas {
   mint: PublicKey;
   curveState: PublicKey;
@@ -93,8 +101,11 @@ export interface BuyTx {
   tx: Transaction;
   /** The dev wallets whose buy instructions are packed here (each signs). */
   wallets: Keypair[];
-  /** The buy instructions in order. */
+  /** The buy instructions in order (flat; aligned with `walletIxs`). */
   instructions: TransactionInstruction[];
+  /** Per-wallet instruction groups (each wallet's buy = an ATA-create
+   *  idempotent ix + the pump.fun buy ix). */
+  walletIxs: TransactionInstruction[][];
   /** Serialized byte size once signed (measured at pack time). */
   signedSize: number;
 }
@@ -102,16 +113,13 @@ export interface BuyTx {
 /** The complete launch sequence, all txs sharing one recent blockhash. */
 export interface LaunchSequence {
   pda: LaunchPdas;
+  /** The fresh mint keypair; signs the create tx alongside the creator and
+   *  is NEVER lost mid-launch (it is part of signersByTx[create]). */
+  mintKeypair: Keypair;
   creator: Keypair;
-  nonce: bigint;
   name: string;
   symbol: string;
   uri: string;
-  /** Whether create() actually carried the auto_migrate / lock_lp args (true
-   *  only when the loaded IDL exposes them). When false the M3 flags were
-   *  NOT sent, never silently: the caller sees this and can surface the
-   *  pre-upgrade note. */
-  migrationArgsSupported: boolean;
   /** Creator -> wallet funding transfers (optional). */
   fundTx: Transaction | null;
   fundIx: TransactionInstruction[] | null;
@@ -126,11 +134,10 @@ export interface LaunchSequence {
 }
 
 export interface BuildLaunchOptions {
-  program: Program;
   connection: Connection;
-  /** Creator: signs create, is fee payer on every tx, pays funding. */
+  /** Creator: signs create (with the mint keypair), is fee payer on every
+   *  tx, pays funding. */
   creator: Keypair;
-  nonce: bigint;
   name: string;
   symbol: string;
   uri: string;
@@ -139,7 +146,7 @@ export interface BuildLaunchOptions {
   /** Optional: lamports each wallet receives from the creator (funding tx).
    *  A single value applies to every wallet; an array applies per wallet. */
   fundLamportsPerWallet?: bigint | bigint[] | null;
-  /** Byte budget per buy tx (default 1150; 5 wallets = 1173, so 4 fit). */
+  /** Byte budget per buy tx (default 1150; measured: 2 wallets = 1060). */
   maxBuyTxBytes?: number;
   /** Bytes reserved in the last buy tx for the bundle tip transfer. */
   tipReserveBytes?: number;
@@ -147,161 +154,47 @@ export interface BuildLaunchOptions {
   computeUnitLimit?: number;
   /** Optional priority fee in micro-lamports per CU on every buy tx. */
   priorityFeeMicroLamports?: number;
-  /** M3 per-token migration flags passed to create() when the loaded IDL
-   *  exposes them. When the IDL is pre-M3 they are NOT sent and
-   *  sequence.migrationArgsSupported reports the drop (never silent). */
-  autoMigrate?: boolean;
-  lockLp?: boolean;
+  /** Slippage headroom (basis points) on every pre-fill buy's max_sol_cost
+   *  quote (default 10%: covers reserve drift + the fee-program split). */
+  slippageBps?: bigint;
 }
 
-/** Derives every PDA for a launch, replicating the program's seeds. */
-export function derivePdas(
-  programId: PublicKey,
-  creator: PublicKey,
-  nonce: bigint
-): LaunchPdas {
-  // Little-endian u64 bytes without Buffer.writeBigUInt64LE (Node-only;
-  // browser Buffer shims lack it). BigInt arithmetic only, no bigint
-  // literals (project target is ES2017).
-  const nonceBytes = Buffer.alloc(8);
-  let v = nonce;
-  for (let i = 0; i < 8; i++) {
-    nonceBytes[i] = Number(v & BigInt(0xff));
-    v = v >> BigInt(8);
-  }
-  const [mint] = PublicKey.findProgramAddressSync(
-    [MINT_SEED, creator.toBuffer(), nonceBytes],
-    programId
-  );
-  const [curveState] = PublicKey.findProgramAddressSync(
-    [CURVE_SEED, mint.toBuffer()],
-    programId
-  );
-  const [mintAuthority] = PublicKey.findProgramAddressSync(
-    [MINT_AUTHORITY_SEED, mint.toBuffer()],
-    programId
-  );
-  const [metadata] = PublicKey.findProgramAddressSync(
-    [METADATA_SEED, METAPLEX_PROGRAM_ID.toBuffer(), mint.toBuffer()],
-    METAPLEX_PROGRAM_ID
-  );
+/** Derives every pump.fun address for one launch from the fresh mint
+ *  keypair (the mint is NOT a PDA anymore; the custom-program nonce/mint
+ *  seeds are gone). */
+export function deriveLaunchPdas(mint: PublicKey): LaunchPdas {
+  const [curveState] = pumpBondingCurvePda(mint);
+  const [mintAuthority] = pumpMintAuthorityPda();
+  const [metadata] = pumpMetadataPda(mint);
   return { mint, curveState, mintAuthority, metadata };
 }
 
-/** Builds one buy instruction via the anchor client (IDL account order).
- *  M3: the program's buy now also carries the recorded creator's wallet and
- *  ATA accounts (validated on-chain on every buy; used by the
- *  auto-graduation path when the fill buy finalizes the curve). */
-export async function buildBuyIx(
-  program: Program,
-  buyer: PublicKey,
-  pda: LaunchPdas,
-  solInLamports: bigint,
-  creator: PublicKey
-): Promise<TransactionInstruction> {
-  if (solInLamports <= BigInt(0)) {
-    throw new Error(`buy amount must be positive, got ${solInLamports}`);
+/**
+ * Quotes every pre-fill buy against the curve's INITIAL virtual reserves
+ * (30 SOL / 1.073B — the state right after create, before any buy can land
+ * on a fresh mint), chaining each fill's simulated reserve movement into the
+ * next quote. Returns the per-wallet pump.fun buy args aligned 1:1 with
+ * `buys`.
+ */
+export function quoteLaunchBuys(
+  buys: BuyAllocation[],
+  slippageBps?: bigint
+): { tokensOut: bigint; maxSolCost: bigint }[] {
+  let vsr = VIRTUAL_SOL_RESERVE;
+  let vtr = VIRTUAL_TOKEN_RESERVE;
+  const quotes: { tokensOut: bigint; maxSolCost: bigint }[] = [];
+  for (const buy of buys) {
+    const q = quotePumpBuy({
+      solInLamports: buy.solInLamports,
+      virtualSolReserves: vsr,
+      virtualTokenReserves: vtr,
+      slippageBps,
+    });
+    vsr = q.nextVirtualSolReserves;
+    vtr = q.nextVirtualTokenReserves;
+    quotes.push({ tokensOut: q.tokensOut, maxSolCost: q.maxSolCost });
   }
-  const buyerAta = await getAssociatedTokenAddress(
-    pda.mint,
-    buyer,
-    false,
-    TOKEN_2022_PROGRAM_ID
-  );
-  const creatorAta = await getAssociatedTokenAddress(
-    pda.mint,
-    creator,
-    false,
-    TOKEN_2022_PROGRAM_ID
-  );
-  return program.methods
-    .buy(new BN(solInLamports.toString()))
-    .accounts({
-      buyer,
-      mint: pda.mint,
-      curveState: pda.curveState,
-      buyerAta,
-      creatorAccount: creator,
-      creatorAta,
-      mintAuthority: pda.mintAuthority,
-      systemProgram: SystemProgram.programId,
-      token2022Program: TOKEN_2022_PROGRAM_ID,
-      associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
-    })
-    .instruction();
-}
-
-/** Whether the loaded IDL's create() carries the M3 migration args
- *  (auto_migrate + lock_lp). The anchor client normalizes IDL identifiers to
- *  camelCase (auto_migrate -> autoMigrate), so BOTH spellings are accepted.
- *  The client signs exactly what the IDL declares; sending the new args to a
- *  pre-M3 program would make the create decode fail on-chain, so callers
- *  must gate on this. */
-export function createIxMigrationSupported(program: Program): boolean {
-  const instructions = (
-    program.idl as unknown as {
-      instructions?: { name?: string; args?: { name?: string }[] }[];
-    }
-  ).instructions ?? [];
-  const create = instructions.find((i) => i.name === "create");
-  const argNames = (create?.args ?? []).map((a) => a.name ?? "");
-  const hasAutoMigrate =
-    argNames.includes("auto_migrate") || argNames.includes("autoMigrate");
-  const hasLockLp = argNames.includes("lock_lp") || argNames.includes("lockLp");
-  return hasAutoMigrate && hasLockLp;
-}
-
-/** Builds the create instruction via the anchor client (IDL account order).
- *  The M3 migration flags are appended to the create args ONLY when the
- *  loaded IDL declares them; on a pre-M3 IDL the 4-arg create is emitted and
- *  the caller is told via LaunchSequence.migrationArgsSupported. The flags
- *  are never silently dropped: buildLaunchSequence reports the capability
- *  alongside the built sequence. */
-export async function buildCreateIx(
-  program: Program,
-  creator: PublicKey,
-  pda: LaunchPdas,
-  nonce: bigint,
-  name: string,
-  symbol: string,
-  uri: string,
-  opts?: { autoMigrate?: boolean; lockLp?: boolean }
-): Promise<TransactionInstruction> {
-  if (Buffer.byteLength(name, "utf8") > 32) throw new Error(`name too long: ${name}`);
-  if (Buffer.byteLength(symbol, "utf8") > 10) throw new Error(`symbol too long: ${symbol}`);
-  if (Buffer.byteLength(uri, "utf8") > 200) throw new Error(`uri too long: ${uri}`);
-  const createMethod = program.methods.create as unknown as (
-    nonce: BN,
-    name: string,
-    symbol: string,
-    uri: string,
-    autoMigrate?: boolean,
-    lockLp?: boolean
-  ) => ReturnType<typeof program.methods.create>;
-  const builder = createIxMigrationSupported(program)
-    ? createMethod(
-        new BN(nonce.toString()),
-        name,
-        symbol,
-        uri,
-        opts?.autoMigrate ?? DEFAULT_AUTO_MIGRATE,
-        opts?.lockLp ?? DEFAULT_LOCK_LP
-      )
-    : createMethod(new BN(nonce.toString()), name, symbol, uri);
-  return builder
-    .accounts({
-      creator,
-      mint: pda.mint,
-      curveState: pda.curveState,
-      mintAuthority: pda.mintAuthority,
-      metadata: pda.metadata,
-      sysvarInstructions: SYSVAR_INSTRUCTIONS_PUBKEY,
-      systemProgram: SystemProgram.programId,
-      token2022Program: TOKEN_2022_PROGRAM_ID,
-      mplTokenMetadataProgram: METAPLEX_PROGRAM_ID,
-      rent: SYSVAR_RENT_PUBKEY,
-    })
-    .instruction();
+  return quotes;
 }
 
 /** Serialized size of a signed tx built from ixs + signers. */
@@ -336,13 +229,14 @@ function signedSize(
 /** Materializes one packed buy tx (unsigned). */
 function materializeBuyTx(
   creator: Keypair,
-  ixs: TransactionInstruction[],
+  walletIxs: TransactionInstruction[][],
   wallets: Keypair[],
   blockhash: string,
   computeUnitLimit: number,
   priorityFeeMicroLamports: number,
   signedSizeBytes: number
 ): BuyTx {
+  const instructions = walletIxs.flat();
   const tx = new Transaction({
     feePayer: creator.publicKey,
     blockhash,
@@ -356,32 +250,33 @@ function materializeBuyTx(
       })
     );
   }
-  tx.add(...ixs);
-  return { tx, wallets, instructions: ixs, signedSize: signedSizeBytes };
+  tx.add(...instructions);
+  return { tx, wallets, instructions, walletIxs, signedSize: signedSizeBytes };
 }
 
 /**
  * Greedily packs the dev buys into buy transactions under the byte budget.
- * Each wallet's buy is one instruction; the wallets sign their own buy and the
- * creator signs as fee payer. Measured: +155 bytes per wallet, 5 wallets max
- * per tx (1173 bytes), 4 wallets in the tip-carrying last tx.
+ * Each wallet's buy is two instructions (ATA-create idempotent + pump.fun
+ * buy); the wallets sign their own buys and the creator signs as fee payer.
+ * Measured (M10): ~200 bytes/wallet, 2 wallets max per tx (1060 bytes), 3
+ * overflow the 1232-byte limit.
  */
-export async function packBuyTxs(opts: {
-  program: Program;
+export function packBuyTxs(opts: {
   creator: Keypair;
   pda: LaunchPdas;
   buys: BuyAllocation[];
+  quotes: { tokensOut: bigint; maxSolCost: bigint }[];
   blockhash: string;
   maxBuyTxBytes?: number;
   tipReserveBytes?: number;
   computeUnitLimit?: number;
   priorityFeeMicroLamports?: number;
-}): Promise<BuyTx[]> {
+}): BuyTx[] {
   const {
-    program,
     creator,
     pda,
     buys,
+    quotes,
     blockhash,
     maxBuyTxBytes = DEFAULT_MAX_BUY_TX_BYTES,
     tipReserveBytes = DEFAULT_TIP_RESERVE_BYTES,
@@ -391,22 +286,33 @@ export async function packBuyTxs(opts: {
   if (maxBuyTxBytes > MAX_TX_BYTES) {
     throw new Error(`maxBuyTxBytes ${maxBuyTxBytes} > hard limit ${MAX_TX_BYTES}`);
   }
+  if (quotes.length !== buys.length) {
+    throw new Error(`quotes (${quotes.length}) must align with buys (${buys.length})`);
+  }
   const budget = maxBuyTxBytes - tipReserveBytes;
 
   const out: BuyTx[] = [];
-  let current: { wallets: Keypair[]; ixs: TransactionInstruction[] } | null = null;
+  let current: { wallets: Keypair[]; walletIxs: TransactionInstruction[][] } | null = null;
   let currentSize = 0;
 
-  for (const buy of buys) {
-    const ix = await buildBuyIx(program, buy.wallet.publicKey, pda, buy.solInLamports, creator.publicKey);
-    if (!current) current = { wallets: [], ixs: [] };
-    const candidate: { wallets: Keypair[]; ixs: TransactionInstruction[] } = {
+  for (let i = 0; i < buys.length; i++) {
+    const buy = buys[i];
+    const quote = quotes[i];
+    const ixs = buildPumpBuyIx({
+      mint: pda.mint,
+      buyer: buy.wallet.publicKey,
+      creator: creator.publicKey,
+      tokensOut: quote.tokensOut,
+      maxSolCost: quote.maxSolCost,
+    });
+    if (!current) current = { wallets: [], walletIxs: [] };
+    const candidate: { wallets: Keypair[]; walletIxs: TransactionInstruction[][] } = {
       wallets: [...current.wallets, buy.wallet],
-      ixs: [...current.ixs, ix],
+      walletIxs: [...current.walletIxs, ixs],
     };
     const size = signedSize(
       creator,
-      candidate.ixs,
+      candidate.walletIxs.flat(),
       candidate.wallets,
       blockhash,
       computeUnitLimit,
@@ -420,7 +326,7 @@ export async function packBuyTxs(opts: {
       out.push(
         materializeBuyTx(
           creator,
-          current.ixs,
+          current.walletIxs,
           current.wallets,
           blockhash,
           computeUnitLimit,
@@ -428,10 +334,10 @@ export async function packBuyTxs(opts: {
           currentSize
         )
       );
-      current = { wallets: [buy.wallet], ixs: [ix] };
+      current = { wallets: [buy.wallet], walletIxs: [ixs] };
       currentSize = signedSize(
         creator,
-        [ix],
+        ixs,
         [buy.wallet],
         blockhash,
         computeUnitLimit,
@@ -443,7 +349,7 @@ export async function packBuyTxs(opts: {
     out.push(
       materializeBuyTx(
         creator,
-        current.ixs,
+        current.walletIxs,
         current.wallets,
         blockhash,
         computeUnitLimit,
@@ -456,18 +362,19 @@ export async function packBuyTxs(opts: {
 }
 
 /**
- * Builds the full launch sequence. All txs share one recent blockhash so the
- * same signed txs can either be sent sequentially (Tier 1) or packed into a
- * single Jito bundle with the same blockhash (Tier 2).
+ * Builds the full launch sequence: a fresh mint Keypair, the pump.fun create
+ * tx (signed by the creator + the mint keypair) and every pre-fill buy tx
+ * quoted client-side against the chained virtual reserves. All txs share one
+ * recent blockhash so the same signed txs can either be sent sequentially
+ * (Tier 1) or packed into a single Jito bundle with the same blockhash
+ * (Tier 2).
  */
 export async function buildLaunchSequence(
   opts: BuildLaunchOptions
 ): Promise<LaunchSequence> {
   const {
-    program,
     connection,
     creator,
-    nonce,
     name,
     symbol,
     uri,
@@ -477,8 +384,7 @@ export async function buildLaunchSequence(
     tipReserveBytes,
     computeUnitLimit,
     priorityFeeMicroLamports,
-    autoMigrate,
-    lockLp,
+    slippageBps,
   } = opts;
   if (buys.length === 0) throw new Error("at least one dev wallet buy is required");
 
@@ -500,21 +406,20 @@ export async function buildLaunchSequence(
     }
   };
 
-  const pda = derivePdas(program.programId, creator.publicKey, nonce);
+  // M10: the mint is a FRESH Keypair generated client-side (never a PDA, and
+  // never lost: it signs the create tx in signersByTx[create]).
+  const mintKeypair = Keypair.generate();
+  const pda = deriveLaunchPdas(mintKeypair.publicKey);
   const latest = await connection.getLatestBlockhash("confirmed");
   const blockhash = { blockhash: latest.blockhash, lastValidBlockHeight: latest.lastValidBlockHeight };
 
-  const migrationArgsSupported = createIxMigrationSupported(program);
-  const createIx = await buildCreateIx(
-    program,
-    creator.publicKey,
-    pda,
-    nonce,
+  const createIx = buildPumpCreateIx({
+    creator: creator.publicKey,
+    mint: mintKeypair.publicKey,
     name,
     symbol,
     uri,
-    { autoMigrate, lockLp }
-  );
+  });
   const createTx = new Transaction({ feePayer: creator.publicKey, blockhash: latest.blockhash, lastValidBlockHeight: 0 });
   addFeeIxs(createTx);
   createTx.add(createIx);
@@ -546,11 +451,15 @@ export async function buildLaunchSequence(
     }
   }
 
-  const buyTxs = await packBuyTxs({
-    program,
+  // M10: client-side quotes (pump.fun buy takes tokens_out + max_sol_cost,
+  // so the SOL->tokens math happens here, chained across the fills).
+  const quotes = quoteLaunchBuys(buys, slippageBps);
+
+  const buyTxs = packBuyTxs({
     creator,
     pda,
     buys,
+    quotes,
     blockhash: latest.blockhash,
     maxBuyTxBytes,
     tipReserveBytes,
@@ -560,17 +469,16 @@ export async function buildLaunchSequence(
 
   const signersByTx: Keypair[][] = [];
   if (fundTx) signersByTx.push([creator]);
-  signersByTx.push([creator]);
+  signersByTx.push([creator, mintKeypair]);
   for (const bt of buyTxs) signersByTx.push([creator, ...bt.wallets]);
 
   return {
     pda,
+    mintKeypair,
     creator,
-    nonce,
     name,
     symbol,
     uri,
-    migrationArgsSupported,
     fundTx,
     fundIx,
     fundIxPerWallet,
@@ -629,52 +537,54 @@ export async function simulateTx(
 
 /**
  * Pre-flight simulation of the whole launch. The create tx simulates
- * standalone against the live chain. Buy txs cannot simulate standalone on a
- * fresh mint (the curve does not exist yet), so each buy tx is validated in a
- * sandbox tx that runs the create instruction first, then the buy
- * instructions in chunks of up to 3 wallets (the sandbox tx must stay under
- * the 1232-byte serialization limit). A failed simulation is a hard error.
+ * standalone against the live chain (signed by the creator + the mint
+ * keypair). Buy txs cannot simulate standalone on a fresh mint (the curve
+ * does not exist yet), so each wallet's buy is validated in a sandbox tx
+ * that runs the funding transfer + the create instruction first. Measured
+ * (M10): the pump.fun create ix (~500 bytes) plus ONE wallet's
+ * ATA-create+buy ixs already reach ~1120 bytes with funding, so the sandbox
+ * chunk size is 1 wallet — 2 would overflow the 1232-byte limit. A failed
+ * simulation is a hard error.
  */
 export async function preflightLaunch(
   connection: Connection,
-  seq: LaunchSequence,
-  opts: { chunkSize?: number } = {}
+  seq: LaunchSequence
 ): Promise<{
   create: SimResult;
   buyChunks: { buyTxIndex: number; walletCount: number; result: SimResult }[];
 }> {
-  // With funding, the sandbox must fund each chunk's wallets too, and the
-  // fund + create + chunk buys must stay under the 1232-byte limit: chunk 2
-  // (measured: create + 2 buys + 2 transfers ≈ 1045 bytes). Without funding,
-  // chunk 3 fits (create + 3 buys = 1068).
-  const chunkSize = opts.chunkSize ?? (seq.fundIx ? 2 : 3);
   const latest = await connection.getLatestBlockhash("confirmed");
 
-  // 1) create tx standalone, preceded by the funding transfers (the wallets
-  //    must hold lamports in the sandbox for their buys to pass).
+  // 1) create tx standalone, preceded by up to two funding transfers (the
+  //    sandbox must stay under the 1232-byte limit even for large rosters;
+  //    each buy sandbox below funds its own wallet, so a full funding sweep
+  //    is never needed here).
   const createTx = new Transaction({
     feePayer: seq.creator.publicKey,
     blockhash: latest.blockhash,
     lastValidBlockHeight: 0,
   });
   createTx.add(ComputeBudgetProgram.setComputeUnitLimit({ units: MAX_COMPUTE_UNITS }));
-  if (seq.fundIx) createTx.add(...seq.fundIx);
+  if (seq.fundIx) createTx.add(...seq.fundIx.slice(0, 2));
   createTx.add(seq.createIx);
-  const create = await simulateTx(connection, createTx, [seq.creator]);
+  const create = await simulateTx(connection, createTx, [
+    seq.creator,
+    seq.mintKeypair,
+  ]);
   if (create.err) {
     throw new Error(`preflight: create simulation failed: ${JSON.stringify(create.err)}`);
   }
 
-  // 2) each buy tx, sandboxed behind fund + create instructions
+  // 2) each buy tx's wallets, sandboxed one at a time behind fund + create.
   const buyChunks: { buyTxIndex: number; walletCount: number; result: SimResult }[] = [];
   let walletOffset = 0;
   for (let i = 0; i < seq.buyTxs.length; i++) {
     const bt = seq.buyTxs[i];
-    for (let s = 0; s < bt.wallets.length; s += chunkSize) {
-      const chunkWallets = bt.wallets.slice(s, s + chunkSize);
-      const chunkIxs = bt.instructions.slice(s, s + chunkSize);
+    for (let w = 0; w < bt.wallets.length; w++) {
+      const wallet = bt.wallets[w];
+      const walletIxs = bt.walletIxs[w];
       const chunkFundIx = seq.fundIxPerWallet
-        ? seq.fundIxPerWallet.slice(walletOffset + s, walletOffset + s + chunkSize)
+        ? [seq.fundIxPerWallet[walletOffset + w]]
         : [];
       const tx = new Transaction({
         feePayer: seq.creator.publicKey,
@@ -682,14 +592,18 @@ export async function preflightLaunch(
         lastValidBlockHeight: 0,
       });
       tx.add(ComputeBudgetProgram.setComputeUnitLimit({ units: MAX_COMPUTE_UNITS }));
-      tx.add(...chunkFundIx, seq.createIx, ...chunkIxs);
-      const result = await simulateTx(connection, tx, [seq.creator, ...chunkWallets]);
+      tx.add(...chunkFundIx, seq.createIx, ...walletIxs);
+      const result = await simulateTx(connection, tx, [
+        seq.creator,
+        seq.mintKeypair,
+        wallet,
+      ]);
       if (result.err) {
         throw new Error(
-          `preflight: buy tx ${i} chunk ${s / chunkSize} simulation failed: ${JSON.stringify(result.err)}`
+          `preflight: buy tx ${i} wallet ${w} simulation failed: ${JSON.stringify(result.err)}`
         );
       }
-      buyChunks.push({ buyTxIndex: i, walletCount: chunkWallets.length, result });
+      buyChunks.push({ buyTxIndex: i, walletCount: 1, result });
     }
     walletOffset += bt.wallets.length;
   }
@@ -811,7 +725,7 @@ export async function sendSequentially(
         sent.length > 0
           ? ` NOTE: ${sent.length} earlier launch tx(s) already confirmed (${sent
               .map((s) => s.label)
-              .join(", ")}); the token may be partially launched. A fresh launch uses a new nonce and creates a NEW mint; do not re-send this sequence.`
+              .join(", ")}); the token may be partially launched. A fresh launch creates a NEW mint; do not re-send this sequence.`
           : "";
       throw new Error(`${msg}${partial}`);
     }
@@ -832,13 +746,15 @@ export async function withTimeout<T>(p: Promise<T>, ms: number, msg: string): Pr
   }
 }
 
-/** Reads a wallet's Token-2022 balance for the launch mint (raw units). */
+/** Reads a wallet's legacy-SPL token balance for the launch mint (raw
+ *  units). pump.fun mints are LEGACY SPL tokens, so the ATA is derived with
+ *  TOKEN_PROGRAM_ID (never Token-2022). */
 export async function walletTokenBalance(
   connection: Connection,
   wallet: PublicKey,
   mint: PublicKey
 ): Promise<bigint> {
-  const ata = await getAssociatedTokenAddress(mint, wallet, false, TOKEN_2022_PROGRAM_ID);
+  const ata = getAssociatedTokenAddressSync(mint, wallet, false, TOKEN_PROGRAM_ID);
   try {
     const r = await connection.getTokenAccountBalance(ata, "confirmed");
     return BigInt(r.value.amount);
@@ -855,12 +771,11 @@ export async function holderCount(connection: Connection, mint: PublicKey): Prom
   return r.value.filter((a) => BigInt(a.amount) > BigInt(0)).length;
 }
 
-/** Lamports needed by each wallet to buy and create its ATA on first buy.
- *  Token-2022 token accounts are 170 bytes (165 base + TLV header space), as
- *  measured via the ATA program's GetAccountDataSize CPI on devnet; 165 bytes
- *  (the legacy SPL token size) is short by ~21k lamports of rent. */
+/** Lamports needed by each wallet to create its legacy-SPL ATA on first buy.
+ *  Legacy SPL token accounts are 165 bytes (the Token-2022 170-byte size
+ *  that the old custom program used is gone). */
 export async function ataRentLamports(connection: Connection): Promise<number> {
-  return connection.getMinimumBalanceForRentExemption(170, "confirmed");
+  return connection.getMinimumBalanceForRentExemption(165, "confirmed");
 }
 
 /** Lamports a wallet must retain after its buy: the rent-exempt floor for a

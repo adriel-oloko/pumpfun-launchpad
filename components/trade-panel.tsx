@@ -33,7 +33,6 @@
 //   - The roster (import, batch selection, balances) sits inside this card
 //     under the tabs exactly like v4.
 
-import { Program, type Provider } from "@coral-xyz/anchor";
 import { LAMPORTS_PER_SOL, PublicKey } from "@solana/web3.js";
 import { useEffect, useRef, useState } from "react";
 import {
@@ -66,7 +65,6 @@ import {
   type WithdrawOutcome,
 } from "../lib/disperse";
 import { shortAddress } from "../lib/format";
-import { PUMPFUN_IDL, PUMPFUN_PROGRAM_ID } from "../lib/idl";
 import { isValidPubkey } from "../lib/managed-wallets";
 import { DUST_SOL_LAMPORTS } from "../lib/params";
 import { formatSolLamports } from "../lib/sell-all";
@@ -140,11 +138,12 @@ export function TradePanel({
   const autoBuyEndRef = useRef<number | null>(null);
   const autoSellEndRef = useRef<number | null>(null);
   const deselectTimerRef = useRef<number | null>(null);
-  // One connection + anchor Program reused across rounds (built lazily).
-  const engineRef = useRef<{
-    connection: ReturnType<typeof makeDevnetConnection>;
-    program: Program;
-  } | null>(null);
+  // One connection reused across rounds (built lazily). No anchor Program:
+  // pump.fun instructions are hand-built (lib/pump.ts) and every tx is
+  // signed manually with the roster Keypairs.
+  const engineRef = useRef<ReturnType<typeof makeDevnetConnection> | null>(
+    null
+  );
 
   // Latest-render mirrors: the recursive timers close over these refs so
   // they always read current roster/inputs/state, never a stale closure.
@@ -201,17 +200,7 @@ export function TradePanel({
 
   const getEngine = () => {
     if (engineRef.current) return engineRef.current;
-    const connection = makeDevnetConnection();
-    // Anchor Wallet is Node-only in the browser; the auto rounds sign every
-    // tx manually with the roster Keypairs, so a minimal provider suffices
-    // (same pattern as the M4 launch flow and the M6 sell-all).
-    const provider = {
-      connection,
-      publicKey: PUMPFUN_PROGRAM_ID,
-      wallet: { publicKey: PUMPFUN_PROGRAM_ID },
-    } as Provider;
-    const program = new Program(PUMPFUN_IDL, provider);
-    engineRef.current = { connection, program };
+    engineRef.current = makeDevnetConnection();
     return engineRef.current;
   };
 
@@ -275,9 +264,9 @@ export function TradePanel({
     setManualError(null);
     setManualReport(null);
     try {
-      const { connection, program } = getEngine();
+      const connection = getEngine();
       const mintPk = new PublicKey(mint);
-      const read = await readAutoCurveState(program, mintPk);
+      const read = await readAutoCurveState(connection, mintPk);
       if (read.kind === "missing") {
         throw new Error("CURVE NOT FOUND FOR MINT");
       }
@@ -290,7 +279,6 @@ export function TradePanel({
         side === "buy"
           ? await buySelectedWallets({
               connection,
-              program,
               mint: mintPk,
               curve: read.curve,
               wallets,
@@ -298,8 +286,8 @@ export function TradePanel({
             })
           : await sellSelectedWallets({
               connection,
-              program,
               mint: mintPk,
+              curve: read.curve,
               wallets,
               sellPct: pct,
             });
@@ -682,10 +670,10 @@ export function TradePanel({
     stop?: string;
     retry?: string;
   }> => {
-    const { program } = getEngine();
+    const connection = getEngine();
     let read;
     try {
-      read = await readAutoCurveState(program, mintPk);
+      read = await readAutoCurveState(connection, mintPk);
     } catch {
       return { ok: false, retry: "RPC ERROR READING CURVE STATE, RETRYING" };
     }
@@ -750,10 +738,9 @@ export function TradePanel({
     // Round-start scheduling: the next round fires the instant this round's
     // window ends, regardless of how long the build + send takes.
     scheduleAutoBuy();
-    const { connection, program } = getEngine();
+    const connection = getEngine();
     void fireAutoBuy({
       connection,
-      program,
       mint: mintPk,
       curve: gate.curve as AutoCurveInfo,
       wallets,
@@ -826,11 +813,11 @@ export function TradePanel({
       `AUTO SELL: ${wallets.length} RANDOM WALLET${wallets.length === 1 ? "" : "S"}...`
     );
     scheduleAutoSell();
-    const { connection, program } = getEngine();
+    const connection = getEngine();
     void fireAutoSell({
       connection,
-      program,
       mint: mintPk,
+      curve: gate.curve as AutoCurveInfo,
       wallets,
       minSellRaw,
     })
@@ -1015,7 +1002,7 @@ export function TradePanel({
                       max={api.wallets.length}
                       value={api.batchSize}
                       onChange={(e) => api.setBatchSize(e.target.value)}
-                      className="w-16 text-center font-mono text-[12px] border-none"
+                      className="w-8 text-center font-mono text-[12px] border-none"
                     />
                   </div>
                   <div className="flex items-center gap-1">
