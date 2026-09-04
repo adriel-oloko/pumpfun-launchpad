@@ -629,6 +629,7 @@ export function LaunchPanel({
               </p>
             )}
           </div>
+          <div className="grid md:grid-cols-2 lg:grid-cols-3">
           {selectedWallets.map((w) => (
             <Field
               key={w.address}
@@ -645,6 +646,7 @@ export function LaunchPanel({
               />
             </Field>
           ))}
+          </div>
         </Collapse>
 
         {launchError ? <StatusLine text={`LAST ERROR: ${launchError}`} tone="error" /> : null}
