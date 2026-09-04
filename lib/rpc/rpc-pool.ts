@@ -60,11 +60,20 @@ export const MAINNET_RPC_POOL: string[] = buildPool(
     ['https://api.mainnet-beta.solana.com']
 )
 
-/** Devnet pool: env NEXT_PUBLIC_SOLANA_RPC_DEVNET + Triton public default. */
+/**
+ * Devnet pool: env NEXT_PUBLIC_SOLANA_RPC_DEVNET + keyed Helius default.
+ *
+ * The default is a KEYED endpoint (not the public api.devnet.solana.com) so
+ * builds without the env var (Vercel, CI) still get a working endpoint.
+ * api.devnet.solana.com has been observed returning 429 for sustained
+ * periods (public devnet RPC is heavily rate-limited); it must not be the
+ * only member of the pool. Add it as an explicit extra endpoint via the env
+ * var if you want it as a fallback.
+ */
 export const DEVNET_RPC_POOL: string[] = buildPool(
     'NEXT_PUBLIC_SOLANA_RPC_DEVNET',
     [
-        'https://api.devnet.solana.com',
+        'https://ava-84o4ye-fast-devnet.helius-rpc.com',
     ]
 )
 
@@ -88,10 +97,12 @@ function markBackoff(url: string): void {
     backoffUntil.set(url, Date.now() + BACKOFF_MS)
 }
 
-/** Next healthy pool URL (round-robin, skipping cooldown'd endpoints). If
- *  every endpoint is cooling down, recycle the whole pool rather than fail a
- *  request that has no alternative. */
-function pickNextUrl(pool: string[]): string {
+/** Next healthy pool URL (round-robin, skipping cooldown'd endpoints), or
+ *  null when EVERY endpoint is cooling down. The caller must then wait for
+ *  the earliest cooldown to expire before retrying — clearing the map here
+ *  would instantly re-hammer a throttled endpoint (the old behavior turned a
+ *  brief 429 into a sustained failure loop). */
+function pickNextUrl(pool: string[]): string | null {
     const now = Date.now()
     const start = rrIndex % pool.length
     for (let i = 0; i < pool.length; i++) {
@@ -102,10 +113,20 @@ function pickNextUrl(pool: string[]): string {
             return url
         }
     }
-    backoffUntil.clear()
-    const url = pool[start]
-    rrIndex = (start + 1) % pool.length
-    return url
+    return null
+}
+
+/** When every endpoint is cooling, sleep until the soonest one recovers
+ *  (plus a tiny stagger) so the pool genuinely waits out the cooldown
+ *  instead of clearing it and hammering the throttled endpoint. Capped so a
+ *  pathological single-endpoint pool still surfaces its failure promptly. */
+function sleepUntilHealthy(pool: string[]): Promise<void> {
+    const now = Date.now()
+    const soonest = Math.min(
+        ...pool.map((url) => backoffUntil.get(url) ?? 0)
+    )
+    const wait = Math.min(Math.max(soonest - now, 0) + 25, 46_000)
+    return new Promise((resolve) => setTimeout(resolve, wait))
 }
 
 /** Combine the caller's signal with a per-attempt timeout so a slow URL
@@ -137,6 +158,14 @@ export async function rotatingFetch(
     let lastError: unknown = null
     for (let attempt = 0; attempt < RETRY_ATTEMPTS; attempt++) {
         const url = pickNextUrl(pool)
+        // All endpoints cooling down: WAIT for the soonest cooldown to expire
+        // instead of re-hammering a throttled endpoint (the old clear() here
+        // amplified a brief 429 into a sustained failure loop). Honor the
+        // caller's abort signal during the wait.
+        if (url === null) {
+            await sleepUntilHealthy(pool)
+            continue
+        }
         const signal = attemptSignal(init?.signal)
         try {
             const response = await RPC_LIMITER.run(() =>
