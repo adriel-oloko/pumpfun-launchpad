@@ -79,7 +79,8 @@ import {
 } from '../lib/bundle/jito'
 import { submitBundleViaFanoutWithRetry } from '../lib/bundle/fanout-submit'
 import { bundleDropMessage, friendlyTxError } from '../lib/tx-errors'
-import { makeDevnetConnection } from '../lib/connection'
+import { makeAppConnection } from '../lib/connection'
+import { solanaNetwork } from '../lib/network'
 import { useCreatorWallet } from '../lib/creator-wallet'
 import { pubkeyFromSecretKey } from '../lib/managed-wallets'
 import { DECIMALS } from '../lib/params'
@@ -104,6 +105,8 @@ import type { RosterApi } from './roster'
 import { shortAddress } from './roster'
 
 const EXPLORER = 'https://explorer.solana.com'
+/** Explorer cluster query: devnet links need ?cluster=devnet; mainnet none. */
+const EXPLORER_QS = solanaNetwork() === 'devnet' ? '?cluster=devnet' : ''
 const DEFAULT_SOL_IN = '0.01'
 
 function errMsg(e: unknown): string {
@@ -297,7 +300,7 @@ export function LaunchPanel({
                     `  dev ${b.wallet.publicKey.toBase58().slice(0, 12)}... buys ${(Number(b.solInLamports) / LAMPORTS_PER_SOL).toFixed(4)} SOL`
                 )
             }
-            const connection = makeDevnetConnection()
+            const connection = makeAppConnection()
             log(
                 `program : pump.fun native (6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P)`
             )
@@ -352,10 +355,10 @@ export function LaunchPanel({
                     : {}),
             })
             log(
-                `mint    : ${EXPLORER}/address/${seq.pda.mint.toBase58()}?cluster=devnet (fresh pump.fun mint keypair; the .pump suffix is indexer-applied)`
+                `mint    : ${EXPLORER}/address/${seq.pda.mint.toBase58()}${EXPLORER_QS} (fresh pump.fun mint keypair; the .pump suffix is indexer-applied)`
             )
             log(
-                `curve   : ${EXPLORER}/address/${seq.pda.curveState.toBase58()}?cluster=devnet`
+                `curve   : ${EXPLORER}/address/${seq.pda.curveState.toBase58()}${EXPLORER_QS}`
             )
             log(`packing : ${seq.buyTxs.length} buy tx(s):`)
             for (const bt of seq.buyTxs) {
@@ -386,7 +389,7 @@ export function LaunchPanel({
                     onSignature: (label, sig) => {
                         sentSigs.push(sig)
                         log(
-                            `[${label}] ${sig}  ${EXPLORER}/tx/${sig}?cluster=devnet`
+                            `[${label}] ${sig}  ${EXPLORER}/tx/${sig}${EXPLORER_QS}`
                         )
                     },
                 })
@@ -536,9 +539,9 @@ export function LaunchPanel({
             const mintPk = seq.pda.mint
             log('')
             log('=== on-chain verification ===')
-            log(`token   : ${EXPLORER}/address/${mint}?cluster=devnet`)
+            log(`token   : ${EXPLORER}/address/${mint}${EXPLORER_QS}`)
             log(
-                `curve   : ${EXPLORER}/address/${seq.pda.curveState.toBase58()}?cluster=devnet`
+                `curve   : ${EXPLORER}/address/${seq.pda.curveState.toBase58()}${EXPLORER_QS}`
             )
 
             const balances = []
@@ -677,7 +680,7 @@ export function LaunchPanel({
         setSellReport(null)
         const sigs: string[] = []
         try {
-            const connection = makeDevnetConnection()
+            const connection = makeAppConnection()
             // M10: sellAllManagedWallets signs every sell with the roster
             // Keypairs and hand-builds the pump.fun sell ixs itself (no anchor
             // Program, no IDL) — only the connection + mint + roster are needed.

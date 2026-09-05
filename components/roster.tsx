@@ -42,7 +42,7 @@ import { OnlinePumpAmmSdk } from '@pump-fun/pump-swap-sdk'
 import { LAMPORTS_PER_SOL, PublicKey } from '@solana/web3.js'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { readAutoCurveState } from '../lib/auto'
-import { makeDevnetConnection } from '../lib/connection'
+import { makeAppConnection } from '../lib/connection'
 import { exportPksBackup, generateRandomWallets } from '../lib/distribute'
 import { shortAddress } from '../lib/format'
 import {
@@ -168,7 +168,7 @@ function fmtSolValue(lamports: bigint): string {
  * transport/RPC errors so the caller can flag the balances stale.
  */
 async function readSolPerTokenRaw(
-    connection: ReturnType<typeof makeDevnetConnection>,
+    connection: ReturnType<typeof makeAppConnection>,
     mint: PublicKey
 ): Promise<bigint | null> {
     const read = await readAutoCurveState(connection, mint)
@@ -228,8 +228,8 @@ export function useRoster(): RosterApi {
     // mounted above the board page, which owns this hook).
     const { pushToast } = useToasts()
 
-    const connRef = useRef<ReturnType<typeof makeDevnetConnection> | null>(null)
-    if (connRef.current === null) connRef.current = makeDevnetConnection()
+    const connRef = useRef<ReturnType<typeof makeAppConnection> | null>(null)
+    if (connRef.current === null) connRef.current = makeAppConnection()
     const connection = connRef.current
 
     /** Monotonic tick sequence: a slower in-flight tick that started before a

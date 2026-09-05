@@ -29,13 +29,12 @@
 // the gate and the batch quote against the same snapshot.
 //
 // Step 2 of the M8A spec (the optional mainnet atomic Jito-bundle path) is
-// deliberately NOT implemented here: this launchpad is devnet-only in the
-// UI (makeDevnetConnection), devnet's block engine is dead, and a mainnet
-// bundle path cannot be verified in this environment. The concurrent
-// per-wallet tx path below is the honest, devnet-testable implementation;
-// a mainnet Jito-bundle assembly would slot in behind
-// submitBundleViaFanoutWithRetry when a mainnet connection exists. TODO
-// (M8A step 2): add a bundle path for 1..5 selected wallets on mainnet.
+// deliberately NOT implemented here. The UI now follows the app network
+// (lib/network.ts: NEXT_PUBLIC_SOLANA_NETWORK, default devnet, where the
+// block engine is dead), and the concurrent per-wallet tx path below is the
+// honest, network-agnostic implementation; a mainnet Jito-bundle assembly
+// would slot in behind submitBundleViaFanoutWithRetry for 1..5 selected
+// wallets. TODO (M8A step 2): add that bundle path for mainnet.
 //
 // All amounts are bigint (no bigint literals, project target is ES2017);
 // every tx is signed manually with the wallet's Keypair (anchor Wallet is

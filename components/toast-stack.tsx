@@ -122,7 +122,7 @@ function ToastItem({
           </p>
           {txHash ? (
             <p className="mt-1 font-mono text-[11px]">
-              <ExplorerLink hash={txHash} cluster="devnet" inverted={isError} />
+              <ExplorerLink hash={txHash} inverted={isError} />
             </p>
           ) : null}
         </div>

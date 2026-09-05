@@ -21,7 +21,7 @@ import {
   useState,
   type ReactNode,
 } from "react";
-import { makeDevnetConnection } from "./connection";
+import { makeAppConnection } from "./connection";
 import { pubkeyFromSecretKey } from "./managed-wallets";
 
 /** The localStorage key the launch panel persisted the creator key under. */
@@ -76,7 +76,7 @@ export function CreatorWalletProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     if (!pubkey) return;
     let cancelled = false;
-    const conn = makeDevnetConnection();
+    const conn = makeAppConnection();
     const read = async () => {
       try {
         const b = await conn.getBalance(new PublicKey(pubkey), "confirmed");

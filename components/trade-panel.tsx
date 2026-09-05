@@ -49,7 +49,7 @@ import {
   type AutoRoundResult,
   type AutoWallet,
 } from "../lib/auto";
-import { makeDevnetConnection } from "../lib/connection";
+import { makeAppConnection } from "../lib/connection";
 import { friendlyTxError } from "../lib/tx-errors";
 import {
   buySelectedWallets,
@@ -141,7 +141,7 @@ export function TradePanel({
   // One connection reused across rounds (built lazily). No anchor Program:
   // pump.fun instructions are hand-built (lib/pump.ts) and every tx is
   // signed manually with the roster Keypairs.
-  const engineRef = useRef<ReturnType<typeof makeDevnetConnection> | null>(
+  const engineRef = useRef<ReturnType<typeof makeAppConnection> | null>(
     null
   );
 
@@ -200,7 +200,7 @@ export function TradePanel({
 
   const getEngine = () => {
     if (engineRef.current) return engineRef.current;
-    engineRef.current = makeDevnetConnection();
+    engineRef.current = makeAppConnection();
     return engineRef.current;
   };
 
@@ -457,7 +457,7 @@ export function TradePanel({
     setDistributeError(null);
     setDistributeReport(null);
     try {
-      const connection = makeDevnetConnection();
+      const connection = makeAppConnection();
       const result = await disperseSol({
         connection,
         hub: { address: hub.address, key: hub.key },
@@ -511,7 +511,7 @@ export function TradePanel({
     setDistributeError(null);
     setDistributeReport(null);
     try {
-      const connection = makeDevnetConnection();
+      const connection = makeAppConnection();
       const outcomes = await withdrawSol({
         connection,
         wallets: sources,

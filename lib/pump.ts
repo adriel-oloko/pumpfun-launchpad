@@ -41,6 +41,7 @@ import {
   SYSVAR_RENT_PUBKEY,
   TransactionInstruction,
 } from "@solana/web3.js";
+import { solanaNetwork } from "./network";
 
 /* ------------------------------------------------------------------ */
 /* Verified pump.fun constants (M10 prompt table; do not guess)        */
@@ -56,12 +57,18 @@ export const PUMP_GLOBAL = new PublicKey(
   "4wTV1YmiEkRvAtNtsSGPtUrqRYQMe5SKy2uB4Jjaxnjf"
 );
 
-/** pump.fun protocol fee recipient (DEVNET). The program stores the fee
- *  recipient(s) inside the global account's `fee_recipient` field, which is
- *  cluster-specific: mainnet's is `CebN5WGQ4jvEPvsVU4EoHEpgzq1VV2fskvCwf8gCDbZ`,
- *  devnet's is the value below. A mainnet run MUST switch this. */
-export const PUMP_FEE_RECIPIENT = new PublicKey(
-  "68yFSZxzLWJXkxxRGydZ63C6mHx1NLEDWmwN9Lb5yySg"
+/** pump.fun protocol fee recipient (CLUSTER-SPECIFIC). The program stores the
+ *  fee recipient(s) inside the global account's `fee_recipient` field, which
+ *  differs per cluster: mainnet's is `CebN5WGQ4jvEPvsVU4EoHEpgzq1VV2fskvCwf8gCDbZ`,
+ *  devnet's is the 68yFSZ... value below. The buy/sell instructions pass the
+ *  recipient as a writable account, so a devnet recipient on a mainnet tx
+ *  makes real SOL/tokens land on the wrong account and the tx reverts. The
+ *  constant follows lib/network.ts (NEXT_PUBLIC_SOLANA_NETWORK, default
+ *  devnet), so a `mainnet` build automatically uses the mainnet recipient. */
+export const PUMP_FEE_RECIPIENT: PublicKey = new PublicKey(
+  solanaNetwork() === 'mainnet'
+    ? 'CebN5WGQ4jvEPvsVU4EoHEpgzq1VV2fskvCwf8gCDbZ'
+    : '68yFSZxzLWJXkxxRGydZ63C6mHx1NLEDWmwN9Lb5yySg'
 );
 
 /** pump.fun event authority PDA (seeds: ["__event_authority"], double

@@ -16,6 +16,7 @@ import type {
     SelectHTMLAttributes,
 } from 'react'
 import { shortAddress } from '../lib/format'
+import { solanaNetwork } from '../lib/network'
 
 /* ---------- labels: mono caps, the mechanical voice ---------- */
 
@@ -150,12 +151,13 @@ export function StatusLine({
 export function ExplorerLink({
     hash,
     kind = 'tx',
-    cluster = 'devnet',
+    cluster = solanaNetwork(),
     inverted,
 }: {
     hash: string
     kind?: 'tx' | 'address'
-    /** Solana explorer cluster; devnet is this app's network. */
+    /** Solana explorer cluster; follows the app network by default
+     *  (lib/network.ts), overridable per link. */
     cluster?: 'mainnet' | 'devnet'
     /** For links sitting on an ink card (error toasts): invert the hover. */
     inverted?: boolean
