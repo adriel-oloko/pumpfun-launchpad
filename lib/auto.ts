@@ -384,7 +384,7 @@ export async function fireAutoBuy(
   const pctNum = Math.round(buyPct * 100);
   const creator = new PublicKey(curve.creator);
   const ataRent = await connection.getMinimumBalanceForRentExemption(
-    165,
+    170,
     "confirmed"
   );
   const latest = await connection.getLatestBlockhash("confirmed");

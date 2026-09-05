@@ -847,11 +847,10 @@ export async function holderCount(connection: Connection, mint: PublicKey): Prom
   return r.value.filter((a) => BigInt(a.amount) > BigInt(0)).length;
 }
 
-/** Lamports needed by each wallet to create its legacy-SPL ATA on first buy.
- *  Legacy SPL token accounts are 165 bytes (the Token-2022 170-byte size
- *  that the old custom program used is gone). */
+/** Lamports needed by each wallet to create its Token-2022 ATA on first buy.
+ *  Token-2022 token accounts are 170 bytes (NOT 165 like legacy SPL). */
 export async function ataRentLamports(connection: Connection): Promise<number> {
-  return connection.getMinimumBalanceForRentExemption(165, "confirmed");
+  return connection.getMinimumBalanceForRentExemption(170, "confirmed");
 }
 
 /** Lamports a wallet must retain after its buy: the rent-exempt floor for a

@@ -253,7 +253,7 @@ export async function buySelectedWallets(
     return { completed: 0, failed: 0, skipped: 0, signatures: [] };
   }
   const ataRent = await connection.getMinimumBalanceForRentExemption(
-    165,
+    170,
     "confirmed"
   );
   const latest = await connection.getLatestBlockhash("confirmed");
