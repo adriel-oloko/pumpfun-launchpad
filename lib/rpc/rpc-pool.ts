@@ -66,7 +66,9 @@ function buildPool(envName: string, defaults: string[]): string[] {
  */
 export const MAINNET_RPC_POOL: string[] = buildPool(
     'NEXT_PUBLIC_SOLANA_RPC_MAINNET',
-    []
+    [
+        'https://mainnet.helius-rpc.com/?api-key=6fd05d57-a073-4cc6-8b5b-4314a652e487',
+    ]
 )
 
 /**
@@ -131,9 +133,7 @@ function pickNextUrl(pool: string[]): string | null {
  *  pathological single-endpoint pool still surfaces its failure promptly. */
 function sleepUntilHealthy(pool: string[]): Promise<void> {
     const now = Date.now()
-    const soonest = Math.min(
-        ...pool.map((url) => backoffUntil.get(url) ?? 0)
-    )
+    const soonest = Math.min(...pool.map((url) => backoffUntil.get(url) ?? 0))
     const wait = Math.min(Math.max(soonest - now, 0) + 25, 46_000)
     return new Promise((resolve) => setTimeout(resolve, wait))
 }
