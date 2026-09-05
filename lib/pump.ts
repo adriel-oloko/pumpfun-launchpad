@@ -67,7 +67,7 @@ export const PUMP_GLOBAL = new PublicKey(
  *  devnet), so a `mainnet` build automatically uses the mainnet recipient. */
 export const PUMP_FEE_RECIPIENT: PublicKey = new PublicKey(
   solanaNetwork() === 'mainnet'
-    ? 'CebN5WGQ4jvEPvsVU4EoHEpgzq1VV2fskvCwf8gCDbZ'
+    ? '62qc2CNXwrYqQScmEdiZFFAnJR262PxWEuNQtxfafNgV'
     : '68yFSZxzLWJXkxxRGydZ63C6mHx1NLEDWmwN9Lb5yySg'
 );
 

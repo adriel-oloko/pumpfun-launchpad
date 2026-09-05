@@ -865,11 +865,7 @@ export function LaunchPanel({
                     name/symbol/uri) + funding */}
                     <div className="lg:col-span-4">
                         <div className="flex flex-wrap items-center gap-4 border-2 border-ink px-3 py-2">
-                            <span className="label-mono !text-[10px] opacity-80">
-                                migration: AUTOMATIC (pump.fun migrates to
-                                PumpSwap when the curve graduates — no launch
-                                flags, the `.pump` suffix is indexer-applied)
-                            </span>
+                            
                             <label className="label-mono flex items-center gap-2 cursor-pointer opacity-80 ml-auto">
                                 <input
                                     type="checkbox"
