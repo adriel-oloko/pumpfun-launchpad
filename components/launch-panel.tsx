@@ -159,7 +159,7 @@ export function LaunchPanel({
     const [telegram, setTelegram] = useState('')
     const [manualMetadata, setManualMetadata] = useState(false)
     const [advancedOpen, setAdvancedOpen] = useState(false)
-    const [tier, setTier] = useState<'1' | '2'>('1')
+    const [tier, setTier] = useState<'1' | '2'>('2')
     const [fundFromCreator, setFundFromCreator] = useState(true)
     const [tipSol, setTipSol] = useState(DEFAULT_TIP_SOL)
     const [solIns, setSolIns] = useState<Record<string, string>>({})
