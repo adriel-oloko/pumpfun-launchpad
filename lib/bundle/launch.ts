@@ -70,6 +70,13 @@ export const METAPLEX_PROGRAM_ID: PublicKey = PUMP_METAPLEX_PROGRAM_ID;
 export const MAX_TX_BYTES = 1232;
 export const MAX_COMPUTE_UNITS = 1_400_000;
 
+/** Per-tx compute-unit limits for the REAL bundle txs. Stamping
+ *  MAX_COMPUTE_UNITS on every tx made a 3-tx launch bundle reserve 4.2M CU,
+ *  which Jito's cost model rejected (ExceedsCostModel -> Invalid). Measured
+ *  consumption: create ~111k, buy (incl. ATA create + tip) ~205k. */
+export const CREATE_CU_LIMIT = 150_000;
+export const BUY_CU_LIMIT = 250_000;
+
 /** Default serialized-byte budget for a buy tx. The tip transfer added to the
  *  last bundle tx costs ~80 bytes, so the last tx is packed to
  *  maxBuyTxBytes - tipReserveBytes and holds one wallet fewer. */
@@ -154,7 +161,9 @@ export interface BuildLaunchOptions {
   maxBuyTxBytes?: number;
   /** Bytes reserved in the last buy tx for the bundle tip transfer. */
   tipReserveBytes?: number;
-  /** Compute-unit limit instruction added to every buy tx. */
+  /** Optional per-tx compute-unit limit override. When omitted, the REAL
+   *  bundle txs use per-tx defaults: the create tx stamps CREATE_CU_LIMIT and
+   *  every buy tx stamps BUY_CU_LIMIT. */
   computeUnitLimit?: number;
   /** Optional priority fee in micro-lamports per CU on every buy tx. */
   priorityFeeMicroLamports?: number;
@@ -288,7 +297,7 @@ export function packBuyTxs(opts: {
     blockhash,
     maxBuyTxBytes = DEFAULT_MAX_BUY_TX_BYTES,
     tipReserveBytes = DEFAULT_TIP_RESERVE_BYTES,
-    computeUnitLimit = MAX_COMPUTE_UNITS,
+    computeUnitLimit = BUY_CU_LIMIT,
     priorityFeeMicroLamports = DEFAULT_PRIORITY_FEE_MICRO_LAMPORTS,
   } = opts;
   if (maxBuyTxBytes > MAX_TX_BYTES) {
@@ -398,14 +407,21 @@ export async function buildLaunchSequence(
   if (buys.length === 0) throw new Error("at least one dev wallet buy is required");
 
   // M7a fee policy: resolve the knobs once so the create tx, the fund tx and
-  // every packed buy tx carry the SAME compute-unit price. When the caller
-  // omits them the lib/fees.ts defaults apply (env-tunable). The CU-limit ix
-  // goes on every tx so the price ix (which requires the limit ix to precede
-  // it in the same tx) is always well-formed.
-  const cuLimit = computeUnitLimit ?? MAX_COMPUTE_UNITS;
+  // every packed buy tx carry the SAME compute-unit price (env-tunable
+  // lib/fees.ts default when omitted). Per-tx CU budgeting: the create tx
+  // stamps CREATE_CU_LIMIT and each buy tx stamps BUY_CU_LIMIT (measured
+  // consumption: create ~111k, buy incl. ATA create + tip ~205k). Stamping
+  // MAX_COMPUTE_UNITS on every tx made a 3-tx launch bundle reserve 4.2M CU,
+  // which Jito's cost model rejected (ExceedsCostModel -> Invalid). The fund
+  // tx is a plain transfer and gets no CU-limit ix. A caller-supplied
+  // computeUnitLimit overrides both per-tx defaults.
   const priorityFee = priorityFeeMicroLamports ?? DEFAULT_PRIORITY_FEE_MICRO_LAMPORTS;
-  const addFeeIxs = (tx: Transaction): void => {
-    tx.add(ComputeBudgetProgram.setComputeUnitLimit({ units: cuLimit }));
+  const createCuLimit = computeUnitLimit ?? CREATE_CU_LIMIT;
+  const buyCuLimit = computeUnitLimit ?? BUY_CU_LIMIT;
+  const addFeeIxs = (tx: Transaction, cuLimit?: number): void => {
+    if (cuLimit !== undefined) {
+      tx.add(ComputeBudgetProgram.setComputeUnitLimit({ units: cuLimit }));
+    }
     if (priorityFee > 0) {
       tx.add(
         ComputeBudgetProgram.setComputeUnitPrice({
@@ -435,7 +451,7 @@ export async function buildLaunchSequence(
     uri,
   });
   const createTx = new Transaction({ feePayer: creator.publicKey, blockhash: latest.blockhash, lastValidBlockHeight: 0 });
-  addFeeIxs(createTx);
+  addFeeIxs(createTx, createCuLimit);
   createTx.add(createIx);
 
   let fundTx: Transaction | null = null;
@@ -478,7 +494,7 @@ export async function buildLaunchSequence(
     blockhash: latest.blockhash,
     maxBuyTxBytes,
     tipReserveBytes,
-    computeUnitLimit: cuLimit,
+    computeUnitLimit: buyCuLimit,
     priorityFeeMicroLamports: priorityFee,
   });
 
