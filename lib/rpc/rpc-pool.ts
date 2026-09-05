@@ -56,7 +56,7 @@ function buildPool(envName: string, defaults: string[]): string[] {
 
 /** Mainnet pool: env NEXT_PUBLIC_SOLANA_RPC_MAINNET + Triton public default. */
 export const MAINNET_RPC_POOL: string[] = buildPool(
-    'NEXT_PUBLIC_SOLANA_RPC_MAINNET',
+    'https://mainnet.helius-rpc.com/?api-key=6fd05d57-a073-4cc6-8b5b-4314a652e487',
     ['https://api.mainnet-beta.solana.com']
 )
 
