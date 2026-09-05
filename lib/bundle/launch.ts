@@ -56,6 +56,7 @@ import {
   pumpMetadataPda,
   pumpMintAuthorityPda,
   quotePumpBuy,
+  resolvePumpFeeRecipient,
 } from "../pump";
 import { VIRTUAL_SOL_RESERVE, VIRTUAL_TOKEN_RESERVE } from "../params";
 import { DEFAULT_PRIORITY_FEE_MICRO_LAMPORTS } from "../fees";
@@ -269,6 +270,9 @@ export function packBuyTxs(opts: {
   pda: LaunchPdas;
   buys: BuyAllocation[];
   quotes: { tokensOut: bigint; maxSolCost: bigint }[];
+  /** The LIVE protocol fee recipient (resolvePumpFeeRecipient) baked into
+   *  every buy instruction. */
+  feeRecipient: PublicKey;
   blockhash: string;
   maxBuyTxBytes?: number;
   tipReserveBytes?: number;
@@ -280,6 +284,7 @@ export function packBuyTxs(opts: {
     pda,
     buys,
     quotes,
+    feeRecipient,
     blockhash,
     maxBuyTxBytes = DEFAULT_MAX_BUY_TX_BYTES,
     tipReserveBytes = DEFAULT_TIP_RESERVE_BYTES,
@@ -305,6 +310,7 @@ export function packBuyTxs(opts: {
       mint: pda.mint,
       buyer: buy.wallet.publicKey,
       creator: creator.publicKey,
+      feeRecipient,
       tokensOut: quote.tokensOut,
       maxSolCost: quote.maxSolCost,
     });
@@ -416,6 +422,11 @@ export async function buildLaunchSequence(
   const latest = await connection.getLatestBlockhash("confirmed");
   const blockhash = { blockhash: latest.blockhash, lastValidBlockHeight: latest.lastValidBlockHeight };
 
+  // M10 + fee-rotation fix: resolve the protocol fee recipient LIVE from the
+  // pump.fun global account (pump.fun rotates it; a stale constant reverts
+  // every buy with Custom 6000). The value is baked into every buy ix.
+  const feeRecipient = await resolvePumpFeeRecipient(connection);
+
   const createIx = buildPumpCreateIx({
     creator: creator.publicKey,
     mint: mintKeypair.publicKey,
@@ -463,6 +474,7 @@ export async function buildLaunchSequence(
     pda,
     buys,
     quotes,
+    feeRecipient,
     blockhash: latest.blockhash,
     maxBuyTxBytes,
     tipReserveBytes,

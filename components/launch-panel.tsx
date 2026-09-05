@@ -71,7 +71,7 @@ import {
 } from '../lib/bundle'
 import { publishTokenMetadata } from '../lib/metadata'
 import {
-    JITO_DEVNET_ENDPOINT,
+    JITO_MAINNET_ENDPOINT,
     JitoBundleClient,
     KNOWN_TIP_ACCOUNTS,
     MIN_TIP_LAMPORTS,
@@ -404,7 +404,7 @@ export function LaunchPanel({
                 // "launch complete" block below, so the tier-2 outcome is captured
                 // here and a non-landing result throws before any verification.
                 log('tier 2: assembling jito bundle...')
-                const jito = new JitoBundleClient(JITO_DEVNET_ENDPOINT)
+                const jito = new JitoBundleClient(JITO_MAINNET_ENDPOINT)
                 let unreachable: string | null = null
                 let tier2Result: BundleSubmissionResult | null = null
                 try {
@@ -417,7 +417,7 @@ export function LaunchPanel({
                 } catch (e) {
                     unreachable = errMsg(e)
                     log(
-                        `jito endpoint ${JITO_DEVNET_ENDPOINT}: UNREACHABLE (${unreachable})`
+                        `jito endpoint ${JITO_MAINNET_ENDPOINT}: UNREACHABLE (${unreachable})`
                     )
                     log(
                         '   matches devnet reality: devnet.block-engine.jito.wtf does not resolve;'

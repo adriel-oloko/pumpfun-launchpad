@@ -44,6 +44,7 @@ import {
   buildPumpSellIx,
   quotePumpSell,
   readPumpCurveState,
+  resolvePumpFeeRecipient,
 } from "./pump";
 import { CANONICAL_POOL_INDEX, lookupMigratedPool, sendRawWithRetry } from "./migrate";
 import { friendlyTxError } from "./tx-errors";
@@ -177,7 +178,10 @@ async function sellOneCurve(
     virtualTokenReserves: bigint;
   },
   wallet: Keypair,
-  slippagePct: number
+  slippagePct: number,
+  /** Live protocol fee recipient (resolvePumpFeeRecipient), resolved once
+   *  per sell-all run. */
+  feeRecipient: PublicKey
 ): Promise<SellOutcome> {
   const address = wallet.publicKey.toBase58();
   const slippageBps = BigInt(Math.round(slippagePct * 100));
@@ -226,6 +230,7 @@ async function sellOneCurve(
         mint,
         seller: wallet.publicKey,
         creator: curve.creator,
+        feeRecipient,
         tokensIn: balance,
         minSolOutput: quote.minSolOutput,
       });
@@ -389,6 +394,11 @@ export async function sellAllManagedWallets(
   }
   const route: SellRoute = graduated ? "pumpSwap" : "curve";
 
+  // Live protocol fee recipient for the curve route (pump.fun rotates it; a
+  // stale value reverts every sell with Custom 6000). Resolved once for the
+  // whole run; the PumpSwap route does not use it.
+  const feeRecipient = await resolvePumpFeeRecipient(connection);
+
   // Each keyed roster wallet signs and pays for its own sell; watch-only
   // rows (no key) are skipped. Per-wallet sells run concurrently.
   const workers = wallets
@@ -407,7 +417,8 @@ export async function sellAllManagedWallets(
               virtualTokenReserves: curve.virtualTokenReserves,
             },
             wallet,
-            slippagePct
+            slippagePct,
+            feeRecipient
           );
         }
         return await sellOnePumpSwap(

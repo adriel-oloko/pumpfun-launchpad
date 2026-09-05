@@ -56,6 +56,7 @@ import {
   sendAndConfirmWithRetry,
   walletTokenBalance,
 } from "./bundle/launch";
+import { resolvePumpFeeRecipient } from "./pump";
 
 /** Final outcome of one manual batch trade (the v4 batch pattern). */
 export interface ManualBatchResult {
@@ -124,7 +125,10 @@ async function buyOne(
   wallet: AutoWallet,
   pct: number,
   ataRent: number,
-  latest: { blockhash: string; lastValidBlockHeight: number }
+  latest: { blockhash: string; lastValidBlockHeight: number },
+  /** Live protocol fee recipient (resolvePumpFeeRecipient), resolved once
+   *  per batch. */
+  feeRecipient: PublicKey
 ): Promise<string | null> {
   const kp = Keypair.fromSecretKey(bs58.decode(wallet.key));
   const live = BigInt(await connection.getBalance(kp.publicKey, "confirmed"));
@@ -149,6 +153,7 @@ async function buyOne(
     buyer: kp.publicKey,
     mint,
     creator,
+    feeRecipient,
     solInLamports: solIn,
     solReserve: curve.solReserve,
     tokenReserve: curve.tokenReserve,
@@ -177,7 +182,10 @@ async function sellOne(
   curve: AutoCurveInfo,
   wallet: AutoWallet,
   pct: number,
-  latest: { blockhash: string; lastValidBlockHeight: number }
+  latest: { blockhash: string; lastValidBlockHeight: number },
+  /** Live protocol fee recipient (resolvePumpFeeRecipient), resolved once
+   *  per batch. */
+  feeRecipient: PublicKey
 ): Promise<string | null> {
   const kp = Keypair.fromSecretKey(bs58.decode(wallet.key));
   const balance = await walletTokenBalance(connection, kp.publicKey, mint);
@@ -189,6 +197,7 @@ async function sellOne(
     seller: kp.publicKey,
     mint,
     creator,
+    feeRecipient,
     tokenIn,
     solReserve: curve.solReserve,
     tokenReserve: curve.tokenReserve,
@@ -248,9 +257,11 @@ export async function buySelectedWallets(
     "confirmed"
   );
   const latest = await connection.getLatestBlockhash("confirmed");
+  // Live protocol fee recipient (pump.fun rotates it; stale -> Custom 6000).
+  const feeRecipient = await resolvePumpFeeRecipient(connection);
   const settled = await Promise.allSettled(
     wallets.map((w) =>
-      buyOne(connection, mint, curve, w, buyPct, ataRent, latest)
+      buyOne(connection, mint, curve, w, buyPct, ataRent, latest, feeRecipient)
     )
   );
   return tally(settled);
@@ -272,9 +283,11 @@ export async function sellSelectedWallets(
     return { completed: 0, failed: 0, skipped: 0, signatures: [] };
   }
   const latest = await connection.getLatestBlockhash("confirmed");
+  // Live protocol fee recipient (pump.fun rotates it; stale -> Custom 6000).
+  const feeRecipient = await resolvePumpFeeRecipient(connection);
   const settled = await Promise.allSettled(
     wallets.map((w) =>
-      sellOne(connection, mint, curve, w, sellPct, latest)
+      sellOne(connection, mint, curve, w, sellPct, latest, feeRecipient)
     )
   );
   return tally(settled);

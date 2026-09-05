@@ -57,19 +57,62 @@ export const PUMP_GLOBAL = new PublicKey(
   "4wTV1YmiEkRvAtNtsSGPtUrqRYQMe5SKy2uB4Jjaxnjf"
 );
 
-/** pump.fun protocol fee recipient (CLUSTER-SPECIFIC). The program stores the
- *  fee recipient(s) inside the global account's `fee_recipient` field, which
- *  differs per cluster: mainnet's is `CebN5WGQ4jvEPvsVU4EoHEpgzq1VV2fskvCwf8gCDbZ`,
- *  devnet's is the 68yFSZ... value below. The buy/sell instructions pass the
- *  recipient as a writable account, so a devnet recipient on a mainnet tx
- *  makes real SOL/tokens land on the wrong account and the tx reverts. The
- *  constant follows lib/network.ts (NEXT_PUBLIC_SOLANA_NETWORK, default
- *  devnet), so a `mainnet` build automatically uses the mainnet recipient. */
-export const PUMP_FEE_RECIPIENT: PublicKey = new PublicKey(
-  solanaNetwork() === 'mainnet'
-    ? '62qc2CNXwrYqQScmEdiZFFAnJR262PxWEuNQtxfafNgV'
-    : '68yFSZxzLWJXkxxRGydZ63C6mHx1NLEDWmwN9Lb5yySg'
-);
+/** pump.fun protocol fee recipient — CLUSTER-SPECIFIC AND A MOVING TARGET.
+ *  The program stores the recipient in the global account's `fee_recipient`
+ *  field (bytes [41..73]) and buy/sell instructions pass it as a writable
+ *  account. pump.fun ROTATES this wallet (mainnet was CebN5WGQ... at the Apr
+ *  2026 upgrade, then 62qc2CNX... by Sep 2026; devnet has been 68yFSZ...), so
+ *  a hardcoded value goes stale and the program rejects the tx with `Custom
+ *  6000 NotAuthorized`. NEVER hardcode: call
+ *  `resolvePumpFeeRecipient(connection)` (live read of the global account,
+ *  cached briefly) and thread the result into the buy/sell builders. The
+ *  fallback below only covers a failed/empty live read. */
+export function pumpFeeRecipientFallback(): PublicKey {
+  return new PublicKey(
+    solanaNetwork() === 'mainnet'
+      ? '62qc2CNXwrYqQScmEdiZFFAnJR262PxWEuNQtxfafNgV'
+      : '68yFSZxzLWJXkxxRGydZ63C6mHx1NLEDWmwN9Lb5yySg'
+  );
+}
+
+/** TTL for the live fee-recipient cache. Rotations are rare but the value
+ *  must not go stale across a long sell-all round, so 60s keeps it fresh
+ *  without an RPC read per instruction. */
+const FEE_RECIPIENT_CACHE_TTL_MS = 60_000;
+
+const feeRecipientCache = new Map<
+  string,
+  { value: PublicKey; at: number }
+>();
+
+/** Reads the LIVE protocol fee recipient from pump.fun's global account
+ *  (PUMP_GLOBAL, bytes [41..73]) — the only address the buy/sell fee check
+ *  accepts. Cached per RPC endpoint for FEE_RECIPIENT_CACHE_TTL_MS. On any
+ *  read/parse failure it falls back to the per-cluster constant so a
+ *  transient RPC error can never brick a launch. */
+export async function resolvePumpFeeRecipient(
+  connection: Connection
+): Promise<PublicKey> {
+  const key = connection.rpcEndpoint;
+  const cached = feeRecipientCache.get(key);
+  if (cached && Date.now() - cached.at < FEE_RECIPIENT_CACHE_TTL_MS) {
+    return cached.value;
+  }
+  try {
+    const info = await connection.getAccountInfo(PUMP_GLOBAL, "confirmed");
+    const data = info?.data;
+    // the fee_recipient field is never the zero pubkey; guard against a
+    // truncated/absent account
+    if (data && data.length >= 73 && data.subarray(41, 73).some((b) => b !== 0)) {
+      const value = new PublicKey(data.subarray(41, 73));
+      feeRecipientCache.set(key, { value, at: Date.now() });
+      return value;
+    }
+  } catch {
+    // fall through to the per-cluster fallback
+  }
+  return pumpFeeRecipientFallback();
+}
 
 /** pump.fun event authority PDA (seeds: ["__event_authority"], double
  *  underscore). Derived from the program id, NOT a fixed pubkey. */
@@ -506,10 +549,13 @@ export function buildPumpBuyIx(opts: {
   /** The curve's recorded creator (from readPumpCurveState; the creator
    *  vault + the creator fee leg are derived from it). */
   creator: PublicKey;
+  /** The LIVE protocol fee recipient (resolvePumpFeeRecipient). Passing a
+   *  stale/rotated value makes the program revert with Custom 6000. */
+  feeRecipient: PublicKey;
   tokensOut: bigint;
   maxSolCost: bigint;
 }): TransactionInstruction[] {
-  const { mint, buyer, creator, tokensOut, maxSolCost } = opts;
+  const { mint, buyer, creator, feeRecipient, tokensOut, maxSolCost } = opts;
   const [bondingCurve] = pumpBondingCurvePda(mint);
   const associatedBondingCurve = pumpBondingCurveAta(mint);
   const associatedUser = pumpUserAta(mint, buyer);
@@ -530,7 +576,7 @@ export function buildPumpBuyIx(opts: {
 
   const keys = [
     { pubkey: PUMP_GLOBAL, isSigner: false, isWritable: false },
-    { pubkey: PUMP_FEE_RECIPIENT, isSigner: false, isWritable: true },
+    { pubkey: feeRecipient, isSigner: false, isWritable: true },
     { pubkey: mint, isSigner: false, isWritable: false },
     { pubkey: bondingCurve, isSigner: false, isWritable: true },
     { pubkey: associatedBondingCurve, isSigner: false, isWritable: true },
@@ -576,10 +622,13 @@ export function buildPumpSellIx(opts: {
   /** The curve's recorded creator (from readPumpCurveState); feeds the
    *  creator_vault account. */
   creator: PublicKey;
+  /** The LIVE protocol fee recipient (resolvePumpFeeRecipient). Passing a
+   *  stale/rotated value makes the program revert with Custom 6000. */
+  feeRecipient: PublicKey;
   tokensIn: bigint;
   minSolOutput: bigint;
 }): TransactionInstruction[] {
-  const { mint, seller, creator, tokensIn, minSolOutput } = opts;
+  const { mint, seller, creator, feeRecipient, tokensIn, minSolOutput } = opts;
   const [bondingCurve] = pumpBondingCurvePda(mint);
   const associatedBondingCurve = pumpBondingCurveAta(mint);
   const associatedUser = pumpUserAta(mint, seller);
@@ -598,7 +647,7 @@ export function buildPumpSellIx(opts: {
 
   const keys = [
     { pubkey: PUMP_GLOBAL, isSigner: false, isWritable: false },
-    { pubkey: PUMP_FEE_RECIPIENT, isSigner: false, isWritable: true },
+    { pubkey: feeRecipient, isSigner: false, isWritable: true },
     { pubkey: mint, isSigner: false, isWritable: false },
     { pubkey: bondingCurve, isSigner: false, isWritable: true },
     { pubkey: associatedBondingCurve, isSigner: false, isWritable: true },

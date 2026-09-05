@@ -35,39 +35,49 @@ import {
   PUMP_BUYBACK_FEE_RECIPIENT,
   PUMP_EVENT_AUTHORITY,
   PUMP_FEE_PROGRAM_ID,
-  PUMP_FEE_RECIPIENT,
   PUMP_GLOBAL,
   PUMP_METAPLEX_PROGRAM_ID,
   PUMP_PROGRAM_ID,
   pumpFeeConfigPda,
   pumpGlobalVolumeAccumulatorPda,
   pumpMintAuthorityPda,
+  resolvePumpFeeRecipient,
 } from "../pump";
 
-/** Every account that is identical across launches (safe to share in one ALT).
- *  Order is irrelevant; the ALT is keyed by address. */
-export const PUMP_LOOKUP_ACCOUNTS: PublicKey[] = [
-  SystemProgram.programId,
-  TOKEN_PROGRAM_ID,
-  ASSOCIATED_TOKEN_PROGRAM_ID,
-  SYSVAR_RENT_PUBKEY,
-  PUMP_GLOBAL,
-  PUMP_METAPLEX_PROGRAM_ID,
-  PUMP_EVENT_AUTHORITY,
-  PUMP_PROGRAM_ID,
-  PUMP_FEE_PROGRAM_ID,
-  PUMP_FEE_RECIPIENT,
-  PUMP_BUYBACK_FEE_RECIPIENT,
-  pumpFeeConfigPda()[0],
-  pumpMintAuthorityPda()[0],
-  pumpGlobalVolumeAccumulatorPda()[0],
-  ComputeBudgetProgram.programId,
-];
+/** Every account that is identical across launches (safe to share in one ALT)
+ *  EXCEPT the protocol fee recipient, which pump.fun rotates: pass the LIVE
+ *  value from resolvePumpFeeRecipient so the sandbox always references the
+ *  address the buy/sell instructions actually use. Order is irrelevant; the
+ *  ALT is keyed by address. */
+export function pumpLookupAccounts(feeRecipient: PublicKey): PublicKey[] {
+  return [
+    SystemProgram.programId,
+    TOKEN_PROGRAM_ID,
+    ASSOCIATED_TOKEN_PROGRAM_ID,
+    SYSVAR_RENT_PUBKEY,
+    PUMP_GLOBAL,
+    PUMP_METAPLEX_PROGRAM_ID,
+    PUMP_EVENT_AUTHORITY,
+    PUMP_PROGRAM_ID,
+    PUMP_FEE_PROGRAM_ID,
+    feeRecipient,
+    PUMP_BUYBACK_FEE_RECIPIENT,
+    pumpFeeConfigPda()[0],
+    pumpMintAuthorityPda()[0],
+    pumpGlobalVolumeAccumulatorPda()[0],
+    ComputeBudgetProgram.programId,
+  ];
+}
 
 /**
- * Returns a ready-to-use ALT containing PUMP_LOOKUP_ACCOUNTS. When
- * `cachedAddress` names a live ALT it is reused; otherwise a fresh ALT is
- * created + extended in one tx and returned. The payer (the creator) signs.
+ * Returns a ready-to-use ALT. When `cachedAddress` names a live ALT it is
+ * reused; otherwise a fresh ALT is created + extended in one tx and returned.
+ * The payer (the creator) signs. The protocol fee recipient is resolved LIVE
+ * (pump.fun rotates it), so a freshly created ALT always carries the address
+ * the buy/sell instructions use. NOTE: a REUSED cached ALT created before a
+ * rotation may lack the current recipient — that is safe (the sandbox then
+ * writes the recipient as a full pubkey instead of a 1-byte index; it only
+ * costs bytes, never correctness).
  */
 export async function ensurePumpLookupTable(
   connection: Connection,
@@ -87,6 +97,8 @@ export async function ensurePumpLookupTable(
     }
   }
 
+  const feeRecipient = await resolvePumpFeeRecipient(connection);
+
   const [createIx, address] = AddressLookupTableProgram.createLookupTable({
     authority: payer.publicKey,
     payer: payer.publicKey,
@@ -96,7 +108,7 @@ export async function ensurePumpLookupTable(
     payer: payer.publicKey,
     authority: payer.publicKey,
     lookupTable: address,
-    addresses: PUMP_LOOKUP_ACCOUNTS,
+    addresses: pumpLookupAccounts(feeRecipient),
   });
 
   const latest = await connection.getLatestBlockhash("confirmed");

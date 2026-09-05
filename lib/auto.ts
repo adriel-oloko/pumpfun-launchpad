@@ -69,6 +69,7 @@ import {
   quotePumpBuy,
   quotePumpSell,
   readPumpCurveState,
+  resolvePumpFeeRecipient,
   type PumpCurveState,
 } from "./pump";
 import { TOTAL_SUPPLY } from "./params";
@@ -249,6 +250,9 @@ export interface AutoBuyIxOptions {
   mint: PublicKey;
   /** The curve's recorded creator (public key). */
   creator: PublicKey;
+  /** The LIVE protocol fee recipient (resolvePumpFeeRecipient); a stale
+   *  value makes the pump.fun program revert with Custom 6000. */
+  feeRecipient: PublicKey;
   solInLamports: bigint;
   /** The curve's VIRTUAL reserves at quote time (readAutoCurveState). */
   solReserve: bigint;
@@ -267,6 +271,7 @@ export function buildAutoBuyIx(opts: AutoBuyIxOptions): TransactionInstruction[]
     buyer,
     mint,
     creator,
+    feeRecipient,
     solInLamports,
     solReserve,
     tokenReserve,
@@ -282,6 +287,7 @@ export function buildAutoBuyIx(opts: AutoBuyIxOptions): TransactionInstruction[]
     mint,
     buyer,
     creator,
+    feeRecipient,
     tokensOut: quote.tokensOut,
     maxSolCost: quote.maxSolCost,
   });
@@ -293,6 +299,9 @@ export interface AutoSellIxOptions {
   /** The curve's recorded creator (public key); feeds the creator_vault
    *  account of pump.fun's sell. */
   creator: PublicKey;
+  /** The LIVE protocol fee recipient (resolvePumpFeeRecipient); a stale
+   *  value makes the pump.fun program revert with Custom 6000. */
+  feeRecipient: PublicKey;
   tokenIn: bigint;
   /** The curve's VIRTUAL reserves at quote time. */
   solReserve: bigint;
@@ -310,6 +319,7 @@ export function buildAutoSellIx(opts: AutoSellIxOptions): TransactionInstruction
     seller,
     mint,
     creator,
+    feeRecipient,
     tokenIn,
     solReserve,
     tokenReserve,
@@ -325,6 +335,7 @@ export function buildAutoSellIx(opts: AutoSellIxOptions): TransactionInstruction
     mint,
     seller,
     creator,
+    feeRecipient,
     tokensIn: tokenIn,
     minSolOutput: quote.minSolOutput,
   });
@@ -377,6 +388,9 @@ export async function fireAutoBuy(
     "confirmed"
   );
   const latest = await connection.getLatestBlockhash("confirmed");
+  // Live protocol fee recipient (pump.fun rotates it; a stale value reverts
+  // every buy with Custom 6000). One read for the whole round.
+  const feeRecipient = await resolvePumpFeeRecipient(connection);
 
   // Chain the round's quotes across the simulated reserves: wallet i quotes
   // the state wallets 0..i-1 leave behind (their fills land within the
@@ -421,6 +435,7 @@ export async function fireAutoBuy(
         mint,
         buyer: kp.publicKey,
         creator,
+        feeRecipient,
         tokensOut: quote.tokensOut,
         maxSolCost: quote.maxSolCost,
       });
@@ -484,6 +499,9 @@ export async function fireAutoSell(
   const pctNum = Math.round(sellPct * 100);
   const creator = new PublicKey(curve.creator);
   const latest = await connection.getLatestBlockhash("confirmed");
+  // Live protocol fee recipient (pump.fun rotates it; a stale value reverts
+  // every sell with Custom 6000). One read for the whole round.
+  const feeRecipient = await resolvePumpFeeRecipient(connection);
 
   // Chain the round's min_sol_output quotes across the simulated reserves.
   let vsr = curve.solReserve;
@@ -512,6 +530,7 @@ export async function fireAutoSell(
         mint,
         seller: kp.publicKey,
         creator,
+        feeRecipient,
         tokensIn: tokenIn,
         minSolOutput: quote.minSolOutput,
       });
