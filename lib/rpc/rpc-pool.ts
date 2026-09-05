@@ -17,8 +17,10 @@
  *   NEXT_PUBLIC_SOLANA_RPC_MAINNET / NEXT_PUBLIC_SOLANA_RPC_DEVNET. Each may
  *   be a comma-separated list; every entry is prepended to that network's
  *   pool ahead of the public defaults.
- * - The public defaults (api.mainnet-beta.solana.com / devnet.helius-rpc.com/?api-key=6fd05d57-a073-4cc6-8b5b-4314a652e487,
- *   operated by Triton) act as keyless failover.
+ * - The devnet default (devnet.helius-rpc.com/?api-key=6fd05d57-a073-4cc6-8b5b-4314a652e487,
+ *   operated by Helius) acts as keyless failover. Mainnet has NO public
+ *   default: api.mainnet-beta.solana.com 403-blocks datacenter IPs (Vercel),
+ *   so mainnet requires a keyed endpoint via NEXT_PUBLIC_SOLANA_RPC_MAINNET.
  * - NEXT_PUBLIC_ vars are inlined identically at build time in every module
  *   that reads them, so the pool is stable per build.
  *
@@ -54,7 +56,14 @@ function buildPool(envName: string, defaults: string[]): string[] {
     return [...new Set([...envEndpoints(envName), ...defaults].map(normalize))]
 }
 
-/** Mainnet pool: env NEXT_PUBLIC_SOLANA_RPC_MAINNET + Triton public default. */
+/**
+ * Mainnet pool: env NEXT_PUBLIC_SOLANA_RPC_MAINNET ONLY. There is no public
+ * default: api.mainnet-beta.solana.com returns HTTP 403 to datacenter/cloud
+ * IP ranges (Vercel serverless), and 403 is not a failover-able status in
+ * rotatingFetch, so keeping it in the pool would 403 ~half of all requests
+ * with no recovery. Mainnet reads/launches REQUIRE a keyed endpoint
+ * (Helius/Triton/QuickNode) via the env var.
+ */
 export const MAINNET_RPC_POOL: string[] = buildPool(
     'NEXT_PUBLIC_SOLANA_RPC_MAINNET',
     []
