@@ -29,17 +29,19 @@ import {
 } from "@solana/web3.js";
 import {
   ASSOCIATED_TOKEN_PROGRAM_ID,
-  TOKEN_PROGRAM_ID,
+  TOKEN_2022_PROGRAM_ID,
 } from "@solana/spl-token";
 import {
   PUMP_BUYBACK_FEE_RECIPIENT,
   PUMP_EVENT_AUTHORITY,
   PUMP_FEE_PROGRAM_ID,
   PUMP_GLOBAL,
-  PUMP_METAPLEX_PROGRAM_ID,
+  PUMP_MAYHEM_PROGRAM_ID,
   PUMP_PROGRAM_ID,
   pumpFeeConfigPda,
   pumpGlobalVolumeAccumulatorPda,
+  pumpMayhemGlobalParamsPda,
+  pumpMayhemSolVaultPda,
   pumpMintAuthorityPda,
   resolvePumpFeeRecipient,
 } from "../pump";
@@ -52,11 +54,11 @@ import {
 export function pumpLookupAccounts(feeRecipient: PublicKey): PublicKey[] {
   return [
     SystemProgram.programId,
-    TOKEN_PROGRAM_ID,
+    TOKEN_2022_PROGRAM_ID,
     ASSOCIATED_TOKEN_PROGRAM_ID,
     SYSVAR_RENT_PUBKEY,
     PUMP_GLOBAL,
-    PUMP_METAPLEX_PROGRAM_ID,
+    PUMP_MAYHEM_PROGRAM_ID,
     PUMP_EVENT_AUTHORITY,
     PUMP_PROGRAM_ID,
     PUMP_FEE_PROGRAM_ID,
@@ -65,6 +67,8 @@ export function pumpLookupAccounts(feeRecipient: PublicKey): PublicKey[] {
     pumpFeeConfigPda()[0],
     pumpMintAuthorityPda()[0],
     pumpGlobalVolumeAccumulatorPda()[0],
+    pumpMayhemGlobalParamsPda()[0],
+    pumpMayhemSolVaultPda()[0],
     ComputeBudgetProgram.programId,
   ];
 }

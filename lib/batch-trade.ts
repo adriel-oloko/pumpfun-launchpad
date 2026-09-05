@@ -40,7 +40,7 @@
 // every tx is signed manually with the wallet's Keypair (anchor Wallet is
 // Node-only in the browser, and the anchor Program is gone entirely).
 
-import { TOKEN_PROGRAM_ID, getAssociatedTokenAddressSync } from "@solana/spl-token";
+import { TOKEN_2022_PROGRAM_ID, getAssociatedTokenAddressSync } from "@solana/spl-token";
 import bs58 from "bs58";
 import { Connection, Keypair, PublicKey, Transaction } from "@solana/web3.js";
 import {
@@ -136,7 +136,7 @@ async function buyOne(
     mint,
     kp.publicKey,
     false,
-    TOKEN_PROGRAM_ID
+    TOKEN_2022_PROGRAM_ID
   );
   const ataInfo = await connection.getAccountInfo(ata, "confirmed");
   const reserveAta = ataInfo ? BigInt(0) : BigInt(ataRent);

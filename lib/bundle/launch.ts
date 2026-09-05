@@ -32,8 +32,10 @@
 // 6 decimals, 1e9 supply — lib/params.ts, unchanged).
 
 import {
-  TOKEN_PROGRAM_ID,
+  ExtensionType,
+  TOKEN_2022_PROGRAM_ID,
   getAssociatedTokenAddressSync,
+  getExtensionData,
 } from "@solana/spl-token";
 import {
   ComputeBudgetProgram,
@@ -820,15 +822,15 @@ export async function withTimeout<T>(p: Promise<T>, ms: number, msg: string): Pr
   }
 }
 
-/** Reads a wallet's legacy-SPL token balance for the launch mint (raw
- *  units). pump.fun mints are LEGACY SPL tokens, so the ATA is derived with
- *  TOKEN_PROGRAM_ID (never Token-2022). */
+/** Reads a wallet's Token-2022 token balance for the launch mint (raw
+ *  units). pump.fun mints are Token-2022 since the create_v2 migration, so
+ *  the ATA is derived with TOKEN_2022_PROGRAM_ID. */
 export async function walletTokenBalance(
   connection: Connection,
   wallet: PublicKey,
   mint: PublicKey
 ): Promise<bigint> {
-  const ata = getAssociatedTokenAddressSync(mint, wallet, false, TOKEN_PROGRAM_ID);
+  const ata = getAssociatedTokenAddressSync(mint, wallet, false, TOKEN_2022_PROGRAM_ID);
   try {
     const r = await connection.getTokenAccountBalance(ata, "confirmed");
     return BigInt(r.value.amount);
@@ -891,6 +893,47 @@ export async function readMetadataStrings(
   const uri = readLenPrefixed();
   if (name === null || symbol === null || uri === null) return null;
   return { name, symbol, uri };
+}
+
+/**
+ * Reads the name / symbol / uri from a Token-2022 mint's in-mint token
+ * metadata extension (create_v2 stores metadata IN THE MINT, not in a
+ * Metaplex account). Returns null when the mint is not Token-2022 or has no
+ * metadata extension. The extension payload layout (spl-token-metadata
+ * TokenMetadata): Option<update_authority> (1B flag + 32B if set) + mint
+ * (32B) + name/symbol/uri as u32-LE-length-prefixed strings.
+ */
+export async function readToken2022Metadata(
+  connection: Connection,
+  mint: PublicKey
+): Promise<{ name: string; symbol: string; uri: string } | null> {
+  const info = await connection.getAccountInfo(mint, "confirmed");
+  if (!info) return null;
+  const ext = getExtensionData(ExtensionType.TokenMetadata, info.data);
+  if (!ext) return null;
+  try {
+    let offset = 0;
+    const hasUpdateAuthority = ext[offset];
+    offset += 1;
+    if (hasUpdateAuthority) offset += 32;
+    offset += 32; // mint
+    const readStr = (): string | null => {
+      if (offset + 4 > ext.length) return null;
+      const len = ext.readUInt32LE(offset);
+      offset += 4;
+      if (offset + len > ext.length) return null;
+      const s = ext.subarray(offset, offset + len).toString("utf8");
+      offset += len;
+      return s;
+    };
+    const name = readStr();
+    const symbol = readStr();
+    const uri = readStr();
+    if (name === null || symbol === null || uri === null) return null;
+    return { name, symbol, uri };
+  } catch {
+    return null;
+  }
 }
 
 export { LAMPORTS_PER_SOL };

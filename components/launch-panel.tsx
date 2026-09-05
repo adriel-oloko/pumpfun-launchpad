@@ -62,7 +62,7 @@ import {
     holderCount,
     postBuyFloorLamports,
     preflightLaunch,
-    readMetadataStrings,
+    readToken2022Metadata,
     sendSequentially,
     simulateBundle,
     walletTokenBalance,
@@ -351,8 +351,33 @@ export function LaunchPanel({
                     creator.publicKey,
                     'confirmed'
                 )
-                const needed =
-                    totalFund + BigInt(Math.round(0.02 * LAMPORTS_PER_SOL))
+                // The pump.fun `create_v2` instruction makes the creator fund
+                // the accounts it allocates, all rent-exempt:
+                //   - Token-2022 mint (~400-570B; metadata lives IN-MINT via the
+                //     Token-2022 metadata extension, growing with the
+                //     name/symbol/uri length — there is NO Metaplex account)
+                //   - bonding curve (151B on live create_v2 tokens)
+                //   - bonding-curve ATA (Token-2022 token account = 170B)
+                //   - mayhem_state + mayhem_token_vault: created then CLOSED
+                //     for non-mayhem tokens (net zero, but the creator must
+                //     cover their rent mid-tx) — reserved as a flat buffer
+                // The creator must also retain its own native rent-exempt
+                // floor after the create and pay the tx fee. Sum the rent
+                // minimums + the ephemeral-mayhem buffer + floor + fee.
+                const mintSize =
+                    340 +
+                    Buffer.byteLength(name, 'utf8') +
+                    Buffer.byteLength(symbol, 'utf8') +
+                    Buffer.byteLength(finalUri, 'utf8')
+                const createRent =
+                    BigInt(await connection.getMinimumBalanceForRentExemption(mintSize)) + // Token-2022 mint
+                    BigInt(await connection.getMinimumBalanceForRentExemption(151)) + // bonding curve
+                    BigInt(await connection.getMinimumBalanceForRentExemption(170)) + // Token-2022 ATA
+                    BigInt(await connection.getMinimumBalanceForRentExemption(340)) + // mayhem_state (ephemeral)
+                    BigInt(await connection.getMinimumBalanceForRentExemption(170)) // mayhem_token_vault (ephemeral)
+                const createMargin =
+                    createRent + postBuyFloorLamports() + BigInt(30_000)
+                const needed = totalFund + createMargin
                 log(
                     `fund    : ${(Number(totalFund) / LAMPORTS_PER_SOL).toFixed(4)} SOL from creator (sol_in + ata rent + floor)`
                 )
@@ -615,13 +640,15 @@ export function LaunchPanel({
             } catch (e) {
                 log(`curve state read failed: ${errMsg(e)}`)
             }
-            const meta = await readMetadataStrings(connection, seq.pda.metadata)
+            const meta = await readToken2022Metadata(connection, seq.pda.mint)
             if (meta) {
                 log(
                     `metadata  : name="${meta.name}" symbol="${meta.symbol}" uri=${meta.uri}`
                 )
             } else {
-                log('metadata  : could not decode the metadata account')
+                log(
+                    'metadata  : could not decode the Token-2022 in-mint metadata'
+                )
             }
             log('=== launch complete ===')
 

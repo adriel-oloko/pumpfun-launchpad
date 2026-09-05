@@ -19,9 +19,13 @@
 //   - client-side quote math (pump.fun's buy takes TOKENS OUT, not SOL in)
 //   - TransactionInstruction builders for create / buy / sell
 //
-// TOKEN PROGRAM GOTCHA: pump.fun's standard `create` mints are LEGACY SPL
-// tokens (TOKEN_PROGRAM_ID), NOT Token-2022. Every ATA derivation in this
-// module uses the legacy token program.
+// TOKEN PROGRAM (2026-09): pump.fun migrated new launches to Token-2022. The
+// active create path is `create_v2` (Token-2022 mint; metadata is stored
+// IN-MINT via the Token-2022 metadata extension — there is NO separate
+// Metaplex metadata account anymore). Every ATA derivation in this module uses
+// the Token-2022 token program. `buy`/`sell` keep the SAME account layouts as
+// the legacy path but pass Token-2022 as token_program (verified against the
+// official @pump-fun/pump-sdk createV2AndBuyInstructions flow).
 //
 // ES2017 rules (project-wide): no bigint literals (use BigInt(...)); no
 // Buffer.writeBigUInt64LE (missing in browser Buffer shims) — the 8 u64
@@ -30,7 +34,7 @@
 import { Buffer } from "buffer";
 import {
   ASSOCIATED_TOKEN_PROGRAM_ID,
-  TOKEN_PROGRAM_ID,
+  TOKEN_2022_PROGRAM_ID,
   createAssociatedTokenAccountIdempotentInstruction,
   getAssociatedTokenAddressSync,
 } from "@solana/spl-token";
@@ -38,7 +42,6 @@ import {
   Connection,
   PublicKey,
   SystemProgram,
-  SYSVAR_RENT_PUBKEY,
   TransactionInstruction,
 } from "@solana/web3.js";
 import { solanaNetwork } from "./network";
@@ -140,12 +143,21 @@ export const PUMP_METAPLEX_PROGRAM_ID = new PublicKey(
   "metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s"
 );
 
-/** Legacy SPL token program: pump.fun standard mints are LEGACY SPL, never
- *  Token-2022. Every ATA in the create/buy/sell path uses this program. */
-export const PUMP_TOKEN_PROGRAM_ID: PublicKey = TOKEN_PROGRAM_ID;
+/** Token program used by pump.fun's ACTIVE `create_v2` path: Token-2022.
+ *  (Every live pump.fun mint is Token-2022 since the migration; the v1 legacy
+ *  SPL create is deprecated.) Every ATA derivation in this module uses it. */
+export const PUMP_TOKEN_PROGRAM_ID: PublicKey = TOKEN_2022_PROGRAM_ID;
 
-/** Legacy SPL associated-token program. */
+/** Associated-token program (shared by legacy SPL and Token-2022). */
 export const PUMP_ATA_PROGRAM_ID: PublicKey = ASSOCIATED_TOKEN_PROGRAM_ID;
+
+/** pump.fun mayhem program. `create_v2` carries four mayhem-mode accounts
+ *  (global_params, sol_vault, mayhem_state, mayhem_token_vault) under it even
+ *  for NON-mayhem tokens — the global flag mayhemModeEnabled=1 makes the
+ *  program allocate them on every create. */
+export const PUMP_MAYHEM_PROGRAM_ID = new PublicKey(
+  "MAyhSmzXzV1pTf7LsNkrNwkWKTo4ougAJ1PPg47MD4e"
+);
 
 /** Protocol fee, basis points (100 = 1%), applied on the input side. */
 export const PUMP_FEE_BPS: bigint = BigInt(100);
@@ -158,8 +170,8 @@ export const PUMP_DEFAULT_SLIPPAGE_BPS: bigint = BigInt(1000);
 
 /** Instruction discriminators (8 bytes, little-endian, pump.fun native
  *  program — NOT anchor discriminators). */
-export const PUMP_CREATE_DISCRIMINATOR: number[] = [
-  24, 30, 200, 40, 5, 28, 7, 119, // 0x181ec828051c0777
+export const PUMP_CREATE_V2_DISCRIMINATOR: number[] = [
+  214, 144, 76, 236, 95, 139, 49, 180, // 0xd6904cec5f8b31b4 (create_v2)
 ];
 export const PUMP_BUY_DISCRIMINATOR: number[] = [
   102, 6, 61, 18, 1, 218, 235, 234, // 0x66063d1201daebea
@@ -205,6 +217,9 @@ const USER_VOLUME_SEED = Buffer.from("user_volume_accumulator");
 const FEE_CONFIG_SEED = Buffer.from("fee_config");
 const MINT_AUTHORITY_SEED = Buffer.from("mint-authority");
 const METADATA_SEED = Buffer.from("metadata");
+const MAYHEM_GLOBAL_PARAMS_SEED = Buffer.from("global-params");
+const MAYHEM_SOL_VAULT_SEED = Buffer.from("sol-vault");
+const MAYHEM_STATE_SEED = Buffer.from("mayhem-state");
 
 /** bonding_curve = PDA(["bonding-curve", mint], PUMP_PROGRAM). */
 export function pumpBondingCurvePda(mint: PublicKey): [PublicKey, number] {
@@ -230,6 +245,42 @@ export function pumpCreatorVaultPda(creator: PublicKey): [PublicKey, number] {
   return PublicKey.findProgramAddressSync(
     [CREATOR_VAULT_SEED, creator.toBuffer()],
     PUMP_PROGRAM_ID
+  );
+}
+
+/** mayhem global_params = PDA(["global-params"], MAYHEM_PROGRAM). */
+export function pumpMayhemGlobalParamsPda(): [PublicKey, number] {
+  return PublicKey.findProgramAddressSync(
+    [MAYHEM_GLOBAL_PARAMS_SEED],
+    PUMP_MAYHEM_PROGRAM_ID
+  );
+}
+
+/** mayhem sol_vault = PDA(["sol-vault"], MAYHEM_PROGRAM). */
+export function pumpMayhemSolVaultPda(): [PublicKey, number] {
+  return PublicKey.findProgramAddressSync(
+    [MAYHEM_SOL_VAULT_SEED],
+    PUMP_MAYHEM_PROGRAM_ID
+  );
+}
+
+/** mayhem_state = PDA(["mayhem-state", mint], MAYHEM_PROGRAM). */
+export function pumpMayhemStatePda(mint: PublicKey): [PublicKey, number] {
+  return PublicKey.findProgramAddressSync(
+    [MAYHEM_STATE_SEED, mint.toBuffer()],
+    PUMP_MAYHEM_PROGRAM_ID
+  );
+}
+
+/** mayhem_token_vault = the mayhem sol_vault's Token-2022 ATA of the mint
+ *  (getTokenVaultPda in the official SDK). */
+export function pumpMayhemTokenVaultPda(mint: PublicKey): PublicKey {
+  const [solVault] = pumpMayhemSolVaultPda();
+  return getAssociatedTokenAddressSync(
+    mint,
+    solVault,
+    true,
+    PUMP_TOKEN_PROGRAM_ID
   );
 }
 
@@ -282,7 +333,7 @@ export function pumpMetadataPda(mint: PublicKey): [PublicKey, number] {
   );
 }
 
-/** The bonding curve's own legacy-SPL ATA of the mint (owner = the curve
+/** The bonding curve's own Token-2022 ATA of the mint (owner = the curve
  *  PDA, so allowOwnerOffCurve = true). */
 export function pumpBondingCurveAta(mint: PublicKey): PublicKey {
   const [bondingCurve] = pumpBondingCurvePda(mint);
@@ -290,13 +341,18 @@ export function pumpBondingCurveAta(mint: PublicKey): PublicKey {
     mint,
     bondingCurve,
     true,
-    TOKEN_PROGRAM_ID
+    PUMP_TOKEN_PROGRAM_ID
   );
 }
 
-/** A user's legacy-SPL ATA of the mint. */
+/** A user's Token-2022 ATA of the mint. */
 export function pumpUserAta(mint: PublicKey, user: PublicKey): PublicKey {
-  return getAssociatedTokenAddressSync(mint, user, false, TOKEN_PROGRAM_ID);
+  return getAssociatedTokenAddressSync(
+    mint,
+    user,
+    false,
+    PUMP_TOKEN_PROGRAM_ID
+  );
 }
 
 /* ------------------------------------------------------------------ */
@@ -472,15 +528,20 @@ export function quotePumpSell(opts: {
 /* ------------------------------------------------------------------ */
 
 /**
- * Builds the pump.fun `create` instruction: a fresh legacy-SPL mint (the
- * caller's `mintKeypair` signs the tx alongside the creator), with FOUR args
- * (name/symbol/uri AND the `creator` pubkey — the program records the creator
- * explicitly for the fee-sharing config) — never append `.pump` to the symbol
- * (indexers add the suffix because the token is on pump.fun's program). The
- * account order below is the official current IDL order (14 accounts: mint,
- * mint_authority, bonding_curve, associated_bonding_curve, global,
- * mpl_token_metadata, metadata, user/creator, system_program, token_program,
- * associated_token_program, rent, event_authority, program).
+ * Builds the pump.fun ACTIVE `create_v2` instruction (Token-2022 mint; the
+ * caller's `mintKeypair` signs the tx alongside the creator/user). SIX args:
+ * name/symbol/uri + creator pubkey + is_mayhem_mode + is_cashback_enabled.
+ * For a standard launch both flags are FALSE — verified against live create_v2
+ * txs on mainnet (RONK / SunwuKong / maggie all pass 0/0; the global
+ * mayhemModeEnabled / is_cashback_enabled toggles are protocol-level, NOT
+ * per-token defaults). The mint is Token-2022 and the name/symbol/uri metadata
+ * is stored IN-MINT via the Token-2022 metadata extension — there is NO
+ * separate Metaplex metadata account anymore. The account order below is the
+ * official IDL order (16 accounts, incl. the mayhem-program leg:
+ * mayhem_program_id, global_params, sol_vault, mayhem_state,
+ * mayhem_token_vault — the program allocates them even for non-mayhem tokens
+ * because mayhemModeEnabled=1 globally). Never append `.pump` to the symbol
+ * (indexers add the suffix because the token is on pump.fun's program).
  */
 export function buildPumpCreateIx(opts: {
   creator: PublicKey;
@@ -488,8 +549,14 @@ export function buildPumpCreateIx(opts: {
   name: string;
   symbol: string;
   uri: string;
+  /** Per-token mayhem-mode flag; standard launches pass false. */
+  isMayhemMode?: boolean;
+  /** Per-token cashback flag; standard launches pass false. */
+  isCashbackEnabled?: boolean;
 }): TransactionInstruction {
   const { creator, mint, name, symbol, uri } = opts;
+  const isMayhemMode = opts.isMayhemMode ?? false;
+  const isCashbackEnabled = opts.isCashbackEnabled ?? false;
   if (Buffer.byteLength(name, "utf8") > 32) {
     throw new Error(`name too long: ${name}`);
   }
@@ -501,30 +568,37 @@ export function buildPumpCreateIx(opts: {
   }
   const [bondingCurve] = pumpBondingCurvePda(mint);
   const [mintAuthority] = pumpMintAuthorityPda();
-  const [metadata] = pumpMetadataPda(mint);
   const associatedBondingCurve = pumpBondingCurveAta(mint);
+  const [globalParams] = pumpMayhemGlobalParamsPda();
+  const [solVault] = pumpMayhemSolVaultPda();
+  const [mayhemState] = pumpMayhemStatePda(mint);
+  const mayhemTokenVault = pumpMayhemTokenVaultPda(mint);
   const keys = [
     { pubkey: mint, isSigner: true, isWritable: true },
     { pubkey: mintAuthority, isSigner: false, isWritable: false },
     { pubkey: bondingCurve, isSigner: false, isWritable: true },
     { pubkey: associatedBondingCurve, isSigner: false, isWritable: true },
     { pubkey: PUMP_GLOBAL, isSigner: false, isWritable: false },
-    { pubkey: PUMP_METAPLEX_PROGRAM_ID, isSigner: false, isWritable: false },
-    { pubkey: metadata, isSigner: false, isWritable: true },
     { pubkey: creator, isSigner: true, isWritable: true },
     { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
-    { pubkey: TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },
+    { pubkey: PUMP_TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },
     { pubkey: PUMP_ATA_PROGRAM_ID, isSigner: false, isWritable: false },
-    { pubkey: SYSVAR_RENT_PUBKEY, isSigner: false, isWritable: false },
+    { pubkey: PUMP_MAYHEM_PROGRAM_ID, isSigner: false, isWritable: true },
+    { pubkey: globalParams, isSigner: false, isWritable: false },
+    { pubkey: solVault, isSigner: false, isWritable: true },
+    { pubkey: mayhemState, isSigner: false, isWritable: true },
+    { pubkey: mayhemTokenVault, isSigner: false, isWritable: true },
     { pubkey: PUMP_EVENT_AUTHORITY, isSigner: false, isWritable: false },
     { pubkey: PUMP_PROGRAM_ID, isSigner: false, isWritable: false },
   ];
   const data = Buffer.concat([
-    Buffer.from(PUMP_CREATE_DISCRIMINATOR),
+    Buffer.from(PUMP_CREATE_V2_DISCRIMINATOR),
     borshString(name),
     borshString(symbol),
     borshString(uri),
     creator.toBuffer(),
+    Buffer.from([isMayhemMode ? 1 : 0]),
+    Buffer.from([isCashbackEnabled ? 1 : 0]),
   ]);
   return new TransactionInstruction({
     keys,
@@ -535,13 +609,16 @@ export function buildPumpCreateIx(opts: {
 
 /**
  * Builds the pump.fun `buy` instruction pair for one buyer:
- *   [createAssociatedTokenAccountIdempotent (buyer ATA, legacy SPL), buy]
+ *   [createAssociatedTokenAccountIdempotent (buyer ATA, Token-2022), buy]
  * The ATA-create is harmless when the ATA already exists (the proven SDKs do
  * exactly this). buy data = discriminator ++ u64le(tokens_out) ++
  * u64le(max_sol_cost) ++ u8(track_volume=1). The account order below is the
  * official current buy layout (18 accounts, incl. the fee-program leg:
  * creator_vault, volume accumulators, fee_config, fee_program, and the two
- * remaining accounts bonding_curve_v2 + one buyback fee recipient).
+ * remaining accounts bonding_curve_v2 + one buyback fee recipient). The
+ * token_program account is Token-2022 (this is the SAME instruction the
+ * official SDK uses for Token-2022 tokens: createV2AndBuyInstructions passes
+ * TOKEN_2022_PROGRAM_ID).
  */
 export function buildPumpBuyIx(opts: {
   mint: PublicKey;
@@ -570,7 +647,7 @@ export function buildPumpBuyIx(opts: {
     associatedUser,
     buyer,
     mint,
-    TOKEN_PROGRAM_ID,
+    TOKEN_2022_PROGRAM_ID,
     ASSOCIATED_TOKEN_PROGRAM_ID
   );
 
@@ -583,7 +660,7 @@ export function buildPumpBuyIx(opts: {
     { pubkey: associatedUser, isSigner: false, isWritable: true },
     { pubkey: buyer, isSigner: true, isWritable: true },
     { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
-    { pubkey: TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },
+    { pubkey: PUMP_TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },
     { pubkey: creatorVault, isSigner: false, isWritable: true },
     { pubkey: PUMP_EVENT_AUTHORITY, isSigner: false, isWritable: false },
     { pubkey: PUMP_PROGRAM_ID, isSigner: false, isWritable: false },
@@ -610,11 +687,13 @@ export function buildPumpBuyIx(opts: {
 
 /**
  * Builds the pump.fun `sell` instruction pair for one seller:
- *   [createAssociatedTokenAccountIdempotent (seller ATA, legacy SPL), sell]
+ *   [createAssociatedTokenAccountIdempotent (seller ATA, Token-2022), sell]
  * sell data = discriminator ++ u64le(tokens_in) ++ u64le(min_sol_output).
  * The account order below is the official current sell layout (16 accounts,
  * incl. the fee-program leg: creator_vault, fee_config, fee_program, and the
- * two remaining accounts bonding_curve_v2 + one buyback fee recipient).
+ * two remaining accounts bonding_curve_v2 + one buyback fee recipient). The
+ * token_program account is Token-2022 (same instruction the official SDK uses
+ * for Token-2022 tokens).
  */
 export function buildPumpSellIx(opts: {
   mint: PublicKey;
@@ -641,7 +720,7 @@ export function buildPumpSellIx(opts: {
     associatedUser,
     seller,
     mint,
-    TOKEN_PROGRAM_ID,
+    TOKEN_2022_PROGRAM_ID,
     ASSOCIATED_TOKEN_PROGRAM_ID
   );
 
@@ -655,7 +734,7 @@ export function buildPumpSellIx(opts: {
     { pubkey: seller, isSigner: true, isWritable: true },
     { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
     { pubkey: creatorVault, isSigner: false, isWritable: true },
-    { pubkey: TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },
+    { pubkey: PUMP_TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },
     { pubkey: PUMP_EVENT_AUTHORITY, isSigner: false, isWritable: false },
     { pubkey: PUMP_PROGRAM_ID, isSigner: false, isWritable: false },
     { pubkey: feeConfig, isSigner: false, isWritable: false },

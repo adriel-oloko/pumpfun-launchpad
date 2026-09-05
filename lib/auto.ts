@@ -46,7 +46,7 @@
 // Node-only in the browser, and the anchor Program is gone entirely).
 
 import {
-  TOKEN_PROGRAM_ID,
+  TOKEN_2022_PROGRAM_ID,
   getAssociatedTokenAddressSync,
 } from "@solana/spl-token";
 import bs58 from "bs58";
@@ -412,7 +412,7 @@ export async function fireAutoBuy(
         mint,
         kp.publicKey,
         false,
-        TOKEN_PROGRAM_ID
+        TOKEN_2022_PROGRAM_ID
       );
       const ataInfo = await connection.getAccountInfo(ata, "confirmed");
       const reserveAta = ataInfo ? BigInt(0) : BigInt(ataRent);
