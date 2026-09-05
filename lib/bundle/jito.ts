@@ -60,6 +60,27 @@ export interface BundleAttempt {
   status?: string;
   landedSlot?: number | null;
   sendError?: string;
+  /** Relay that accepted this attempt's bundle (jito/bloxroute/astralane).
+   *  Only jito is status-pollable, so only a jito accept can produce the
+   *  rejection fields below. */
+  winningRelay?: string;
+  /** Jito getBundleStatuses rejection_reason.reason: TransactionFailure,
+   *  ExceedsCostModel, BlockhashNotFound, TipError, BundleLockError,
+   *  InvalidPreOrPostAccounts, or null when the detailed status had no
+   *  verdict (aged out / relay has no status API). */
+  rejectionReason?: string | null;
+  /** Jito getBundleStatuses rejection_reason.msg (human detail). */
+  rejectionMsg?: string | null;
+  /** Shared recent blockhash the signed bundle was built over. */
+  blockhash?: string;
+  /** lastValidBlockHeight paired with `blockhash`. */
+  lastValidBlockHeight?: number | null;
+  /** Base58 signature of each signed bundle tx, aligned with base64. When a
+   *  bundle is Invalid nothing lands, so these are identifiers only; decode
+   *  `base64` to diff accounts against the chain. */
+  txSignatures?: string[];
+  /** Base64 signed bundle txs (decode to reproduce/diagnose an Invalid). */
+  base64?: string[];
 }
 
 export interface BundleSubmissionResult {

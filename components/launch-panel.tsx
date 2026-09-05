@@ -560,10 +560,28 @@ export function LaunchPanel({
                         pollTimeoutMs: 40_000,
                         pollIntervalMs: 2_500,
                         connection,
-                        onAttempt: (a) =>
-                            log(
-                                `   attempt ${a.attempt}: tip ${a.tipLamports}${a.bundleId ? `, bundle ${a.bundleId}` : ''}${a.status ? `, status ${a.status}` : ''}${a.sendError ? `, error: ${a.sendError}` : ''}`
-                            ),
+                        onAttempt: (a) => {
+                            const segs = [
+                                `attempt ${a.attempt}`,
+                                `tip ${a.tipLamports}`,
+                                a.bundleId ? `bundle ${a.bundleId}` : '',
+                                a.status ? `status ${a.status}` : '',
+                                a.winningRelay ? `relay ${a.winningRelay}` : '',
+                                a.rejectionReason
+                                    ? `reason ${a.rejectionReason}`
+                                    : '',
+                                a.rejectionMsg ? `msg ${a.rejectionMsg}` : '',
+                                a.blockhash ? `blockhash ${a.blockhash}` : '',
+                                a.lastValidBlockHeight != null
+                                    ? `lastValidBlockHeight ${a.lastValidBlockHeight}`
+                                    : '',
+                                a.txSignatures && a.txSignatures.length
+                                    ? `sigs ${a.txSignatures.join(',')}`
+                                    : '',
+                                a.sendError ? `error ${a.sendError}` : '',
+                            ].filter((s) => s !== '')
+                            log(`   ${segs.join(', ')}`)
+                        },
                     })
                     log(
                         `TIER 2 RESULT: ${tier2Result.outcome}${tier2Result.bundleId ? ` (bundle ${tier2Result.bundleId})` : ''}${tier2Result.landedSlot != null ? `, landed slot ${tier2Result.landedSlot}` : ''}`
@@ -579,6 +597,55 @@ export function LaunchPanel({
                     )
                 }
                 if (!tier2Result || tier2Result.outcome !== 'landed') {
+                    // M7b observability: a rejected bundle leaves a full trace
+                    // in the log so the culprit class (TransactionFailure /
+                    // ExceedsCostModel / BlockhashNotFound / TipError /
+                    // nothing-landed) is identifiable without re-running. The
+                    // base64 of each attempt's signed txs rides on
+                    // tier2Result.attempts[].base64 for decoding against the
+                    // chain (the rejection reason alone cannot name the tx).
+                    const lastA = tier2Result?.attempts?.length
+                        ? tier2Result.attempts[tier2Result.attempts.length - 1]
+                        : null
+                    const simSummary = sims
+                        .map((s) => `${s.label} ${s.unitsConsumed ?? '?'} CU`)
+                        .join(', ')
+                    log('tier 2 diagnostic (rejected):')
+                    log(`  bundle id            : ${lastA?.bundleId ?? 'none'}`)
+                    log(`  status               : ${lastA?.status ?? 'n/a'}`)
+                    log(
+                        `  rejection reason     : ${lastA?.rejectionReason ?? 'n/a'}`
+                    )
+                    log(`  rejection msg        : ${lastA?.rejectionMsg ?? 'n/a'}`)
+                    log(`  blockhash            : ${lastA?.blockhash ?? 'n/a'}`)
+                    log(
+                        `  lastValidBlockHeight : ${lastA?.lastValidBlockHeight ?? 'n/a'}`
+                    )
+                    log(`  tip (lamports)       : ${lastA?.tipLamports ?? 'n/a'}`)
+                    log(
+                        `  tx signatures        : ${
+                            lastA?.txSignatures?.length
+                                ? lastA.txSignatures.join(', ')
+                                : 'n/a'
+                        }`
+                    )
+                    log(`  sim/preflight        : ${simSummary || 'n/a'}`)
+                    log(
+                        `  attempts             : ${
+                            tier2Result
+                                ? tier2Result.attempts
+                                      .map(
+                                          (t) =>
+                                              `#${t.attempt} ${t.status ?? ''}${
+                                                  t.rejectionReason
+                                                      ? ` (${t.rejectionReason})`
+                                                      : ''
+                                              }`
+                                      )
+                                      .join('; ')
+                                : 'n/a'
+                        }`
+                    )
                     throw new Error(
                         tier2Result
                             ? bundleDropMessage(tier2Result)

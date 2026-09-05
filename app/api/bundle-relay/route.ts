@@ -168,36 +168,52 @@ export async function GET(req: Request): Promise<NextResponse> {
   }
   const { overrides } = resolveRelayEndpointsFromEnv();
   const base = overrides.jito.url.replace(/\/+$/, "");
-  const rpcBody = JSON.stringify({
-    jsonrpc: "2.0",
-    id: 1,
-    method: "getInflightBundleStatuses",
-    params: [[bundleId]],
-  });
-  try {
+  const post = async (method: string, params: unknown[]) => {
     const res = await fetch(`${base}/bundles`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: rpcBody,
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }),
     });
-    const raw = await res.text();
-    const json = JSON.parse(raw) as {
-      result?: { value?: { status?: string; landed_slot?: number | null }[] };
+    return (await res.json()) as {
+      result?: { value?: Record<string, unknown>[] };
       error?: { message?: string };
     };
-    const v = json.result?.value?.[0];
-    if (json.error) {
-      return NextResponse.json(
-        { error: json.error.message ?? "jito status error" },
-        { status: 502 }
-      );
+  };
+  try {
+    // getInflightBundleStatuses gives the coarse lifecycle (Pending/Landed/
+    // Failed/Invalid); getBundleStatuses carries the ACTUAL rejection_reason
+    // (BlockhashNotFound, TransactionFailure, ExceedsCostModel, ...). Poll
+    // BOTH and merge so the client can show WHY a bundle was rejected instead
+    // of the opaque "Invalid" it currently reports.
+    const [inflight, detailed] = await Promise.all([
+      post("getInflightBundleStatuses", [[bundleId]]),
+      post("getBundleStatuses", [[bundleId]]),
+    ]);
+    const inflightErr = inflight.error?.message;
+    const detailedErr = detailed.error?.message;
+    if (inflightErr && detailedErr) {
+      return NextResponse.json({ error: inflightErr ?? detailedErr }, { status: 502 });
     }
-    if (!v) {
-      return NextResponse.json({ status: null, landedSlot: null });
-    }
+    const iv = inflight.result?.value?.[0] as
+      | { status?: string; landed_slot?: number | null }
+      | undefined;
+    const dv = detailed.result?.value?.[0] as
+      | {
+          bundle_id?: string;
+          slot?: number;
+          confirmation_status?: string;
+          rejection_reason?: { reason?: string; msg?: string } | null;
+          err?: unknown;
+        }
+      | undefined;
+    const status = iv?.status ?? null;
+    const landedSlot = iv?.landed_slot ?? null;
+    const rejection = dv?.rejection_reason ?? null;
     return NextResponse.json({
-      status: v.status ?? "Unknown",
-      landedSlot: v.landed_slot ?? null,
+      status,
+      landedSlot,
+      rejectionReason: rejection?.reason ?? null,
+      rejectionMsg: rejection?.msg ?? null,
     });
   } catch (e) {
     return NextResponse.json(

@@ -88,6 +88,8 @@ export function bundleDropMessage(r: {
     tipLamports?: number;
     bundleId?: string;
     status?: string;
+    rejectionReason?: string | null;
+    rejectionMsg?: string | null;
     sendError?: string;
   }[];
   note?: string;
@@ -104,8 +106,10 @@ export function bundleDropMessage(r: {
           .map(
             (a) =>
               `attempt ${a.attempt}${a.status ? ` ${a.status}` : ""}${
-                a.sendError ? ` error: ${a.sendError}` : ""
-              }`
+                a.rejectionReason ? ` reason: ${a.rejectionReason}` : ""
+              }${
+                a.rejectionMsg ? ` msg: ${a.rejectionMsg}` : ""
+              }${a.sendError ? ` error: ${a.sendError}` : ""}`
           )
           .join("; ")
       : "no attempts recorded";

@@ -19,11 +19,16 @@
 //
 // STATUS POLLING: only Jito exposes an in-flight bundle status API. When the
 // winning relay is Jito, status polls through the proxy (GET
-// ?action=status&relay=jito&bundleId=...). When a non-Jito relay accepted
-// (bloXroute/Astralane), there is no status API: the outcome is "pending"
-// with an honest note and the caller's own on-chain verification (the mint
-// appearing) is the ground truth, exactly the M7a rule that only a landed
-// bundle is a launch.
+// ?action=status&relay=jito&bundleId=...). The proxy merges the coarse
+// getInflightBundleStatuses verdict with getBundleStatuses' rejection_reason
+// (TransactionFailure / ExceedsCostModel / BlockhashNotFound / TipError / ...),
+// and this module surfaces it on the attempt + in the final note BEFORE the
+// tip escalates, so a rejected bundle logs WHY it was rejected while the
+// detailed status is still available (it ages out in seconds). When a non-Jito
+// relay accepted (bloXroute/Astralane), there is no status API: the outcome is
+// "pending" with an honest note and the caller's own on-chain verification
+// (the mint appearing) is the ground truth, exactly the M7a rule that only a
+// landed bundle is a launch.
 
 import {
   Connection,
@@ -31,6 +36,7 @@ import {
   PublicKey,
   Transaction,
 } from "@solana/web3.js";
+import bs58 from "bs58";
 import { DEFAULT_JITO_TIP_LAMPORTS } from "../fees";
 import { JitoBundleClient, MIN_TIP_LAMPORTS } from "./jito";
 import {
@@ -39,7 +45,11 @@ import {
   type RelayId,
   summarizeFanout,
 } from "./relays";
-import type { BundleSubmissionResult, BundleAttempt } from "./jito";
+import type {
+  BundleAssembly,
+  BundleAttempt,
+  BundleSubmissionResult,
+} from "./jito";
 
 function errMsg(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
@@ -54,36 +64,117 @@ function isPollableRelay(relay: RelayId): boolean {
   return relay === "jito";
 }
 
-/** Polls the winning Jito bundle's status through the proxy. Returns
- *  "timeout" when no final status arrives in the window. */
+/** Base58 canonical (fee-payer) signature of each signed bundle tx, aligned
+ *  1:1 with the signed txs. When a bundle is Invalid nothing lands, so these
+ *  are identifiers that let a post-mortem correlate the exact signed txs. */
+function bundleTxSignatures(signedTxs: Transaction[]): string[] {
+  return signedTxs.map((tx) => {
+    const feePayer = tx.feePayer as PublicKey | null;
+    const feeSig = tx.signatures.find(
+      (s) => feePayer !== null && s.publicKey.equals(feePayer)
+    );
+    return feeSig?.signature ? bs58.encode(feeSig.signature) : "";
+  });
+}
+
+interface ProxyStatusPoll {
+  status: string;
+  landedSlot: number | null;
+  rejectionReason?: string | null;
+  rejectionMsg?: string | null;
+}
+
+/** One status GET through the proxy. Returns null on a transient error or an
+ *  empty verdict so the caller can re-query (never throws). The proxy route's
+ *  GET handler polls BOTH getInflightBundleStatuses (coarse lifecycle) and
+ *  getBundleStatuses (the ACTUAL rejection_reason) and merges them, so a
+ *  single call can carry the reason. */
+async function fetchProxyStatusOnce(
+  bundleId: string,
+  fetchFn: typeof fetch
+): Promise<ProxyStatusPoll | null> {
+  try {
+    const res = await fetchFn(
+      `/api/bundle-relay?action=status&relay=jito&bundleId=${encodeURIComponent(bundleId)}`
+    );
+    const json = (await res.json()) as {
+      status?: string | null;
+      landedSlot?: number | null;
+      rejectionReason?: string | null;
+      rejectionMsg?: string | null;
+      error?: string;
+    };
+    if (res.ok && json.status) {
+      return {
+        status: json.status,
+        landedSlot: json.landedSlot ?? null,
+        rejectionReason: json.rejectionReason ?? null,
+        rejectionMsg: json.rejectionMsg ?? null,
+      };
+    }
+  } catch {
+    // transient proxy/RPC blip: the caller retries
+  }
+  return null;
+}
+
+/**
+ * Polls the winning Jito bundle's status through the proxy. Returns "timeout"
+ * when no final status arrives in the window.
+ *
+ * getInflightBundleStatuses can report Failed/Invalid a beat before
+ * getBundleStatuses populates rejection_reason, and the detailed status ages
+ * out in seconds. So once a final Failed/Invalid verdict arrives without a
+ * reason, re-query TIGHTLY (sub-second) before giving up; never after a full
+ * poll-interval sleep, or the rejection reason is lost for good.
+ */
 async function pollProxyStatus(
   bundleId: string,
   pollTimeoutMs: number,
   pollIntervalMs: number,
   fetchFn: typeof fetch
-): Promise<{ status: string; landedSlot: number | null } | "timeout"> {
+): Promise<ProxyStatusPoll | "timeout"> {
   const start = Date.now();
   for (;;) {
-    try {
-      const res = await fetchFn(
-        `/api/bundle-relay?action=status&relay=jito&bundleId=${encodeURIComponent(bundleId)}`
-      );
-      const json = (await res.json()) as {
-        status?: string | null;
-        landedSlot?: number | null;
-        error?: string;
-      };
-      if (res.ok && json.status) {
-        if (json.status === "Landed" || json.status === "Failed" || json.status === "Invalid") {
-          return { status: json.status, landedSlot: json.landedSlot ?? null };
+    const polled = await fetchProxyStatusOnce(bundleId, fetchFn);
+    if (polled) {
+      const isFinal =
+        polled.status === "Landed" ||
+        polled.status === "Failed" ||
+        polled.status === "Invalid";
+      if (isFinal) {
+        if (
+          (polled.status === "Failed" || polled.status === "Invalid") &&
+          !polled.rejectionReason
+        ) {
+          const detailed = await tightRetryDetailedStatus(bundleId, fetchFn);
+          if (detailed) return detailed;
         }
+        return polled;
       }
-    } catch {
-      // transient proxy/RPC blip: keep polling until the window closes
     }
     if (Date.now() - start > pollTimeoutMs) return "timeout";
     await sleepMs(pollIntervalMs);
   }
+}
+
+/** A few sub-second re-queries to catch getBundleStatuses' rejection reason
+ *  before it ages out (it lags the coarse in-flight verdict). Returns the
+ *  first poll carrying a reason; otherwise null (caller keeps the coarse
+ *  verdict with rejectionReason null). */
+async function tightRetryDetailedStatus(
+  bundleId: string,
+  fetchFn: typeof fetch,
+  attempts = 4,
+  delayMs = 600
+): Promise<ProxyStatusPoll | null> {
+  for (let i = 0; i < attempts; i++) {
+    await sleepMs(delayMs);
+    const polled = await fetchProxyStatusOnce(bundleId, fetchFn);
+    if (!polled) continue;
+    if (polled.rejectionReason || polled.status === "Landed") return polled;
+  }
+  return null;
 }
 
 export interface FanoutSubmitOptions {
@@ -154,9 +245,9 @@ export async function submitBundleViaFanoutWithRetry(
       continue;
     }
 
-    let base64: string[];
+    let assembled: BundleAssembly;
     try {
-      const assembled = await assembler.assembleBundle({
+      assembled = await assembler.assembleBundle({
         txs,
         signersByTx,
         blockhash: latest.blockhash,
@@ -165,19 +256,34 @@ export async function submitBundleViaFanoutWithRetry(
         tipLamports,
         tipPayer,
       });
-      base64 = assembled.base64;
     } catch (e) {
       attempts.push({ attempt: i + 1, tipLamports, sendError: `assemble: ${errMsg(e)}` });
+      if (opts.onAttempt) opts.onAttempt(attempts[attempts.length - 1]);
       break;
     }
+
+    // Per-attempt diagnostic context, carried onto every attempt so a
+    // rejected bundle leaves enough behind to decode the exact signed txs.
+    const attemptContext = {
+      blockhash: latest.blockhash,
+      lastValidBlockHeight: latest.lastValidBlockHeight,
+      txSignatures: bundleTxSignatures(assembled.signedTxs),
+      base64: assembled.base64,
+    };
 
     // Fan out through the same-origin proxy (Jito + bloXroute + Astralane in
     // parallel, first-accept-wins; credentials stay server-side).
     let fanout: RelayFanoutResult;
     try {
-      fanout = await submitBundleViaRelayProxy({ base64, fetchFn });
+      fanout = await submitBundleViaRelayProxy({ base64: assembled.base64, fetchFn });
     } catch (e) {
-      attempts.push({ attempt: i + 1, tipLamports, sendError: `relay proxy: ${errMsg(e)}` });
+      attempts.push({
+        attempt: i + 1,
+        tipLamports,
+        sendError: `relay proxy: ${errMsg(e)}`,
+        ...attemptContext,
+      });
+      if (opts.onAttempt) opts.onAttempt(attempts[attempts.length - 1]);
       continue;
     }
 
@@ -188,6 +294,8 @@ export async function submitBundleViaFanoutWithRetry(
         tipLamports,
         bundleId: winner.bundleId,
         status: `accepted by ${winner.relay}`,
+        winningRelay: winner.relay,
+        ...attemptContext,
       };
       attempts.push(attempt);
       if (opts.onAttempt) opts.onAttempt(attempt);
@@ -204,12 +312,17 @@ export async function submitBundleViaFanoutWithRetry(
       }
 
       const status = await pollProxyStatus(winner.bundleId, pollTimeoutMs, pollIntervalMs, fetchFn);
-      const withStatus: BundleAttempt = { ...attempt, status: undefined, landedSlot: null };
+      const finalAttempt: BundleAttempt = { ...attempt, status: undefined, landedSlot: null };
       if (status !== "timeout") {
-        withStatus.status = status.status;
-        withStatus.landedSlot = status.landedSlot;
+        finalAttempt.status = status.status;
+        finalAttempt.landedSlot = status.landedSlot;
+        // Surface the ACTUAL rejection reason (BlockhashNotFound,
+        // TransactionFailure, ExceedsCostModel, ...) so a rejected bundle is
+        // diagnosable instead of reporting the opaque "Invalid" alone.
+        finalAttempt.rejectionReason = status.rejectionReason ?? null;
+        finalAttempt.rejectionMsg = status.rejectionMsg ?? null;
       }
-      attempts[attempts.length - 1] = withStatus;
+      attempts[attempts.length - 1] = finalAttempt;
 
       if (status === "timeout") {
         return {
@@ -222,13 +335,15 @@ export async function submitBundleViaFanoutWithRetry(
       if (status.status === "Landed") {
         return { outcome: "landed", bundleId: winner.bundleId, landedSlot: status.landedSlot, attempts };
       }
-      // Invalid / Failed: escalate the tip and re-submit (next loop). The
-      // status API never says WHY a bundle is Invalid; the exact-reason
-      // simulateBundle diagnostic was removed (2026-09-05: Jito moved
-      // simulateBundle off the block engine to Jito-Solana RPC endpoints,
-      // which this app has no subscription to, so it only ever returned
-      // -32601 Invalid method). Diagnose with the read-only checks in the
-      // pumpfun-launchpad skill reference instead.
+      // Invalid / Failed: emit the full diagnostic (bundle id, verdict,
+      // rejection reason + message, blockhash, height, tip, tx signatures)
+      // BEFORE escalating the tip, so the caller logs the why while the
+      // details are still in hand. The rejection reason comes from
+      // getBundleStatuses, which the proxy route's GET handler merges with
+      // the coarse in-flight verdict (it is NOT opaque; see
+      // app/api/bundle-relay/route.ts). Escalating the tip cannot fix a
+      // reverting tx; the diagnostic is what drives the next fix.
+      if (opts.onAttempt) opts.onAttempt(finalAttempt);
       continue;
     }
 
@@ -239,12 +354,22 @@ export async function submitBundleViaFanoutWithRetry(
       sendError: fanout.legs.length
         ? `no relay accepted (${summarizeFanout(fanout)})`
         : "no relay accepted (all disabled/skipped)",
+      ...attemptContext,
     });
     if (opts.onAttempt) opts.onAttempt(attempts[attempts.length - 1]);
   }
+  // Rejected: fold the last rejection reason into the note so the caller's
+  // bundleDropMessage carries the why without needing to dig through attempts.
+  const lastAttempt = attempts[attempts.length - 1];
+  const lastReason =
+    lastAttempt?.rejectionReason
+      ? ` last rejection: ${lastAttempt.rejectionReason}${
+          lastAttempt.rejectionMsg ? ` (${lastAttempt.rejectionMsg})` : ""
+        }`
+      : "";
   return {
     outcome: "rejected",
     attempts,
-    note: "all attempts rejected or failed to land",
+    note: `all attempts rejected or failed to land${lastReason}`,
   };
 }
