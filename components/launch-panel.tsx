@@ -77,6 +77,7 @@ import {
     MIN_TIP_LAMPORTS,
     type BundleSubmissionResult,
 } from '../lib/bundle/jito'
+import { DEFAULT_JITO_TIP_LAMPORTS } from '../lib/fees'
 import { submitBundleViaFanoutWithRetry } from '../lib/bundle/fanout-submit'
 import { bundleDropMessage, friendlyTxError } from '../lib/tx-errors'
 import { makeAppConnection } from '../lib/connection'
@@ -108,6 +109,9 @@ const EXPLORER = 'https://explorer.solana.com'
 /** Explorer cluster query: devnet links need ?cluster=devnet; mainnet none. */
 const EXPLORER_QS = solanaNetwork() === 'devnet' ? '?cluster=devnet' : ''
 const DEFAULT_SOL_IN = '0.01'
+/** Default Jito bundle tip (Tier 2) shown in the tip field, in SOL.
+ *  Matches lib/fees DEFAULT_JITO_TIP_LAMPORTS (0.001 SOL). */
+const DEFAULT_TIP_SOL = (DEFAULT_JITO_TIP_LAMPORTS / LAMPORTS_PER_SOL).toString()
 
 function errMsg(e: unknown): string {
     if (e instanceof Error) return e.message
@@ -157,6 +161,7 @@ export function LaunchPanel({
     const [advancedOpen, setAdvancedOpen] = useState(false)
     const [tier, setTier] = useState<'1' | '2'>('2')
     const [fundFromCreator, setFundFromCreator] = useState(true)
+    const [tipSol, setTipSol] = useState(DEFAULT_TIP_SOL)
     const [solIns, setSolIns] = useState<Record<string, string>>({})
     const [busy, setBusy] = useState(false)
     const [statusLines, setStatusLines] = useState<string[]>([])
@@ -199,6 +204,25 @@ export function LaunchPanel({
             )
         }
         return BigInt(Math.round(n * LAMPORTS_PER_SOL))
+    }
+
+    /** Parses the Jito bundle tip field (SOL) into lamports. Empty falls back
+     *  to DEFAULT_JITO_TIP_LAMPORTS; 0 disables the tip; a positive value
+     *  below Jito's 1000-lamport minimum is rejected. */
+    const parseTip = (): number => {
+        const raw = tipSol.trim()
+        if (raw === '') return DEFAULT_JITO_TIP_LAMPORTS
+        const n = Number(raw)
+        if (!Number.isFinite(n) || n < 0) {
+            throw new Error(`tip must be a non-negative SOL amount, got "${raw}"`)
+        }
+        const lamports = Math.round(n * LAMPORTS_PER_SOL)
+        if (lamports > 0 && lamports < MIN_TIP_LAMPORTS) {
+            throw new Error(
+                `tip ${raw} SOL (${lamports} lamports) is below Jito's ${MIN_TIP_LAMPORTS} lamport minimum`
+            )
+        }
+        return lamports
     }
 
     const handleLaunch = async () => {
@@ -404,6 +428,10 @@ export function LaunchPanel({
                 // "launch complete" block below, so the tier-2 outcome is captured
                 // here and a non-landing result throws before any verification.
                 log('tier 2: assembling jito bundle...')
+                const jitoTipLamports = parseTip()
+                log(
+                    `tip     : ${jitoTipLamports} lamports (${(jitoTipLamports / LAMPORTS_PER_SOL).toFixed(6)} SOL)`
+                )
                 const jito = new JitoBundleClient(JITO_MAINNET_ENDPOINT)
                 let unreachable: string | null = null
                 let tier2Result: BundleSubmissionResult | null = null
@@ -449,16 +477,16 @@ export function LaunchPanel({
                     blockhash: latest.blockhash,
                     lastValidBlockHeight: latest.lastValidBlockHeight,
                     tipAccount,
-                    tipLamports: MIN_TIP_LAMPORTS,
+                    tipLamports: jitoTipLamports,
                     tipPayer: creator,
                 })
                 log(
-                    `bundle assembled: ${assembled.base64.length} txs, tip ${MIN_TIP_LAMPORTS} lamports -> ${tipAccount.toBase58()}`
+                    `bundle assembled: ${assembled.base64.length} txs, tip ${jitoTipLamports} lamports -> ${tipAccount.toBase58()}`
                 )
                 const tipIx = SystemProgram.transfer({
                     fromPubkey: creator.publicKey,
                     toPubkey: tipAccount,
-                    lamports: MIN_TIP_LAMPORTS,
+                    lamports: jitoTipLamports,
                 })
                 const sims = await simulateBundle(connection, {
                     createIx: seq.createIx,
@@ -502,7 +530,7 @@ export function LaunchPanel({
                         signersByTx: bundleSigners,
                         tipPayer: creator,
                         tipAccount,
-                        initialTipLamports: MIN_TIP_LAMPORTS,
+                        initialTipLamports: jitoTipLamports,
                         maxAttempts: 3,
                         pollTimeoutMs: 40_000,
                         pollIntervalMs: 2_500,
@@ -927,11 +955,29 @@ export function LaunchPanel({
                 ) : null}
 
                 <div className="flex flex-wrap items-center justify-between gap-2 border-t-2 border-ink pt-3">
-                    <Btn
-                        onClick={() => void handleLaunch()}
-                        disabled={busy || !connected}>
-                        {busy ? 'LAUNCHING...' : 'Launch'}
-                    </Btn>
+                    <div className="flex items-center gap-2">
+                        <label
+                            className="label-mono flex items-center gap-1.5 opacity-80"
+                            title="Jito bundle tip in SOL (Tier 2 only). Empty uses the default.">
+                            tip
+                            <Input
+                                type="number"
+                                min={0}
+                                step={0.0001}
+                                value={tipSol}
+                                onChange={(e) => setTipSol(e.target.value)}
+                                placeholder={DEFAULT_TIP_SOL}
+                                className="w-24 font-mono text-[12px]"
+                                aria-label="Jito bundle tip in SOL"
+                            />
+                            SOL
+                        </label>
+                        <Btn
+                            onClick={() => void handleLaunch()}
+                            disabled={busy || !connected}>
+                            {busy ? 'LAUNCHING...' : 'Launch'}
+                        </Btn>
+                    </div>
                     <span className="label-mono opacity-60">
                         {!connected
                             ? 'CONNECT CREATOR KEY IN THE MASTHEAD'
