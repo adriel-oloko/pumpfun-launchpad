@@ -184,10 +184,10 @@ export function deriveLaunchPdas(mint: PublicKey): LaunchPdas {
 
 /**
  * Quotes every pre-fill buy against the curve's INITIAL virtual reserves
- * (30 SOL / 1.073B — the state right after create, before any buy can land
- * on a fresh mint), chaining each fill's simulated reserve movement into the
- * next quote. Returns the per-wallet pump.fun buy args aligned 1:1 with
- * `buys`.
+ * (30 SOL / 1.073B tokens = 1_073_000_000_000_000 raw units at 6 decimals;
+ * the state right after create, before any buy can land on a fresh mint),
+ * chaining each fill's simulated reserve movement into the next quote.
+ * Returns the per-wallet pump.fun buy args aligned 1:1 with `buys`.
  */
 export function quoteLaunchBuys(
   buys: BuyAllocation[],

@@ -19,7 +19,6 @@ import {
   fanOutToRelays,
   buildRelayRequest,
   classifyRelayResponse,
-  jitoSimulateBundle,
   RELAY_ORDER,
   RELAY_BUNDLE_CAPS,
   type RelayLegResult,
@@ -352,53 +351,4 @@ describe("pumpfun (M7b: relay fan-out engine)", () => {
     expect(legs.bloxroute).to.equal("disabled");
     expect(legs.astralane).to.equal("disabled");
   });
-});
-
-describe("pumpfun (M7b: Jito simulateBundle diagnostic)", () => {
-  it("fires simulateBundle with the sendBundle dialect and parses the exact RpcBundleExecutionError", async () => {
-    const seen: { url: string; body: string }[] = [];
-    const fetchFn = async (url: string, init?: { body?: string }): Promise<Response> => {
-      seen.push({ url, body: String(init?.body ?? "") });
-      const body = JSON.parse(String(init?.body ?? "{}"));
-      expect(body.method).to.equal("simulateBundle");
-      expect(Array.isArray(body.params)).to.equal(true);
-      expect(body.params.length).to.equal(2);
-      expect(body.params[1]).to.deep.equal({ encoding: "base64" });
-      expect(Array.isArray(body.params[0])).to.equal(true);
-      const raw = JSON.stringify({
-        jsonrpc: "2.0",
-        id: 1,
-        result: {
-          context: { slot: 444500000 },
-          value: {
-            summary: "Failed",
-            error:
-              "TransactionFailure(4vJ9JU1kA3cKpnF2cMfLqb7V2VqF6aHKHwvvSQYmnv3sFgVHQVShgAWzVmxvQv4S2dW9qF3zYRqzBgZFcGmJfEhD, {InstructionError: [0, Custom: 6000]})",
-          },
-        },
-      });
-      return new Response(raw, { status: 200 });
-    };
-    const r = await jitoSimulateBundle(TXS_2, {
-      endpoint: "https://mock-jito.local/api/v1",
-      fetchFn: fetchFn as unknown as typeof fetch,
-    });
-    expect(seen.length).to.equal(1);
-    expect(seen[0].url).to.equal("https://mock-jito.local/api/v1/bundles");
-    expect(r).to.not.equal(null);
-    expect(r?.summary).to.equal("Failed");
-    expect(r?.error).to.contain("TransactionFailure");
-    expect(r?.error).to.contain("Custom: 6000");
-  });
-
-  it("returns null on a network failure (best-effort, never throws)", async () => {
-    const fetchFn = async (): Promise<Response> => {
-      throw new Error("mock network down");
-    };
-    const r = await jitoSimulateBundle(TXS_2, {
-      endpoint: "https://mock-jito.local/api/v1",
-      fetchFn: fetchFn as unknown as typeof fetch,
-    });
-    expect(r).to.equal(null);
-  }).timeout(6_000); // fetchJsonRpc backs off 800ms + 1600ms before giving up
 });

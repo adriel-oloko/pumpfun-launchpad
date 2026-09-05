@@ -35,7 +35,6 @@ import { DEFAULT_JITO_TIP_LAMPORTS } from "../fees";
 import { JitoBundleClient, MIN_TIP_LAMPORTS } from "./jito";
 import {
   submitBundleViaRelayProxy,
-  jitoSimulateBundle,
   type RelayFanoutResult,
   type RelayId,
   summarizeFanout,
@@ -125,10 +124,6 @@ export async function submitBundleViaFanoutWithRetry(
     opts.fetchFn ?? (globalThis as { fetch: typeof fetch }).fetch;
   let tipAccount = opts.tipAccount;
   const attempts: BundleAttempt[] = [];
-  // Exact-reason diagnostic from Jito's own simulateBundle, captured once on
-  // the first "Invalid" verdict (the status API never says WHY). Rides in the
-  // rejected note; null when never triggered or the diagnostic call failed.
-  let invalidSimDiag: string | null = null;
 
   // Assembly is relay-agnostic (the Jito client assembles the shared
   // blockhash + tip-last convention that every relay accepts).
@@ -227,20 +222,13 @@ export async function submitBundleViaFanoutWithRetry(
       if (status.status === "Landed") {
         return { outcome: "landed", bundleId: winner.bundleId, landedSlot: status.landedSlot, attempts };
       }
-      // Invalid / Failed: escalate the tip and re-submit (next loop). On the
-      // FIRST Invalid, fire Jito's own simulateBundle (the same simulation
-      // that produced the verdict) to capture the EXACT reason: the status
-      // API only says "Invalid", simulateBundle returns the precise
-      // RpcBundleExecutionError (TransactionFailure(<sig>, <err>), ...).
-      // Best-effort: a failed diagnostic never breaks the retry loop.
-      if (status.status === "Invalid" && invalidSimDiag === null) {
-        const sim = await jitoSimulateBundle(base64, { fetchFn });
-        invalidSimDiag = sim
-          ? sim.error
-            ? `${sim.summary}: ${sim.error}`
-            : `simulateBundle summary=${sim.summary} (no error detail)`
-          : null;
-      }
+      // Invalid / Failed: escalate the tip and re-submit (next loop). The
+      // status API never says WHY a bundle is Invalid; the exact-reason
+      // simulateBundle diagnostic was removed (2026-09-05: Jito moved
+      // simulateBundle off the block engine to Jito-Solana RPC endpoints,
+      // which this app has no subscription to, so it only ever returned
+      // -32601 Invalid method). Diagnose with the read-only checks in the
+      // pumpfun-launchpad skill reference instead.
       continue;
     }
 
@@ -257,8 +245,6 @@ export async function submitBundleViaFanoutWithRetry(
   return {
     outcome: "rejected",
     attempts,
-    note: invalidSimDiag
-      ? `all attempts rejected or failed to land. Jito simulateBundle: ${invalidSimDiag}`
-      : "all attempts rejected or failed to land",
+    note: "all attempts rejected or failed to land",
   };
 }

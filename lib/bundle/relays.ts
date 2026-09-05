@@ -313,51 +313,6 @@ export async function fetchJsonRpc<T = { result?: unknown; error?: { message?: s
   throw lastErr instanceof Error ? lastErr : new Error(String(lastErr));
 }
 
-/** Result of Jito's OWN bundle simulation (simulateBundle JSON-RPC). */
-export interface JitoSimulateResult {
-  summary: string;
-  /** The exact RpcBundleExecutionError when the simulation failed:
-   *  TransactionFailure(<sig>, <err>) with the precise revert, ExceedsCostModel,
-   *  TipError, BundleLockError, InvalidPreOrPostAccounts, ... */
-  error?: string;
-}
-
-/**
- * Jito's OWN bundle simulation (simulateBundle JSON-RPC): the same
- * simulation that produces the "Invalid" verdict polled via
- * getInflightBundleStatuses. That status API only says "Invalid" with no
- * reason; simulateBundle re-runs the signed bundle and returns the exact
- * RpcBundleExecutionError. Best-effort: returns null on any network / parse
- * failure so the caller's honest rejection reporting never breaks. The block
- * engine is CORS-open for this origin (verified), so this can run straight
- * from the browser, no proxy needed.
- */
-export async function jitoSimulateBundle(
-  base64: string[],
-  opts: { fetchFn?: typeof fetch; endpoint?: string } = {}
-): Promise<JitoSimulateResult | null> {
-  const fetchFn =
-    opts.fetchFn ?? ((globalThis as { fetch: typeof fetch }).fetch);
-  const endpoint = (opts.endpoint ?? JITO_BLOCK_ENGINE_MAINNET).replace(/\/+$/, "");
-  try {
-    const r = await fetchJsonRpc<{
-      result?: { value?: { summary?: string; error?: string } };
-      error?: { message?: string };
-    }>(
-      `${endpoint}/bundles`,
-      "simulateBundle",
-      [base64, { encoding: "base64" }],
-      { attempts: 2, timeoutMs: 15_000, fetchFn }
-    );
-    if (r.error) return { summary: "rpc_error", error: r.error.message };
-    const v = r.result?.value;
-    if (!v) return null;
-    return { summary: v.summary ?? "unknown", error: v.error };
-  } catch {
-    return null;
-  }
-}
-
 export interface ClassifiedLeg {
   status: "accepted" | "rejected";
   bundleId?: string;
