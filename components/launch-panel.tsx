@@ -962,9 +962,6 @@ export function LaunchPanel({
             head={
                 <div className="flex items-center justify-between">
                     <span className="label-mono !text-[13px]">Launch</span>
-                    <span className="label-mono opacity-50">
-                        Solana · Devnet
-                    </span>
                 </div>
             }
             className="flex-1 lg:flex-0 lg:min-w-1/3 lg:sticky lg:top-0 lg:self-start lg:z-30">
@@ -1022,7 +1019,10 @@ export function LaunchPanel({
                                         />
                                     </Field>
                                 </div>
-                                <div className="flex flex-col gap-4">
+                                {/* Token image + socials section: spans the
+                                launch container's full width (both grid
+                                columns), below the description textarea. */}
+                                <div className="flex flex-col gap-4 md:col-span-2">
                                     <Field
                                         label="Token Image"
                                         aside={

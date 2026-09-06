@@ -56,6 +56,7 @@ import {
   sellSelectedWallets,
   type ManualBatchResult,
 } from "../lib/batch-trade";
+import { readToken2022Metadata } from "../lib/bundle";
 import {
   WITHDRAW_FEE_RESERVE_LAMPORTS,
   deleteEmptyWallets,
@@ -106,6 +107,53 @@ export function TradePanel({
   const { pushToast } = useToasts();
 
   const inputCls = "font-mono text-[12px]";
+
+  // Token identity for the header: on-chain name/symbol/uri come from the
+  // mint's Token-2022 in-mint metadata extension, image + socials from a
+  // best-effort fetch of the off-chain JSON at that uri. Each read is stored
+  // WITH its mint so a stale async result can never paint over a newer
+  // mint's header: the derived locals below fall back to empty until
+  // header.mint matches the current mint input (no synchronous setState in
+  // the effect body).
+  const [tokenHeader, setTokenHeader] = useState<TokenHeaderInfo | null>(null);
+  const tokenMeta =
+    tokenHeader && mint && tokenHeader.mint === mint ? tokenHeader.meta : null;
+  const tokenJson =
+    tokenHeader && mint && tokenHeader.mint === mint ? tokenHeader.json : null;
+  const metaStatus =
+    tokenHeader && mint && tokenHeader.mint === mint
+      ? tokenHeader.status
+      : "idle";
+  useEffect(() => {
+    if (!mint) return;
+    let cancelled = false;
+    (async () => {
+      setTokenHeader({ mint, meta: null, json: null, status: "loading" });
+      try {
+        const connection = makeAppConnection();
+        const meta = await readToken2022Metadata(
+          connection,
+          new PublicKey(mint)
+        );
+        if (cancelled) return;
+        if (!meta) {
+          setTokenHeader({ mint, meta: null, json: null, status: "error" });
+          return;
+        }
+        setTokenHeader({ mint, meta, json: null, status: "ok" });
+        const json = await readTokenMetaJson(meta.uri);
+        if (cancelled) return;
+        setTokenHeader({ mint, meta, json, status: "ok" });
+      } catch {
+        if (!cancelled) {
+          setTokenHeader({ mint, meta: null, json: null, status: "error" });
+        }
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [mint]);
 
   // ------------------------------------------------------------------
   // M5 auto buy/sell engine (port of v4's scheduler, ETH -> SOL)
@@ -922,27 +970,55 @@ export function TradePanel({
       head={
         <div className="flex items-center justify-between">
           <span className="label-mono !text-[13px]">Trade</span>
-          <span className="label-mono opacity-50">Solana · Devnet</span>
         </div>
       }
       className="flex-1">
       <div className="flex flex-col gap-4">
         <div className="sticky top-0 z-30 flex flex-col gap-4 bg-paper">
-          <Field
-            label="Token Address"
-            aside={
-              mint ? (
-                <span>{shortAddress(mint, 6)}</span>
-              ) : undefined
-            }>
-            <Input
-              value={tokenAddr}
-              onChange={(e) => onTokenAddrChange(e.target.value)}
-              placeholder="BASE58... (MINT)"
-              className={inputCls}
-              spellCheck={false}
-            />
-          </Field>
+          {/* Token identity header: the curve mint's square image beside the
+          token-address input; the field aside shows the on-chain name +
+          symbol (from the Token-2022 in-mint metadata) once they load. */}
+          <div className="flex items-start gap-3">
+            {mint ? (
+              <TokenSquare
+                key={mint}
+                meta={tokenMeta}
+                metaJson={tokenJson}
+                metaStatus={metaStatus}
+              />
+            ) : null}
+            <div className="min-w-0 flex-1">
+              <Field
+                label="Token Address"
+                aside={
+                  mint ? (
+                    tokenMeta ? (
+                      <span
+                        title={`${tokenMeta.name} (${tokenMeta.symbol}) · ${mint}`}
+                        className="truncate">
+                        {tokenMeta.name} ({tokenMeta.symbol})
+                      </span>
+                    ) : metaStatus === "loading" ? (
+                      <span title={mint}>READING TOKEN META...</span>
+                    ) : (
+                      <span>{shortAddress(mint, 6)}</span>
+                    )
+                  ) : undefined
+                }>
+                <Input
+                  value={tokenAddr}
+                  onChange={(e) => onTokenAddrChange(e.target.value)}
+                  placeholder="BASE58... (MINT)"
+                  className={inputCls}
+                  spellCheck={false}
+                />
+              </Field>
+            </div>
+          </div>
+
+          {/* All available socials in one horizontal row: from the metadata
+          JSON at the on-chain uri (nothing renders while none exist). */}
+          {mint ? <TokenSocials metaJson={tokenJson} /> : null}
 
           {trimmed && !mint ? (
             <StatusLine
@@ -1588,5 +1664,191 @@ function WithdrawOutcomeRow({ outcome }: { outcome: WithdrawOutcome }) {
     <p className="label-mono !text-[10px] break-all opacity-90">
       {addr} {body}
     </p>
+  );
+}
+
+/* ---------- token identity header (image, name/symbol, socials) ---------- */
+
+/** The mint's Token-2022 in-mint metadata (create_v2 stores name/symbol/uri
+ *  IN THE MINT, read by readToken2022Metadata). */
+interface TokenIdentity {
+  name: string;
+  symbol: string;
+  uri: string;
+}
+
+/** Metadata read lifecycle for the header square + aside. */
+type MetaStatus = "idle" | "loading" | "ok" | "error";
+
+/** Off-chain fields extracted from the metadata JSON at the on-chain uri
+ *  (pump.fun-style keys: image / website / external_url / twitter /
+ *  telegram; empty values are omitted from the JSON, never ""). */
+interface TokenMetaJson {
+  image?: string;
+  twitter?: string;
+  telegram?: string;
+  website?: string;
+}
+
+/** One metadata read's full result, stamped with the mint it was read for so
+ *  a stale async result can never paint over a different mint's header. */
+interface TokenHeaderInfo {
+  mint: string;
+  meta: TokenIdentity | null;
+  json: TokenMetaJson | null;
+  status: MetaStatus;
+}
+
+/** Best-effort fetch of the metadata JSON: null when the uri is unreachable,
+ *  not JSON, or the body carries none of the tracked fields. The image and
+ *  socials stay optional so a partial read still renders what it got. */
+async function readTokenMetaJson(uri: string): Promise<TokenMetaJson | null> {
+  try {
+    const res = await fetch(uri);
+    if (!res.ok) return null;
+    const j: unknown = await res.json();
+    if (typeof j !== "object" || j === null) return null;
+    const rec = j as Record<string, unknown>;
+    const str = (k: string): string | undefined =>
+      typeof rec[k] === "string" && (rec[k] as string).trim() !== ""
+        ? (rec[k] as string).trim()
+        : undefined;
+    return {
+      image: str("image"),
+      twitter: str("twitter"),
+      telegram: str("telegram"),
+      website: str("website") ?? str("external_url"),
+    };
+  } catch {
+    return null;
+  }
+}
+
+/** Social raw value -> a clickable href. Bare handles / hostnames get the
+ *  service scheme; full URLs pass through untouched. */
+function socialHref(
+  kind: "twitter" | "telegram" | "website",
+  raw: string
+): string {
+  const v = raw.trim();
+  if (/^https?:\/\//i.test(v)) return v;
+  if (kind === "twitter") return `https://x.com/${v.replace(/^@/, "")}`;
+  if (kind === "telegram") return `https://t.me/${v.replace(/^@/, "")}`;
+  return `https://${v}`;
+}
+
+/** Display label for a social row item: @handle for X / Telegram, the
+ *  hostname (no www) for a website. */
+function socialLabel(
+  kind: "twitter" | "telegram" | "website",
+  raw: string
+): string {
+  const v = raw.trim();
+  if (kind === "website") {
+    const withScheme = /^https?:\/\//i.test(v) ? v : `https://${v}`;
+    try {
+      return new URL(withScheme).hostname.replace(/^www\./, "");
+    } catch {
+      return v;
+    }
+  }
+  if (/^https?:\/\//i.test(v)) {
+    const segs = v.replace(/^https?:\/\//i, "").split(/[/?#]/).filter(Boolean);
+    const last = segs[segs.length - 1];
+    return segs.length >= 2 && last ? `@${last}` : `@${segs[0] ?? ""}`;
+  }
+  return `@${v.replace(/^@/, "")}`;
+}
+
+/** 48px square for the curve mint: the token's off-chain image when one is
+ *  published, else a symbol-letter plate. The broken-image fallback keeps a
+ *  dead URL from leaving a broken-glyph frame; parent keys the instance by
+ *  mint so a new token remounts clean. */
+function TokenSquare({
+  meta,
+  metaJson,
+  metaStatus,
+}: {
+  meta: TokenIdentity | null;
+  metaJson: TokenMetaJson | null;
+  metaStatus: MetaStatus;
+}) {
+  const [broken, setBroken] = useState(false);
+  const imageUrl = metaJson?.image;
+  return (
+    <div
+      className="flex h-12 w-12 shrink-0 items-center justify-center overflow-hidden border-2 border-ink bg-paper"
+      title={
+        meta
+          ? `${meta.name} (${meta.symbol})`
+          : metaStatus === "loading"
+            ? "READING TOKEN META..."
+            : "NO ON-CHAIN TOKEN METADATA"
+      }>
+      {imageUrl && !broken ? (
+        // eslint-disable-next-line @next/next/no-img-element -- token images come from arbitrary on-chain metadata URLs; next/image optimization does not apply
+        <img
+          src={imageUrl}
+          alt={meta ? `${meta.symbol} token image` : "TOKEN IMAGE"}
+          referrerPolicy="no-referrer"
+          className="h-full w-full object-cover"
+          onError={() => setBroken(true)}
+        />
+      ) : (
+        <span className="label-mono text-[12px] opacity-70">
+          {meta
+            ? meta.symbol.slice(0, 4)
+            : metaStatus === "loading"
+              ? "..."
+              : "?"}
+        </span>
+      )}
+    </div>
+  );
+}
+
+/** Horizontal socials row (X / Telegram / website) read from the off-chain
+ *  metadata JSON; renders nothing when the JSON has none. */
+function TokenSocials({ metaJson }: { metaJson: TokenMetaJson | null }) {
+  const items: {
+    kind: "X" | "TG" | "WEB";
+    href: string;
+    label: string;
+  }[] = [];
+  if (metaJson?.twitter) {
+    items.push({
+      kind: "X",
+      href: socialHref("twitter", metaJson.twitter),
+      label: socialLabel("twitter", metaJson.twitter),
+    });
+  }
+  if (metaJson?.telegram) {
+    items.push({
+      kind: "TG",
+      href: socialHref("telegram", metaJson.telegram),
+      label: socialLabel("telegram", metaJson.telegram),
+    });
+  }
+  if (metaJson?.website) {
+    items.push({
+      kind: "WEB",
+      href: socialHref("website", metaJson.website),
+      label: socialLabel("website", metaJson.website),
+    });
+  }
+  if (items.length === 0) return null;
+  return (
+    <div className="flex flex-wrap items-center gap-x-4 gap-y-1 border-t-2 border-ink/40 pt-2">
+      {items.map((it) => (
+        <a
+          key={it.kind}
+          href={it.href}
+          target="_blank"
+          rel="noreferrer"
+          className="label-mono text-[10px] underline decoration-2 underline-offset-2 hover:opacity-60">
+          {it.kind} {it.label}
+        </a>
+      ))}
+    </div>
   );
 }
