@@ -522,13 +522,20 @@ export function fanoutAccepted(r: RelayFanoutResult): boolean {
   return r.accepted !== null;
 }
 
-/** Short one-line summary for logs (the launch panel status line). */
+/** Short one-line summary for logs (the launch panel status line). Includes
+ *  each leg's detail (the relay's actual rejection error) so a send-time
+ *  rejection is diagnosable instead of just "jito=rejected". */
 export function summarizeFanout(r: RelayFanoutResult): string {
   const acc = r.accepted
     ? `${r.accepted.relay} accepted${r.accepted.bundleId ? ` (${r.accepted.bundleId})` : ""}`
     : "no relay accepted";
   const legs = r.legs
-    .map((l) => `${l.relay}=${l.status}${l.bundleId ? `:${l.bundleId.slice(0, 8)}` : ""}`)
+    .map(
+      (l) =>
+        `${l.relay}=${l.status}${l.bundleId ? `:${l.bundleId.slice(0, 8)}` : ""}${
+          l.detail ? ` (${l.detail})` : ""
+        }`
+    )
     .join(" ");
   return `${acc} [${legs}]`;
 }

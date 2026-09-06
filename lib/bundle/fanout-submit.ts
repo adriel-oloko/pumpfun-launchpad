@@ -352,7 +352,7 @@ export async function submitBundleViaFanoutWithRetry(
       attempt: i + 1,
       tipLamports,
       sendError: fanout.legs.length
-        ? `no relay accepted (${summarizeFanout(fanout)})`
+        ? summarizeFanout(fanout)
         : "no relay accepted (all disabled/skipped)",
       ...attemptContext,
     });

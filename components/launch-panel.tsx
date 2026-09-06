@@ -646,6 +646,20 @@ export function LaunchPanel({
                                 : 'n/a'
                         }`
                     )
+                    // Raw signed bundle(s): decode offline to diff every
+                    // account/PDA against the chain. Jito's public block
+                    // engine never returns a rejection_reason for Invalid
+                    // bundles (getBundleStatuses -> value: []), so the signed
+                    // base64 is the ONLY artifact that names the culprit tx.
+                    for (const t of tier2Result?.attempts ?? []) {
+                        if (t.base64?.length) {
+                            log(
+                                `  bundle b64 (attempt ${t.attempt}${
+                                    t.bundleId ? `, id ${t.bundleId}` : ''
+                                }): ${JSON.stringify(t.base64)}`
+                            )
+                        }
+                    }
                     throw new Error(
                         tier2Result
                             ? bundleDropMessage(tier2Result)
