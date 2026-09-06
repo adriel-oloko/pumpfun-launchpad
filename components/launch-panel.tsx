@@ -11,12 +11,19 @@
 //
 //   Tier 1 (default): buildLaunchSequence + preflightLaunch +
 //                     sendSequentially as normal devnet txs.
-//   Tier 2:           the same sequence assembled into a Jito bundle
-//                     (JitoBundleClient.assembleBundle + simulateBundle +
-//                     submitWithRetry). Devnet reality: the devnet block
-//                     engine host does not resolve, so submission cannot
-//                     land; the panel reports that honestly after proving
-//                     the construction.
+//   Tier 2:           the same sequence as an ATOMIC relay bundle submitted
+//                     through the same-origin proxy (/api/bundle-relay):
+//                     Astralane Iris PRIMARY, bloXroute optional fallback.
+//                     The browser assembles a provider-specific signed
+//                     bundle per enabled relay (each pays that relay's own
+//                     recognized tip account in its final tx); the proxy
+//                     submits them sequentially, Astralane first, bloXroute
+//                     only on an explicit reject / unreachable. Relays are
+//                     mainnet services; with no server-side credentials Tier
+//                     2 honestly reports the not-configured state after
+//                     proving the construction (assemble + simulate). An
+//                     accept is NOT a landing: pending accepts are resolved
+//                     by a bounded on-chain mint wait.
 //
 // M10 (native pump.fun): the launch talks to pump.fun's OWN program
 // (6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P), so every token launched is
@@ -52,6 +59,7 @@ import {
     LAMPORTS_PER_SOL,
     PublicKey,
     SystemProgram,
+    type Connection,
 } from '@solana/web3.js'
 import bs58 from 'bs58'
 import { useCallback, useMemo, useState } from 'react'
@@ -66,17 +74,17 @@ import {
     sendSequentially,
     simulateBundle,
     walletTokenBalance,
-    withTimeout,
     type BuyAllocation,
 } from '../lib/bundle'
 import { publishTokenMetadata } from '../lib/metadata'
 import {
-    JITO_MAINNET_ENDPOINT,
-    JitoBundleClient,
-    KNOWN_TIP_ACCOUNTS,
-    MIN_TIP_LAMPORTS,
+    fetchRelayPlan,
+    defaultTipAccountForRelay,
+    RELAY_MIN_TIP_LAMPORTS,
+    type RelayId,
+    type RelayPlanEntry,
     type BundleSubmissionResult,
-} from '../lib/bundle/jito'
+} from '../lib/bundle'
 import { DEFAULT_JITO_TIP_LAMPORTS } from '../lib/fees'
 import { submitBundleViaFanoutWithRetry } from '../lib/bundle/fanout-submit'
 import { bundleDropMessage, friendlyTxError } from '../lib/tx-errors'
@@ -109,13 +117,35 @@ const EXPLORER = 'https://explorer.solana.com'
 /** Explorer cluster query: devnet links need ?cluster=devnet; mainnet none. */
 const EXPLORER_QS = solanaNetwork() === 'devnet' ? '?cluster=devnet' : ''
 const DEFAULT_SOL_IN = '0.01'
-/** Default Jito bundle tip (Tier 2) shown in the tip field, in SOL.
- *  Matches lib/fees DEFAULT_JITO_TIP_LAMPORTS (0.001 SOL). */
+/** Default Tier 2 relay tip (SOL) shown in the tip field: 0.001 SOL, the
+ *  Astralane (free tier) / bloXroute minimum and lib/fees default. */
 const DEFAULT_TIP_SOL = (DEFAULT_JITO_TIP_LAMPORTS / LAMPORTS_PER_SOL).toString()
 
 function errMsg(e: unknown): string {
     if (e instanceof Error) return e.message
     return String(e)
+}
+
+/** Bounded on-chain wait for the launch's FRESH mint account to appear
+ *  (commitment "confirmed"). The mint exists only after the create tx inside
+ *  the atomic relay bundle executed, so this is the honest ground truth for a
+ *  relay ACCEPT that carries no status API — never a fabricated status. */
+async function waitForMintOnChain(
+    connection: Connection,
+    mint: PublicKey,
+    timeoutMs: number
+): Promise<boolean> {
+    const deadline = Date.now() + timeoutMs
+    for (;;) {
+        try {
+            const info = await connection.getAccountInfo(mint, 'confirmed')
+            if (info) return true
+        } catch {
+            // transient RPC error: keep polling until the deadline
+        }
+        if (Date.now() > deadline) return false
+        await new Promise((r) => setTimeout(r, 1_500))
+    }
 }
 
 /** Token amount formatter (trade panel's helper moved with Sell All): raw
@@ -206,9 +236,11 @@ export function LaunchPanel({
         return BigInt(Math.round(n * LAMPORTS_PER_SOL))
     }
 
-    /** Parses the Jito bundle tip field (SOL) into lamports. Empty falls back
-     *  to DEFAULT_JITO_TIP_LAMPORTS; 0 disables the tip; a positive value
-     *  below Jito's 1000-lamport minimum is rejected. */
+    /** Parses the Tier 2 relay tip field (SOL) into lamports. Empty falls
+     *  back to DEFAULT_JITO_TIP_LAMPORTS (0.001 SOL). Any value below the
+     *  1_000_000-lamport (0.001 SOL) floor of BOTH active Tier 2 relays
+     *  (Astralane free tier, bloXroute) is rejected up front — a sub-floor
+     *  bundle cannot be accepted. */
     const parseTip = (): number => {
         const raw = tipSol.trim()
         if (raw === '') return DEFAULT_JITO_TIP_LAMPORTS
@@ -217,9 +249,10 @@ export function LaunchPanel({
             throw new Error(`tip must be a non-negative SOL amount, got "${raw}"`)
         }
         const lamports = Math.round(n * LAMPORTS_PER_SOL)
-        if (lamports > 0 && lamports < MIN_TIP_LAMPORTS) {
+        const floor = RELAY_MIN_TIP_LAMPORTS.astralane
+        if (lamports < floor) {
             throw new Error(
-                `tip ${raw} SOL (${lamports} lamports) is below Jito's ${MIN_TIP_LAMPORTS} lamport minimum`
+                `tip ${raw} SOL (${lamports} lamports) is below the ${floor}-lamport (0.001 SOL) minimum required by the Tier 2 relays (Astralane primary / bloXroute fallback)`
             )
         }
         return lamports
@@ -446,72 +479,80 @@ export function LaunchPanel({
                     `sent ${sent.length} txs: ${sent.map((s) => s.label).join(', ')}`
                 )
             } else {
-                // Tier 2 (Jito bundle). The devnet block engine host does not
-                // resolve, so on devnet a bundle can never land: the construction is
-                // proved (assemble + simulate) and the result is reported honestly.
+                // Tier 2 (atomic relay bundle: Astralane Iris PRIMARY,
+                // bloXroute OPTIONAL fallback). Relay credentials live
+                // server-side; the browser assembles a PROVIDER-SPECIFIC
+                // signed bundle per enabled relay (each paying that relay's
+                // own recognized tip account) and the same-origin proxy
+                // (/api/bundle-relay) submits them sequentially — Astralane
+                // first, bloXroute only on an explicit reject / unreachable.
                 // M7a: a non-landing bundle must NEVER fall through to the
-                // "launch complete" block below, so the tier-2 outcome is captured
-                // here and a non-landing result throws before any verification.
-                log('tier 2: assembling jito bundle...')
-                const jitoTipLamports = parseTip()
+                // "launch complete" block below, so the tier-2 outcome is
+                // captured here and a non-landing result throws before any
+                // verification (pending accepts get a bounded on-chain mint
+                // wait first — an accept is NOT a landing).
+                log('tier 2: assembling atomic relay bundle...')
+                const tier2TipLamports = parseTip()
                 log(
-                    `tip     : ${jitoTipLamports} lamports (${(jitoTipLamports / LAMPORTS_PER_SOL).toFixed(6)} SOL)`
+                    `tip     : ${tier2TipLamports} lamports (${(tier2TipLamports / LAMPORTS_PER_SOL).toFixed(6)} SOL)`
                 )
-                const jito = new JitoBundleClient(JITO_MAINNET_ENDPOINT)
-                let unreachable: string | null = null
-                let tier2Result: BundleSubmissionResult | null = null
+                // Relay plan (ids + configured flags only, no secrets): the
+                // SERVER env decides which relays exist. There is no
+                // Jito-specific reachability probe on the active path.
+                let plan: RelayPlanEntry[] = []
                 try {
-                    const tips = await withTimeout(
-                        jito.getTipAccounts(),
-                        10_000,
-                        'getTipAccounts timed out'
-                    )
-                    log(`jito endpoint reachable (${tips.length} tip accounts)`)
+                    plan = await fetchRelayPlan()
                 } catch (e) {
-                    unreachable = errMsg(e)
-                    log(
-                        `jito endpoint ${JITO_MAINNET_ENDPOINT}: UNREACHABLE (${unreachable})`
-                    )
-                    log(
-                        '   matches devnet reality: devnet.block-engine.jito.wtf does not resolve;'
-                    )
-                    log('   devnet bundles cannot be submitted or land.')
+                    log(`relay plan fetch failed: ${errMsg(e)}`)
                 }
-                const latest = await connection.getLatestBlockhash('confirmed')
-                const tipAccount = new PublicKey(KNOWN_TIP_ACCOUNTS[0])
+                if (plan.length === 0) {
+                    log('relay plan: the server reported no relays')
+                }
+                for (const r of plan) {
+                    log(
+                        `relay   : ${r.id} (${r.role}) ${r.configured ? 'configured' : 'NOT configured (disabled)'}`
+                    )
+                }
+                const enabledRelays = plan
+                    .filter((r) => r.configured)
+                    .map((r) => r.id)
+                let tier2Result: BundleSubmissionResult | null = null
                 const bundleTxs = [
                     seq.fundTx,
                     seq.createTx,
                     ...seq.buyTxs.map((b) => b.tx),
                 ].filter((t): t is NonNullable<typeof t> => t !== null)
                 const bundleSigners = seq.signersByTx
-                // M10: pump.fun buy ixs pack 2 wallets per tx (measured), so a
-                // launch over ~6 funded wallets produces more buy txs than the
-                // 5-tx Jito bundle cap. Surface that BEFORE assembleBundle's
-                // cryptic cap error with the actionable fix.
-                if (bundleTxs.length > 5) {
-                    const nonBuyTxs = bundleTxs.length - seq.buyTxs.length;
-                    const maxWallets = 2 * (5 - nonBuyTxs);
+                // Astralane and bloXroute bundles cap at 4 txs (pump.fun buy
+                // ixs pack 2 wallets per tx, measured M10), so a launch over
+                // ~6 funded wallets exceeds the cap. Surface that BEFORE the
+                // assembler's cryptic cap error with the actionable fix.
+                const TIER2_BUNDLE_CAP = 4
+                if (bundleTxs.length > TIER2_BUNDLE_CAP) {
+                    const nonBuyTxs = bundleTxs.length - seq.buyTxs.length
+                    const maxWallets = 2 * (TIER2_BUNDLE_CAP - nonBuyTxs)
                     throw new Error(
-                        `TIER 2 BUNDLE CAP: ${bundleTxs.length} txs > the 5-tx Jito bundle limit (pump.fun buy ixs pack 2 wallets per tx). Reduce the selected dev wallets to at most ${maxWallets} or use Tier 1 (sequential sends).`
-                    );
+                        `TIER 2 BUNDLE CAP: ${bundleTxs.length} txs > the ${TIER2_BUNDLE_CAP}-tx Astralane/bloXroute bundle limit (pump.fun buy ixs pack 2 wallets per tx). Reduce the selected dev wallets to at most ${maxWallets} or use Tier 1 (sequential sends).`
+                    )
                 }
-                const assembled = await jito.assembleBundle({
-                    txs: bundleTxs,
-                    signersByTx: bundleSigners,
-                    blockhash: latest.blockhash,
-                    lastValidBlockHeight: latest.lastValidBlockHeight,
-                    tipAccount,
-                    tipLamports: jitoTipLamports,
-                    tipPayer: creator,
-                })
+                // Representative tip account for the sandbox sim: the PRIMARY
+                // configured relay's official tip account (first configured
+                // relay in order; the astralane constant when nothing is
+                // configured, so a no-creds rehearsal still proves the
+                // construction). The real per-relay tips are chosen inside
+                // the submitter for EVERY enabled relay.
+                const simRelay: RelayId =
+                    enabledRelays.length > 0 ? enabledRelays[0] : 'astralane'
+                const simTipAccount = new PublicKey(
+                    defaultTipAccountForRelay(simRelay)
+                )
                 log(
-                    `bundle assembled: ${assembled.base64.length} txs, tip ${jitoTipLamports} lamports -> ${tipAccount.toBase58()}`
+                    `tip acct: ${simTipAccount.toBase58()} (${simRelay}, primary)`
                 )
                 const tipIx = SystemProgram.transfer({
                     fromPubkey: creator.publicKey,
-                    toPubkey: tipAccount,
-                    lamports: jitoTipLamports,
+                    toPubkey: simTipAccount,
+                    lamports: tier2TipLamports,
                 })
                 const sims = await simulateBundle(connection, {
                     createIx: seq.createIx,
@@ -528,35 +569,37 @@ export function LaunchPanel({
                 })
                 for (const s of sims)
                     log(`   ${s.label}: ${s.unitsConsumed} CU, ok`)
-                if (unreachable) {
+                if (enabledRelays.length === 0) {
+                    // Assembly + simulation proved the construction. Without
+                    // server-side relay credentials submission is impossible:
+                    // report the honest not-configured state, never a
+                    // fabricated landing.
                     log(
-                        'TIER 2 RESULT: bundle assembled + simulated; submission impossible on devnet'
+                        'TIER 2 RESULT: bundle assembled + simulated; submission impossible (no relay credentials configured server-side). No fabricated landing claim.'
                     )
-                    log(
-                        '   (block engine host does not resolve). No fabricated landing claim.'
+                    throw new Error(
+                        'TIER 2 NOT CONFIGURED: no Tier 2 relay credentials on the server. Set ASTRALANE_API_KEY (primary; portal.astralane.io) and optionally BLOXROUTE_JWT (fallback) in the server env — never NEXT_PUBLIC_ — then re-run. NOTHING WAS CREATED. On devnet, Tier 2 relays are mainnet services: use Tier 1 normal sends.'
                     )
                 } else {
                     log(
-                        'submitting bundle via relay fan-out (jito primary + bloxroute + astralane, same-origin proxy)...'
+                        `submitting provider-specific bundle variants via relay proxy (${enabledRelays.join(' -> ')})...`
                     )
-                    // M7b: the launch bundle is submitted through /api/bundle-relay,
-                    // which fans the SAME signed bundle out to Jito (primary, open),
-                    // bloXroute (JWT) and Astralane (api key) in parallel,
-                    // first-accept-wins. Credentials stay server-side; only the signed
-                    // base64 txs leave this page. The submitter mirrors submitWithRetry
-                    // (single attempt at the configured tip, same honest
-                    // BundleSubmissionResult). On devnet
-                    // this branch is never reached (unreachable above; the devnet
-                    // probe keeps a devnet rehearsal honest). A mainnet deployment
-                    // flips the reachability probe to JITO_MAINNET_ENDPOINT and the
-                    // connection factory to the mainnet pool; this submission path is
-                    // cluster-agnostic.
+                    // The launch txs are assembled into ONE PROVIDER-SPECIFIC
+                    // signed bundle per enabled relay (each paying that
+                    // relay's own recognized tip account in its final tx) and
+                    // submitted through /api/bundle-relay SEQUENTIALLY:
+                    // Astralane primary first, bloXroute fallback only when
+                    // Astralane explicitly rejects or is unreachable — never
+                    // simultaneously. Credentials stay server-side; only the
+                    // signed base64 variants leave this page. Each attempt
+                    // re-assembles with a fresh blockhash at the same tip
+                    // (safe: a landed create makes later attempts revert).
                     tier2Result = await submitBundleViaFanoutWithRetry({
                         txs: bundleTxs,
                         signersByTx: bundleSigners,
                         tipPayer: creator,
-                        tipAccount,
-                        initialTipLamports: jitoTipLamports,
+                        initialTipLamports: tier2TipLamports,
+                        relays: enabledRelays,
                         pollTimeoutMs: 40_000,
                         pollIntervalMs: 2_500,
                         connection,
@@ -587,16 +630,36 @@ export function LaunchPanel({
                         `TIER 2 RESULT: ${tier2Result.outcome}${tier2Result.bundleId ? ` (bundle ${tier2Result.bundleId})` : ''}${tier2Result.landedSlot != null ? `, landed slot ${tier2Result.landedSlot}` : ''}`
                     )
                 }
-                // M7a bundle-drop reconciliation: only a LANDED bundle is a launch.
-                // Anything else throws with an honest summary and a retry path; the
-                // outer catch turns it into the FAILED toast (no LAUNCHED toast, no
-                // trade-panel prefill, no phantom "launch complete").
-                if (unreachable) {
-                    throw new Error(
-                        'TIER 2 BUNDLE COULD NOT BE SUBMITTED: the Jito devnet block engine is unreachable (devnet hosts no block engine). NOTHING WAS CREATED. On devnet use Tier 1 normal sends; on mainnet re-run after the relay wiring lands.'
+                // M7a bundle-drop reconciliation: only a LANDED bundle is a
+                // launch. Astralane/bloXroute accepts carry no status API, so
+                // a pending accept is resolved with a bounded on-chain mint
+                // wait (the fresh mint account appears only if the atomic
+                // bundle executed). Anything un-landed throws with an honest
+                // summary and a retry path; the outer catch turns it into the
+                // FAILED toast (no LAUNCHED toast, no trade-panel prefill, no
+                // phantom "launch complete").
+                let tier2Landed = tier2Result?.outcome === 'landed'
+                if (tier2Result?.outcome === 'pending' && !tier2Landed) {
+                    log(
+                        'relay accepted the bundle but exposes no status API — verifying the launch on-chain (mint appearing)...'
                     )
+                    const mintAppeared = await waitForMintOnChain(
+                        connection,
+                        seq.pda.mint,
+                        25_000
+                    )
+                    if (mintAppeared) {
+                        log(
+                            'mint confirmed on-chain: the relayed bundle LANDED. Proceeding to verification.'
+                        )
+                        tier2Landed = true
+                    } else {
+                        log(
+                            'mint NOT confirmed on-chain within 25s: the accepted bundle did not land (nothing was created).'
+                        )
+                    }
                 }
-                if (!tier2Result || tier2Result.outcome !== 'landed') {
+                if (!tier2Result || !tier2Landed) {
                     // M7b observability: a rejected bundle leaves a full trace
                     // in the log so the culprit class (TransactionFailure /
                     // ExceedsCostModel / BlockhashNotFound / TipError /
@@ -647,9 +710,8 @@ export function LaunchPanel({
                         }`
                     )
                     // Raw signed bundle(s): decode offline to diff every
-                    // account/PDA against the chain. Jito's public block
-                    // engine never returns a rejection_reason for Invalid
-                    // bundles (getBundleStatuses -> value: []), so the signed
+                    // account/PDA against the chain. The active Tier 2 relays
+                    // expose no rejection_reason / status API, so the signed
                     // base64 is the ONLY artifact that names the culprit tx.
                     for (const t of tier2Result?.attempts ?? []) {
                         if (t.base64?.length) {
@@ -772,7 +834,7 @@ export function LaunchPanel({
             // knows nothing was created and the retry path from the status log
             // applies. txHash = first signature seen (none when nothing sent).
             const bundleDrop =
-                /BUNDLE DID NOT LAND|BUNDLE COULD NOT BE SUBMITTED|JITO BUNDLE|TIER 2 BUNDLE/i.test(
+                /BUNDLE DID NOT LAND|BUNDLE COULD NOT BE SUBMITTED|TIER 2 NOT CONFIGURED|JITO BUNDLE|TIER 2 BUNDLE/i.test(
                     rawMsg
                 )
             pushToast({
@@ -1066,7 +1128,7 @@ export function LaunchPanel({
                     <div className="flex items-center gap-2">
                         <label
                             className="label-mono flex items-center gap-1.5 opacity-80"
-                            title="Jito bundle tip in SOL (Tier 2 only). Empty uses the default.">
+                            title="Tier 2 relay tip in SOL (Astralane primary / bloXroute fallback; minimum 0.001 SOL). Empty uses the default.">
                             tip
                             <Input
                                 type="number"
@@ -1076,7 +1138,7 @@ export function LaunchPanel({
                                 onChange={(e) => setTipSol(e.target.value)}
                                 placeholder={DEFAULT_TIP_SOL}
                                 className="w-24 font-mono text-[12px]"
-                                aria-label="Jito bundle tip in SOL"
+                                aria-label="Tier 2 relay tip in SOL"
                             />
                             SOL
                         </label>

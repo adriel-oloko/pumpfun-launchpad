@@ -1,38 +1,41 @@
-// Milestone M7b: fan-out bundle submission at the configured tip (no tip
-// escalation), the Tier 2 submission path for the
-// launch panel. Drop-in for
-// JitoBundleClient.submitWithRetry: SAME BundleSubmissionResult shape and
-// SAME honest semantics (only a LANDED bundle is a launch; everything else
-// reports rejected/pending/unreachable with per-attempt detail), but the
-// bundle is submitted through the SAME-ORIGIN relay proxy
-// (/api/bundle-relay, app/api/bundle-relay/route.ts) which fans it out to
-// Jito (primary) + bloXroute + Astralane in parallel, first-accept-wins.
+// Tier 2 atomic bundle submission at the configured tip (no tip escalation),
+// through the same-origin relay proxy (app/api/bundle-relay/route.ts).
+//
+// RELAY MODEL (2026-09-06): Astralane Iris is the PRIMARY Tier 2 relay and
+// bloXroute is an OPTIONAL fallback. Every relay only recognizes ITS OWN tip
+// accounts, so a Jito-tipped bundle cannot be shared: this submitter
+// assembles a PROVIDER-SPECIFIC signed bundle per target relay — each with
+// that relay's recognized tip account (official Astralane `astra...` /
+// bloXroute `bLx...`/`3UQU...` constants in lib/bundle/relays.ts) in the
+// LAST tx — and POSTs the variants to the same-origin proxy, which submits
+// them SEQUENTIALLY (Astralane first; bloXroute only on an explicit reject /
+// unreachable). Jito is a legacy compatibility relay and is NOT part of the
+// active order; the only Jito-specific machinery left here is the status
+// poll for a legacy jito winner.
 //
 // WHY THE PROXY: bloXroute needs a JWT and Astralane needs an API key, both
 // server-side secrets that must never reach the browser bundle. The browser
-// assembles and signs the bundle locally (no key material leaves the page)
-// and POSTs the base64 txs to its own origin; the route attaches the relay
-// credentials and fans out (the v4 flashbots-proxy pattern).
+// assembles and signs every provider variant locally (no key material leaves
+// the page) and POSTs the base64 txs to its own origin; the route attaches
+// the relay credentials and submits in order (the v4 flashbots-proxy
+// pattern). Wallet secrets stay in the browser; only signed base64
+// transactions cross the same-origin proxy.
 //
-// SAFE RETRIES: Jito's official status documentation defines Invalid as "no
-// longer in the system", not "simulation failed". It can also appear briefly
-// before a new bundle propagates to the status service. We apply a short grace
-// window, then retry a dropped bundle with a fresh blockhash at the same tip.
-// Atomic create semantics make this safe: if an earlier bundle lands, a later
-// one fails at create and cannot reach the tip instruction.
+// SAFE RETRIES: each attempt uses a fresh blockhash at the same configured
+// tip. Atomic create semantics make this safe: if an earlier bundle lands, a
+// later one fails at create and cannot reach the tip instruction.
 //
-// STATUS POLLING: only Jito exposes an in-flight bundle status API. When the
-// winning relay is Jito, status polls through the proxy (GET
-// ?action=status&relay=jito&bundleId=...). The proxy merges the coarse
-// getInflightBundleStatuses verdict with getBundleStatuses' rejection_reason
-// (TransactionFailure / ExceedsCostModel / BlockhashNotFound / TipError / ...),
-// and this module surfaces it on the attempt + in the final note, so a
-// rejected bundle logs WHY it was rejected while the detailed status is still
-// available (it ages out in seconds). When a non-Jito
-// relay accepted (bloXroute/Astralane), there is no status API: the outcome is
-// "pending" with an honest note and the caller's own on-chain verification
-// (the mint appearing) is the ground truth, exactly the M7a rule that only a
-// landed bundle is a launch.
+// HONEST OUTCOMES (M7a rule: only a LANDED bundle is a launch):
+//   - Astralane / bloXroute accepted: they expose NO bundle status API, so
+//     the result is "pending" with an honest note — the caller's own
+//     on-chain verification (the mint appearing) is the ground truth. We do
+//     NOT fabricate a relay status API.
+//   - Jito winner (legacy path only): status polls through the proxy (GET
+//     ?action=status&relay=jito&bundleId=...), which merges the coarse
+//     getInflightBundleStatuses verdict with getBundleStatuses'
+//     rejection_reason, and this module surfaces it on the attempt + in the
+//     final note while the detailed status is still available.
+//   - Nothing accepted: "rejected"/"unreachable" with per-attempt detail.
 
 import {
   Connection,
@@ -49,12 +52,14 @@ import {
 } from "./jito";
 import {
   submitBundleViaRelayProxy,
+  defaultTipAccountForRelay,
+  RELAY_MIN_TIP_LAMPORTS,
+  RELAY_ORDER,
   type RelayFanoutResult,
   type RelayId,
   summarizeFanout,
 } from "./relays";
 import type {
-  BundleAssembly,
   BundleAttempt,
   BundleSubmissionResult,
 } from "./jito";
@@ -69,7 +74,8 @@ function sleepMs(ms: number): Promise<void> {
 
 const RETRY_DELAY_MS = 1_200;
 
-/** True when the relay that accepted is status-pollable (Jito). */
+/** True when the relay that accepted is status-pollable (Jito only — the
+ *  active Tier 2 relays expose no bundle status API). */
 function isPollableRelay(relay: RelayId): boolean {
   return relay === "jito";
 }
@@ -85,6 +91,14 @@ function bundleTxSignatures(signedTxs: Transaction[]): string[] {
     );
     return feeSig?.signature ? bs58.encode(feeSig.signature) : "";
   });
+}
+
+/** One assembled provider-specific variant: signed txs + their base64 + the
+ *  relay tip account they pay. */
+export interface RelayVariant {
+  base64: string[];
+  tipAccount: string;
+  signedTxs: Transaction[];
 }
 
 interface ProxyStatusPoll {
@@ -129,8 +143,8 @@ async function fetchProxyStatusOnce(
 }
 
 /**
- * Polls the winning Jito bundle's status through the proxy. Returns "timeout"
- * when no final status arrives in the window.
+ * Polls the winning Jito bundle's status through the proxy (legacy path).
+ * Returns "timeout" when no final status arrives in the window.
  *
  * getInflightBundleStatuses can report Failed/Invalid a beat before
  * getBundleStatuses populates rejection_reason, and the detailed status ages
@@ -203,10 +217,17 @@ export interface FanoutSubmitOptions {
   signersByTx: Keypair[][];
   /** Pays the tip transfer (added to the LAST tx on assembly). */
   tipPayer: Keypair;
+  /** Tip account override for the JITO legacy leg only; the active Tier 2
+   *  relays use their own official tip accounts (see relays.ts
+   *  defaultTipAccountForRelay), never this value. */
   tipAccount?: PublicKey;
   /** Tip in lamports for the submission attempt (default lib/fees
-   *  DEFAULT_JITO_TIP_LAMPORTS). Used as-is; no escalation. */
+   *  DEFAULT_JITO_TIP_LAMPORTS = 0.001 SOL, the Astralane/bloXroute floor).
+   *  Used as-is; no escalation. */
   initialTipLamports?: number;
+  /** Relays to assemble provider-specific variants for and submit, in order
+   *  (default RELAY_ORDER: astralane primary, bloxroute fallback). */
+  relays?: RelayId[];
   /** Max submission attempts (default 3). Dropped/failed attempts use a fresh
    *  blockhash at the same configured tip. */
   maxAttempts?: number;
@@ -219,8 +240,75 @@ export interface FanoutSubmitOptions {
 }
 
 /**
- * Submits a launch bundle through the relay fan-out proxy. Dropped/failed
- * bundles are retried with a fresh blockhash at the same configured tip. Returns the same
+ * Assembles one PROVIDER-SPECIFIC signed bundle variant per target relay.
+ * Every variant is built from the same unsigned launch txs with THAT relay's
+ * recognized tip account in the final tx, so the exact same Jito-tipped
+ * bundle is never reused across relays (each relay sees only its own
+ * variant). A tip below a relay's minimum is a hard error (retrying at the
+ * same sub-floor tip cannot succeed).
+ */
+export async function assembleRelayVariants(opts: {
+  txs: Transaction[];
+  signersByTx: Keypair[][];
+  blockhash: string;
+  lastValidBlockHeight: number;
+  tipLamports: number;
+  tipPayer: Keypair;
+  relays?: RelayId[];
+  jitoTipAccount?: PublicKey;
+  assembler?: JitoBundleClient;
+}): Promise<{ variants: Partial<Record<RelayId, RelayVariant>> }> {
+  const {
+    txs,
+    signersByTx,
+    blockhash,
+    lastValidBlockHeight,
+    tipLamports,
+    tipPayer,
+    relays = RELAY_ORDER,
+    jitoTipAccount,
+    assembler = new JitoBundleClient("https://mainnet.block-engine.jito.wtf/api/v1"),
+  } = opts;
+  const variants: Partial<Record<RelayId, RelayVariant>> = {};
+  for (const relay of relays) {
+    // The active Tier 2 relays (astralane/bloxroute) pay their OWN official
+    // tip accounts; jito (legacy) honors the caller's override or the
+    // well-known first account (a live block-engine pick happens in the
+    // submit loop for the legacy path).
+    const tipAccount =
+      relay === "jito" && jitoTipAccount
+        ? jitoTipAccount
+        : new PublicKey(defaultTipAccountForRelay(relay));
+    const floor = RELAY_MIN_TIP_LAMPORTS[relay];
+    if (tipLamports < floor) {
+      throw new Error(
+        `tip ${tipLamports} lamports below ${relay}'s ${floor}-lamport (0.001 SOL) minimum`
+      );
+    }
+    const assembly = await assembler.assembleBundle({
+      txs,
+      signersByTx,
+      blockhash,
+      lastValidBlockHeight,
+      tipAccount,
+      tipLamports,
+      tipPayer,
+    });
+    variants[relay] = {
+      base64: assembly.base64,
+      tipAccount: tipAccount.toBase58(),
+      signedTxs: assembly.signedTxs,
+    };
+  }
+  return { variants };
+}
+
+/**
+ * Submits a launch bundle through the relay proxy: assembles a
+ * provider-specific signed bundle per target relay (Astralane primary,
+ * bloXroute fallback — each paying its own recognized tip account) and lets
+ * the proxy submit them SEQUENTIALLY. Dropped/failed bundles are retried
+ * with a fresh blockhash at the same configured tip. Returns the same
  * BundleSubmissionResult as submitWithRetry so the caller's honest reporting
  * (bundleDropMessage, "BUNDLE DID NOT LAND") works unchanged.
  */
@@ -228,25 +316,31 @@ export async function submitBundleViaFanoutWithRetry(
   opts: FanoutSubmitOptions
 ): Promise<BundleSubmissionResult> {
   const { txs, signersByTx, tipPayer, connection } = opts;
+  const relays = opts.relays ?? RELAY_ORDER;
   const initialTipLamports = opts.initialTipLamports ?? DEFAULT_JITO_TIP_LAMPORTS;
   const maxAttempts = opts.maxAttempts ?? 3;
   const pollTimeoutMs = opts.pollTimeoutMs ?? 40_000;
   const pollIntervalMs = opts.pollIntervalMs ?? 2_500;
   const fetchFn =
     opts.fetchFn ?? (globalThis as { fetch: typeof fetch }).fetch;
-  let tipAccount = opts.tipAccount;
   const attempts: BundleAttempt[] = [];
-
-  // Assembly is relay-agnostic (the Jito client assembles the shared
-  // blockhash + tip-last convention that every relay accepts).
+  // Network-touching only for the legacy jito leg (live tip-account pick);
+  // assembleBundle itself is pure and needs no endpoint.
   const assembler = new JitoBundleClient("https://mainnet.block-engine.jito.wtf/api/v1");
+  // The relay whose variant is the diagnostic "bundle b64" canonical:
+  // astralane when present, else the first attempted relay.
+  const canonicalRelay = relays.includes("astralane") ? "astralane" : relays[0];
 
   for (let i = 0; i < maxAttempts; i++) {
     if (i > 0) await sleepMs(RETRY_DELAY_MS);
     const tipLamports = Math.max(MIN_TIP_LAMPORTS, initialTipLamports);
-    if (!tipAccount) {
+
+    // jito legacy leg: pick a live tip account once when the caller did not
+    // pin one (active Tier 2 relays need no network: official constants).
+    let jitoLiveTip: PublicKey | undefined = opts.tipAccount;
+    if (relays.includes("jito") && !jitoLiveTip) {
       try {
-        tipAccount = new PublicKey(await assembler.pickTipAccount());
+        jitoLiveTip = new PublicKey(await assembler.pickTipAccount());
       } catch (e) {
         attempts.push({
           attempt: i + 1,
@@ -267,37 +361,49 @@ export async function submitBundleViaFanoutWithRetry(
       continue;
     }
 
-    let assembled: BundleAssembly;
+    let variants: Partial<Record<RelayId, RelayVariant>>;
     try {
-      assembled = await assembler.assembleBundle({
+      const assembled = await assembleRelayVariants({
         txs,
         signersByTx,
         blockhash: latest.blockhash,
         lastValidBlockHeight: latest.lastValidBlockHeight,
-        tipAccount,
         tipLamports,
         tipPayer,
+        relays,
+        jitoTipAccount: jitoLiveTip,
+        assembler,
       });
+      variants = assembled.variants;
     } catch (e) {
+      // e.g. a tip below a relay's minimum: fail the attempt fast (retrying
+      // at the same sub-floor tip cannot succeed).
       attempts.push({ attempt: i + 1, tipLamports, sendError: `assemble: ${errMsg(e)}` });
       if (opts.onAttempt) opts.onAttempt(attempts[attempts.length - 1]);
       break;
     }
 
+    const canonical: RelayVariant | undefined = variants[canonicalRelay] ?? variants[relays[0]];
     // Per-attempt diagnostic context, carried onto every attempt so a
     // rejected bundle leaves enough behind to decode the exact signed txs.
     const attemptContext = {
       blockhash: latest.blockhash,
       lastValidBlockHeight: latest.lastValidBlockHeight,
-      txSignatures: bundleTxSignatures(assembled.signedTxs),
-      base64: assembled.base64,
+      txSignatures: canonical ? bundleTxSignatures(canonical.signedTxs) : [],
+      base64: canonical?.base64 ?? [],
     };
 
-    // Fan out through the same-origin proxy (Jito + bloXroute + Astralane in
-    // parallel, first-accept-wins; credentials stay server-side).
+    // Submit sequentially through the same-origin proxy (Astralane primary,
+    // bloXroute fallback on explicit reject/unreachable; credentials stay
+    // server-side). Only the provider-specific base64 variants cross the
+    // proxy.
+    const bundles: Partial<Record<RelayId, string[]>> = {};
+    for (const [relay, variant] of Object.entries(variants) as [RelayId, RelayVariant][]) {
+      bundles[relay] = variant.base64;
+    }
     let fanout: RelayFanoutResult;
     try {
-      fanout = await submitBundleViaRelayProxy({ base64: assembled.base64, fetchFn });
+      fanout = await submitBundleViaRelayProxy({ bundles, relays, fetchFn });
     } catch (e) {
       attempts.push({
         attempt: i + 1,
@@ -323,13 +429,14 @@ export async function submitBundleViaFanoutWithRetry(
       if (opts.onAttempt) opts.onAttempt(attempt);
 
       if (!isPollableRelay(winner.relay)) {
-        // bloXroute/Astralane expose no status API; the caller's on-chain
+        // Astralane/bloXroute expose no status API; the caller's on-chain
         // verification is the ground truth for landing.
+        const tipAcct = variants[winner.relay]?.tipAccount ?? "n/a";
         return {
           outcome: "pending",
           bundleId: winner.bundleId,
           attempts,
-          note: `${winner.relay} accepted the bundle (${summarizeFanout(fanout)}); no relay status API exists, on-chain verification decides landing`,
+          note: `${winner.relay} accepted the bundle (${summarizeFanout(fanout)}; tip -> ${tipAcct}); no relay status API exists — on-chain verification (the mint appearing) decides landing`,
         };
       }
 
@@ -357,14 +464,8 @@ export async function submitBundleViaFanoutWithRetry(
       if (status.status === "Landed") {
         return { outcome: "landed", bundleId: winner.bundleId, landedSlot: status.landedSlot, attempts };
       }
-      // Invalid / Failed: emit the full diagnostic (bundle id, verdict,
-      // rejection reason + message, blockhash, height, tip, tx signatures)
-      // so the caller logs the why while the details are still in hand. The
-      // rejection reason comes from getBundleStatuses, which the proxy
-      // route's GET handler merges with the coarse in-flight verdict (it is
-      // NOT opaque; see app/api/bundle-relay/route.ts). Invalid means the
-      // bundle is gone from Jito's system, and Failed means all regions failed
-      // before forwarding, so either verdict is safe to retry.
+      // Invalid / Failed (legacy jito winner): emit the full diagnostic and
+      // retry on the next loop.
       if (opts.onAttempt) opts.onAttempt(finalAttempt);
       continue;
     }

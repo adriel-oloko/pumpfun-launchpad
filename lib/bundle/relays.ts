@@ -1,47 +1,74 @@
-// Milestone M7b: Solana bundle relay fan-out (Jito primary + bloXroute +
-// Astralane), the Solana analog of v4-launchpad's flashbots-proxy.
+// Tier 2 atomic-launch relay submission (Astralane Iris PRIMARY + bloXroute
+// OPTIONAL FALLBACK), the Solana analog of v4-launchpad's flashbots-proxy.
 //
-// WHY IT EXISTS: a bundle sent to ONE relay only lands when that relay's
-// reachable set wins a slot. Sending the SAME signed bundle to SEVERAL
-// relays in parallel (Jito, bloXroute BDN, Astralane) means whichever relay
-// reaches the winning leader accepts it, and the others drop it as already
-// landed. First relay to ACCEPT wins; the bundle id / signatures of the
-// others are harmless (a landed bundle cannot land twice). Jito is the
-// primary relay (roughly 90-95% of mainnet validators run Jito-Solana);
-// bloXroute and Astralane are redundancy legs like v4's Titan/rsync.
+// WHY RELAYS: a launch (fund -> create -> buy) must land atomically (all txs
+// or none) inside one slot, which only a block-engine bundle guarantees.
+// Tier 2 submits the launch as a bundle to Astralane Iris first; bloXroute's
+// Trader API is an OPTIONAL fallback fired ONLY when Astralane explicitly
+// rejects or is unreachable (sequential fallback, never simultaneous).
 //
-// DIALECTS (researched live 2026-09-03, see the route doc comments):
-//   - Jito:      JSON-RPC sendBundle to https://mainnet.block-engine.jito.wtf/
-//                api/v1/bundles, params [[base64...], {encoding:"base64"}],
-//                NO auth (open endpoint). Result = bundle uuid. Up to 5 txs.
-//   - Astralane: Jito-compatible JSON-RPC sendBundle to
-//                https://edge.astralane.io/iris?api-key=<key> (regional
-//                gateways also exist), params [[base64...]]. API key in the
-//                URI or an api_key header. Result = bundle id. Up to 4 txs.
-//   - bloXroute: Solana Trader API HTTP POST submit-batch to
-//                https://ny.solana.dex.blxrbdn.com/api/v2/submit-batch with
-//                an Authorization JWT (server-side secret) and a translated
-//                body: {entries:[{transaction:{content},skipPreflight}],
-//                useBundle:true} (useBundle=true = atomic block-engine
-//                bundle; tip only in the final tx, the Jito convention).
-//                Response {transactions:[{signature,submitted}]}. Up to 4 txs.
+// PER-PROVIDER TIPS (critical): every relay only recognizes ITS OWN tip
+// accounts. Jito pays `96gYZ...`/Jito block-engine accounts, Astralane pays
+// `astra...` wallets, bloXroute pays its own `bLx...`/`3UQU...` wallets. A
+// bundle tipped to the WRONG relay's account is not recognized as a tip (it
+// is just an ordinary transfer, or worse the relay drops the bundle). So the
+// browser assembles a PROVIDER-SPECIFIC signed bundle per relay — each with
+// that relay's recognized tip account in the LAST tx — and the proxy never
+// cross-sends a variant. See KNOWN_ASTRALANE_TIP_ACCOUNTS /
+// KNOWN_BLOXROUTE_TIP_ACCOUNTS / lib/bundle/jito.ts KNOWN_TIP_ACCOUNTS.
+//
+// DIALECTS (researched live 2026-09-06 against the official docs):
+//   - Astralane Iris sendBundle (JSON-RPC POST to
+//     https://edge.astralane.io/iris?api-key=<key>, regional gateways share
+//     /iris): params [[base64...], {encoding:"base64", mevProtect:true,
+//     revertProtection:false}]. API key server-side (query param and/or
+//     api_key header). Result = bundle id OR a list of tx signatures. Up to
+//     4 txs. Min free-tier tip 0.001 SOL (1_000_000 lamports). Docs:
+//     astralane.gitbook.io/docs/low-latency/{submit-transactions,
+//     endpoints-and-configs,send-txn-fee-tiers}.
+//   - bloXroute Solana Trader API POST
+//     https://ny.solana.dex.blxrbdn.com/api/v2/submit-batch with an
+//     Authorization JWT (server-side secret): body
+//     {entries:[{transaction:{content},skipPreflight}], useBundle:true,
+//     frontRunningProtection:true}. useBundle=true = atomic block-engine
+//     bundle capped at 4 txs; tip only in the FINAL tx, paid to an official
+//     bloXroute tipping wallet (>= 0.001 SOL). Response
+//     {transactions:[{signature,submitted}]}. Docs:
+//     docs.bloxroute.com/solana/trader-api/...
+//   - Jito (LEGACY, NOT in the active Tier 2 order): open JSON-RPC
+//     sendBundle to https://mainnet.block-engine.jito.wtf/api/v1/bundles,
+//     params [[base64...], {encoding:"base64"}], no auth. Retained as
+//     compatibility (diagnostic scripts, status polling, the old
+//     JitoBundleClient.submitWithRetry); Jito is deliberately NOT part of
+//     RELAY_ORDER so the active Tier 2 path never builds or sends a
+//     Jito-tipped bundle.
 //
 // SECRETS: the bloXroute JWT and the Astralane API key live ONLY server-side
 // (env, never NEXT_PUBLIC_*) and are attached in the proxy route
 // (app/api/bundle-relay/route.ts), never in the browser bundle. This module
 // is browser-safe: it builds requests and classifies responses, and the
-// same-origin /api/bundle-relay route does the authenticated fan-out.
-//
-// BUNDLE TIP: the launch flow already appends the Jito tip transfer (a plain
-// SOL transfer to a Jito tip account in the LAST bundle tx, lib/bundle/jito.ts
-// assembleBundle). That transfer is valid on every relay: it is an ordinary
-// transfer, and bloXroute + Astralane use the same "tip in the last tx"
-// convention, so ONE signed bundle works on all three relays unchanged.
+// same-origin /api/bundle-relay route does the authenticated submission.
 
-/** The three relays the fan-out targets. jito is primary. */
+/** Relay identifiers. jito is a legacy compatibility relay, NOT part of the
+ *  active Tier 2 order (see the module header). */
 export type RelayId = "jito" | "bloxroute" | "astralane";
 
-export const RELAY_ORDER: RelayId[] = ["jito", "bloxroute", "astralane"];
+/** Role of each relay in the Tier 2 plan (drives UI/log copy). */
+export type RelayRole = "primary" | "fallback" | "legacy";
+
+export const RELAY_ROLE: Record<RelayId, RelayRole> = {
+  astralane: "primary",
+  bloxroute: "fallback",
+  jito: "legacy",
+};
+
+/** ACTIVE Tier 2 submission order: Astralane Iris first, bloXroute as the
+ *  optional fallback. Sequential: the next relay is only tried when the
+ *  previous one explicitly rejects or is unreachable. */
+export const TIER2_RELAY_ORDER: RelayId[] = ["astralane", "bloxroute"];
+
+/** Backwards-compatible name for the active Tier 2 order. */
+export const RELAY_ORDER: RelayId[] = TIER2_RELAY_ORDER;
 
 /** Jito mainnet block engine (open, no auth). jito-js-rpc posts sendBundle
  *  to <endpoint>/bundles; this is that endpoint's base. */
@@ -57,29 +84,108 @@ export const ASTRALANE_EDGE_URL = "https://edge.astralane.io/iris";
 export const BLOXROUTE_SOLANA_URL =
   "https://ny.solana.dex.blxrbdn.com/api/v2/submit-batch";
 
-/** Per-relay bundle caps (tx count). Jito 5, Astralane + bloXroute 4. A
- *  bundle over a relay's cap is skipped for that relay with an honest
- *  rejection, never truncated. */
+/** Per-relay bundle caps (tx count). The ACTIVE Tier 2 relays (Astralane,
+ *  bloXroute) cap bundles at 4 txs; Jito (legacy) allows 5. A bundle over a
+ *  relay's cap is skipped for that relay with an honest rejection, never
+ *  truncated. A 3-tx launch (fund, create, buy+tip) fits both active caps. */
 export const RELAY_BUNDLE_CAPS: Record<RelayId, number> = {
-  jito: 5,
-  bloxroute: 4,
   astralane: 4,
+  bloxroute: 4,
+  jito: 5,
 };
 
-/** The tip account list Jito exposes; the launch flow pays one of these.
- *  bloXroute and Astralane accept the same transfer as the bundle tip. */
+/** The tip account list Jito exposes (legacy path only: the active Tier 2
+ *  relays each recognize their OWN tip accounts below, never Jito's). */
 export const KNOWN_JITO_TIP_ACCOUNTS: string[] = [
   "96gYZGLnJYVFmbjzopPSU6QiEV5fGqZNyN9nmNhvrZU5",
   "HFqU5x63VTqvQss8hp11i4wVV8bD44PvwucfZ2bU7gRe",
 ];
 
+/** Official Astralane Iris tip wallets (docs "Tipping Address"; rotate to
+ *  reduce write-lock contention). The sendBundle code sample in the docs
+ *  uses astra4uejePWneqNaJKuFFA8oonqCE1sqF6b45kDMZm. Source:
+ *  astralane.gitbook.io/docs/low-latency/endpoints-and-configs. */
+export const KNOWN_ASTRALANE_TIP_ACCOUNTS: string[] = [
+  "astra4uejePWneqNaJKuFFA8oonqCE1sqF6b45kDMZm",
+  "astrazznxsGUhWShqgNtAdfrzP2G83DzcWVJDxwV9bF",
+  "astra9xWY93QyfG6yM8zwsKsRodscjQ2uU2HKNL5prk",
+  "astraRVUuTHjpwEVvNBeQEgwYx9w9CFyfxjYoobCZhL",
+  "astraEJ2fEj8Xmy6KLG7B3VfbKfsHXhHrNdCQx7iGJK",
+  "astraubkDw81n4LuutzSQ8uzHCv4BhPVhfvTcYv8SKC",
+  "astraZW5GLFefxNPAatceHhYjfA1ciq9gvfEg2S47xk",
+  "astrawVNP4xDBKT7rAdxrLYiTSTdqtUr63fSMduivXK",
+];
+
+/** Official bloXroute Trader API tip-receiving addresses (docs recommend
+ *  rotating). Every Trader API submission must include a system transfer >=
+ *  0.001 SOL to one of these. Source:
+ *  docs.bloxroute.com/solana/trader-api/introduction/tip-and-tipping-addresses */
+export const KNOWN_BLOXROUTE_TIP_ACCOUNTS: string[] = [
+  "3UQUKjhMKaY2S6bjcQD6yHB7utcZt5bfarRCmctpRtUd",
+  "FogxVNs6Mm2w9rnGL1vkARSwJxvLE8mujTv3LK8RnUhF",
+  "bLx7MvxGaKdKL7mEbpk9tC79z6MnBSJoJkuaEAPu6Nd",
+  "bLx7XBqSg3LUPVf1bRgCnkJmgVZR8QEgDJBPqcRLHvp",
+  "bLx8KeZxinPwy6kkUgyzMLeqb2ARNsWjADG1dhSsVba",
+  "bLxADBknoNj8WAGw2W6GBYeq848Xx6ajhaymV1YvrHm",
+  "bLxAc88vRBwvcUQJEgcxNfBLvHPikY4csNsUmPeWea2",
+  "bLxQ88oCiTsL8Xj4YWekKi1hjrgmbE3J3FFZ2xZHR3h",
+  "bLxS7NoLuynNRJ4mCnEE2YbtwJFttYsEyp2ME7rp2yt",
+  "bLxW6mCov7VEbrKc3S9tcBRcfSzRnLCbNp3Dfn3SJG5",
+  "bLxXSGXs4mYPTC5okZXed1qzvjNwNJ48QJ82hT2V7w7",
+  "bLxYi3vojbbB7hVzVDVTdBLVPhp7GJ3ZB3BwdK5sFXi",
+  "bLxhLPgBXtUpX4b1bH3HatuMGMSKT9GnwtuCGiMSAqe",
+  "bLxpY1mniuFW4PgkNA4JiNxoeKHFszryi6tNgyZAiAA",
+  "bLxuETxd2tgWxBALNwPzAfHhsik4BzD3nrEBCiPNZQD",
+  "bLxuL2gK5FW7xfahvwLrxLyW76vcCpNsKQY2CmnE6kV",
+  "bLxv4Hnub7nDJWHs8s17o9bGU65Bnx6Yqp2fqtMgHmm",
+];
+
+/** Per-relay minimum bundle tip, lamports. Astralane (docs fee tiers: free
+ *  tier min tip 0.001 SOL) and bloXroute (docs: min required tip 0.001 SOL)
+ *  both floor at 1_000_000 lamports. Jito's block engine floor is 1000
+ *  lamports (legacy path only). */
+export const RELAY_MIN_TIP_LAMPORTS: Record<RelayId, number> = {
+  astralane: 1_000_000,
+  bloxroute: 1_000_000,
+  jito: 1_000,
+};
+
+/** The recognized tip-account list for a relay. jito's block engine rotates
+ *  its accounts live (the legacy JitoBundleClient fetches them at runtime);
+ *  the list here is the well-known subset. Astralane and bloXroute publish
+ *  static official lists, which is what the provider-specific assembly uses. */
+export function tipAccountsForRelay(relay: RelayId): string[] {
+  switch (relay) {
+    case "astralane":
+      return KNOWN_ASTRALANE_TIP_ACCOUNTS;
+    case "bloxroute":
+      return KNOWN_BLOXROUTE_TIP_ACCOUNTS;
+    case "jito":
+      return KNOWN_JITO_TIP_ACCOUNTS;
+  }
+}
+
+/** Default tip account (base58) used to assemble a relay's provider-specific
+ *  bundle. Deterministic (first official account) so assembly and tests are
+ *  reproducible; pass a preferred override to rotate. */
+export function defaultTipAccountForRelay(relay: RelayId): string {
+  const accounts = tipAccountsForRelay(relay);
+  if (accounts.length === 0) {
+    throw new Error(`no well-known tip account for relay ${relay}`);
+  }
+  return accounts[0];
+}
+
 /**
  * Resolves the ENABLED relays and their endpoint/auth overrides from the
- * server env. Jito is always enabled (open endpoint). bloXroute needs
- * BLOXROUTE_JWT; Astralane needs ASTRALANE_API_KEY. Both are SERVER secrets:
- * they must live in non-NEXT_PUBLIC env vars (NEXT_PUBLIC_ would inline them
- * into the browser bundle). A relay without credentials reports "disabled"
- * and is never fired, so the fan-out works with Jito alone. Shared by the
+ * server env. The active Tier 2 order is Astralane (primary, needs
+ * ASTRALANE_API_KEY) then bloXroute (optional fallback, needs BLOXROUTE_JWT).
+ * Both are SERVER secrets: they must live in non-NEXT_PUBLIC env vars
+ * (NEXT_PUBLIC_ would inline them into the browser bundle). A relay without
+ * credentials reports "disabled" and is never fired. jito is NEVER
+ * auto-enabled: it is a legacy compatibility relay, deliberately absent from
+ * the active Tier 2 path (its override is still resolved for the legacy
+ * status/diagnostic code that speaks to the block engine). Shared by the
  * proxy route (app/api/bundle-relay/route.ts) and node scripts so the two
  * can never drift apart. Guarded for environments without process.env
  * (browsers return all-disabled).
@@ -93,11 +199,25 @@ export function resolveRelayEndpointsFromEnv(): {
   const env: Record<string, string | undefined> =
     typeof process !== "undefined" && process.env ? process.env : {};
 
+  // jito override is always resolvable (default open block engine) for the
+  // legacy status/diagnostic code, but jito is NOT appended to `enabled`.
   overrides.jito = {
     id: "jito",
     url: env.RELAY_JITO_URL ?? JITO_BLOCK_ENGINE_MAINNET,
   };
-  enabled.push("jito");
+
+  const astraKey = env.ASTRALANE_API_KEY?.trim();
+  if (astraKey) {
+    overrides.astralane = {
+      id: "astralane",
+      url: env.ASTRALANE_URL ?? ASTRALANE_EDGE_URL,
+      // The api key rides as the ?api-key= query param on the edge URL; the
+      // builder appends it when the configured URL lacks it (and mirrors it
+      // in the api_key header, the form the docs' code samples use).
+      authHeaderValue: astraKey,
+    };
+    enabled.push("astralane");
+  }
 
   const bloxJwt = env.BLOXROUTE_JWT?.trim();
   if (bloxJwt) {
@@ -113,19 +233,28 @@ export function resolveRelayEndpointsFromEnv(): {
     enabled.push("bloxroute");
   }
 
-  const astraKey = env.ASTRALANE_API_KEY?.trim();
-  if (astraKey) {
-    overrides.astralane = {
-      id: "astralane",
-      url: env.ASTRALANE_URL ?? ASTRALANE_EDGE_URL,
-      // The api key rides as the ?api-key= query param on the edge URL; the
-      // builder appends it when the configured URL lacks it.
-      authHeaderValue: astraKey,
-    };
-    enabled.push("astralane");
-  }
-
   return { enabled, overrides };
+}
+
+/** One entry of the Tier 2 relay plan the proxy reports to the browser
+ *  (ids + configured flags only — never secrets). */
+export interface RelayPlanEntry {
+  id: RelayId;
+  /** True when this relay's server-side credentials are configured. */
+  configured: boolean;
+  /** primary (astralane) / fallback (bloxroute) / legacy (jito). */
+  role: RelayRole;
+}
+
+/** The full Tier 2 relay plan in RELAY_ORDER, derived from the server env.
+ *  Shared by the route's GET ?action=plan and node scripts. */
+export function relayPlanFromEnv(): RelayPlanEntry[] {
+  const { enabled } = resolveRelayEndpointsFromEnv();
+  return RELAY_ORDER.map((id) => ({
+    id,
+    configured: enabled.includes(id),
+    role: RELAY_ROLE[id],
+  }));
 }
 
 /**
@@ -210,15 +339,24 @@ export interface RelayEndpointOverride {
   authHeaderName?: string;
 }
 
-/** JSON-RPC sendBundle body, the Jito + Astralane dialect. Astralane omits
- *  the second params entry; Jito carries {encoding:"base64"}. Both accept
- *  base64-encoded signed txs in array position 0. */
+/** JSON-RPC sendBundle body. Astralane and Jito share the method name but
+ *  NOT the params: Astralane carries the full bundle config
+ *  {encoding:"base64", mevProtect:true, revertProtection:false} (docs request
+ *  example), Jito carries only {encoding:"base64"}. Both accept base64-encoded
+ *  signed txs in array position 0. */
 function jsonRpcSendBundle(
   base64: string[],
-  opts: { withEncoding?: boolean; id?: number } = {}
+  opts: { withEncoding?: boolean; withMevConfig?: boolean; id?: number } = {}
 ): string {
   const params: unknown[] = [base64];
   if (opts.withEncoding) params.push({ encoding: "base64" });
+  if (opts.withMevConfig) {
+    params.push({
+      encoding: "base64",
+      mevProtect: true,
+      revertProtection: false,
+    });
+  }
   return JSON.stringify({
     jsonrpc: "2.0",
     id: opts.id ?? 1,
@@ -228,8 +366,12 @@ function jsonRpcSendBundle(
 }
 
 /** bloXroute Trader API submit-batch body (translated dialect):
- *  useBundle=true makes it an atomic block-engine bundle (all land or none);
- *  the tip must sit in the final tx (it already does, from assembleBundle). */
+ *  useBundle=true makes it an atomic block-engine bundle (all land or none),
+ *  capped at 4 txs; frontRunningProtection=true withholds the bundle from
+ *  validators with elevated sandwich/malicious-ordering risk. The tip must
+ *  sit in the FINAL tx and pay an OFFICIAL bloXroute tipping wallet (it
+ *  already does: the bundle variant for this relay is assembled with a
+ *  KNOWN_BLOXROUTE_TIP_ACCOUNTS account). */
 function bloxrouteSubmitBatchBody(base64: string[]): string {
   return JSON.stringify({
     entries: base64.map((content) => ({
@@ -237,7 +379,7 @@ function bloxrouteSubmitBatchBody(base64: string[]): string {
       skipPreflight: false,
     })),
     useBundle: true,
-    frontRunningProtection: false,
+    frontRunningProtection: true,
   });
 }
 
@@ -264,19 +406,23 @@ export function buildRelayRequest(
       const ov = overrides?.astralane;
       const url = ov?.url ?? ASTRALANE_EDGE_URL;
       const key = ov?.authHeaderValue;
-      // The api key rides as a query param (?api-key=...) per the docs; the
-      // header form (api_key) is used when a custom endpoint URL omits it.
+      // The api key rides as a query param (?api-key=...) per the docs
+      // endpoint list; when a custom endpoint URL already carries it, no
+      // duplicate is appended. The api_key HEADER is sent alongside it: the
+      // docs' own code samples authenticate with that header too.
       const finalUrl = key && !/api-key=/.test(url)
         ? `${url}${url.includes("?") ? "&" : "?"}api-key=${encodeURIComponent(key)}`
         : url;
       const headers: Record<string, string> = {};
-      if (key && /api-key=/.test(url)) headers["api_key"] = key;
+      if (key) headers["api_key"] = key;
       return {
         relay,
         url: finalUrl,
         headers,
         method: "sendBundle",
-        body: jsonRpcSendBundle(base64, { withEncoding: false }),
+        // Astralane Iris bundle config: {encoding:"base64", mevProtect:true,
+        // revertProtection:false} (docs request example).
+        body: jsonRpcSendBundle(base64, { withMevConfig: true }),
       };
     }
     case "bloxroute": {
@@ -361,10 +507,26 @@ export function classifyRelayResponse(
   switch (relay) {
     case "jito":
     case "astralane": {
-      // JSON-RPC: result = bundle id (accepted); error = rejected.
+      // JSON-RPC sendBundle: Jito returns a bundle uuid (string); Astralane
+      // returns the bundle id OR a list of tx signatures (docs response
+      // example: result: ["37Dx...", ...]). Either shape = accepted.
       const obj = json as { result?: unknown; error?: { message?: string; data?: unknown } } | null;
-      if (obj && typeof obj.result === "string" && obj.result.length > 0) {
-        return { status: "accepted", bundleId: obj.result };
+      const result = obj?.result;
+      const bundleId =
+        typeof result === "string" && result.length > 0
+          ? result
+          : Array.isArray(result) &&
+              result.length > 0 &&
+              result.every((r) => typeof r === "string")
+            ? (result[0] as string)
+            : null;
+      if (bundleId) {
+        const isList = Array.isArray(result);
+        return {
+          status: "accepted",
+          bundleId,
+          ...(isList ? { detail: `${(result as string[]).length} txs accepted` } : {}),
+        };
       }
       const msg = obj?.error?.message
         ? `${obj.error.message}${obj.error.data ? ` (${JSON.stringify(obj.error.data)})` : ""}`
@@ -396,7 +558,11 @@ export function classifyRelayResponse(
 }
 
 export interface FanOutOptions {
-  /** The signed bundle txs (base64). Shared verbatim across every relay. */
+  /** The signed bundle txs (base64). LEGACY: fanOutToRelays is the old
+   *  parallel engine and sends this SAME bundle verbatim to every relay —
+   *  fine for the single-relay jito smoke diagnostic, WRONG for the active
+   *  Tier 2 path (each relay needs its own tip account; see the module
+   *  header and submitRelaysSequentially). */
   base64: string[];
   /** Relays to fan out to (default: RELAY_ORDER). */
   relays?: RelayId[];
@@ -414,12 +580,15 @@ export interface FanOutOptions {
 }
 
 /**
- * The fan-out engine: fires every enabled relay's prepared request in
- * PARALLEL (Promise.allSettled), and resolves as soon as the FIRST relay
- * accepts (first-accept-wins). Every leg gets a bounded timeout; a dead or
- * slow relay can never block the others or hang the caller. All leg outcomes
- * are returned so the caller can report the honest per-relay story when
- * nothing landed (the M7a "bundle did not land" reporting survives).
+ * LEGACY parallel fan-out engine (first-accept-wins). Retained for the Jito
+ * diagnostic smoke (scripts/mainnet-bundle-smoke.mjs) and the mock suite;
+ * the ACTIVE Tier 2 path submits provider-specific variants SEQUENTIALLY via
+ * submitRelaysSequentially — never this function, which would cross-send one
+ * Jito-tipped bundle to every relay. Fires every enabled relay's prepared
+ * request in PARALLEL (Promise.allSettled) and resolves as soon as the FIRST
+ * relay accepts. Every leg gets a bounded timeout; a dead or slow relay can
+ * never block the others or hang the caller. All leg outcomes are returned so
+ * the caller can report the honest per-relay story when nothing landed.
  */
 export async function fanOutToRelays(
   opts: FanOutOptions
@@ -553,9 +722,135 @@ export function fanoutAccepted(r: RelayFanoutResult): boolean {
   return r.accepted !== null;
 }
 
+export interface SequentialSubmitOptions {
+  /** PROVIDER-SPECIFIC signed bundle variants keyed by relay id. Each
+   *  relay's variant is assembled separately with THAT relay's recognized
+   *  tip account in its final tx (see the module header); a variant is only
+   *  ever sent to its own relay. A relay without an entry is skipped. */
+  bundles: Partial<Record<RelayId, string[]>>;
+  /** Relays to attempt, in order (default: RELAY_ORDER = Astralane primary,
+   *  bloXroute fallback). The NEXT relay is only tried when the current one
+   *  explicitly rejects or is unreachable — never in parallel. */
+  relays?: RelayId[];
+  /** Which relays are configured (have server-side credentials). A relay not
+   *  in this set reports disabled and is never fired. */
+  enabled?: RelayId[];
+  /** Endpoint/auth overrides, injected by the route from server env. */
+  overrides?: Record<RelayId, RelayEndpointOverride>;
+  /** fetch implementation (browser global or node 18+ global). */
+  fetchFn?: typeof fetch;
+  /** Per-relay timeout. */
+  timeoutMs?: number;
+  /** Fired the moment a relay accepts. */
+  onAccept?: (leg: RelayLegResult) => void;
+}
+
+/**
+ * The ACTIVE Tier 2 submission engine: tries each relay SEQUENTIALLY in
+ * order (Astralane primary, then bloXroute fallback), each with its OWN
+ * provider-specific signed bundle, and stops at the first ACCEPT. A relay is
+ * only attempted after the previous one explicitly REJECTED or was
+ * UNREACHABLE — never simultaneously, so the same launch content cannot be
+ * racing two relays at once. Every relay gets a bounded timeout. All leg
+ * outcomes are returned so the caller can report the honest per-relay story
+ * when nothing was accepted.
+ *
+ * ACCEPT is NOT landing: Astralane and bloXroute expose no bundle status API,
+ * so an accept means "the relay took the bundle"; the caller's own on-chain
+ * verification (the mint appearing) is the ground truth, exactly the M7a rule
+ * that only a landed bundle is a launch.
+ */
+export async function submitRelaysSequentially(
+  opts: SequentialSubmitOptions
+): Promise<RelayFanoutResult> {
+  const {
+    bundles,
+    relays = RELAY_ORDER,
+    enabled,
+    overrides,
+    fetchFn = (typeof globalThis !== "undefined" && (globalThis as { fetch?: typeof fetch }).fetch)
+      ? (globalThis as { fetch: typeof fetch }).fetch
+      : (() => {
+          throw new Error("no fetch implementation available");
+        })(),
+    timeoutMs = 12_000,
+    onAccept,
+  } = opts;
+  const legs: RelayLegResult[] = [];
+
+  const fire = async (relay: RelayId): Promise<RelayLegResult> => {
+    const req = buildRelayRequest(relay, bundles[relay] as string[], overrides);
+    const started = Date.now();
+    const timer = new Promise<never>((_, reject) =>
+      setTimeout(() => reject(new Error(`relay ${relay} timed out after ${timeoutMs}ms`)), timeoutMs)
+    );
+    try {
+      const res = await Promise.race([fetchFn(req.url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ...req.headers },
+        body: req.body,
+      }), timer]);
+      const raw = await res.text();
+      const classified = classifyRelayResponse(relay, res.status, raw);
+      const result: RelayLegResult = {
+        relay,
+        status: classified.status,
+        latencyMs: Date.now() - started,
+        ...(classified.bundleId ? { bundleId: classified.bundleId } : {}),
+        ...(classified.detail ? { detail: classified.detail } : {}),
+      };
+      return result;
+    } catch (e) {
+      return {
+        relay,
+        status: "unreachable",
+        latencyMs: Date.now() - started,
+        detail: e instanceof Error ? e.message : String(e),
+      };
+    }
+  };
+
+  for (const relay of relays) {
+    const cap = RELAY_BUNDLE_CAPS[relay];
+    const variant = bundles[relay];
+    if (!variant || variant.length === 0) {
+      legs.push({
+        relay,
+        status: "skipped",
+        detail: "no provider-specific signed bundle for this relay",
+      });
+      continue;
+    }
+    if (variant.length > cap) {
+      legs.push({
+        relay,
+        status: "skipped",
+        detail: `bundle has ${variant.length} txs, over this relay's ${cap}-tx cap`,
+      });
+      continue;
+    }
+    if (enabled && !enabled.includes(relay)) {
+      legs.push({
+        relay,
+        status: "disabled",
+        detail: "no credentials configured for this relay",
+      });
+      continue;
+    }
+    const result = await fire(relay);
+    legs.push(result);
+    if (result.status === "accepted") {
+      if (onAccept) onAccept(result);
+      return { accepted: result, legs };
+    }
+    // rejected / unreachable: fall through to the next relay in order.
+  }
+  return { accepted: null, legs };
+}
+
 /** Short one-line summary for logs (the launch panel status line). Includes
  *  each leg's detail (the relay's actual rejection error) so a send-time
- *  rejection is diagnosable instead of just "jito=rejected". */
+ *  rejection is diagnosable instead of just "astralane=rejected". */
 export function summarizeFanout(r: RelayFanoutResult): string {
   const acc = r.accepted
     ? `${r.accepted.relay} accepted${r.accepted.bundleId ? ` (${r.accepted.bundleId})` : ""}`
@@ -572,14 +867,45 @@ export function summarizeFanout(r: RelayFanoutResult): string {
 }
 
 /**
- * Browser-facing submit: the launch flow POSTs the assembled bundle to the
- * SAME-ORIGIN proxy route (/api/bundle-relay), which fans it out to the
- * relays with their server-side credentials attached. Zero CORS, zero secret
- * exposure. Returns the route's JSON (the fan-out result) or throws with the
- * route's error message when nothing accepted.
+ * Browser-facing plan fetch: GETs the Tier 2 relay plan from the same-origin
+ * proxy route (/api/bundle-relay?action=plan), which resolves the configured
+ * relays from SERVER env. The browser uses it to know which provider-specific
+ * bundle variants to assemble and what to print in the launch log — it never
+ * sees credentials.
+ */
+export async function fetchRelayPlan(opts?: {
+  fetchFn?: typeof fetch;
+}): Promise<RelayPlanEntry[]> {
+  const g = globalThis as { fetch?: typeof fetch };
+  const f =
+    opts?.fetchFn ??
+    (typeof g.fetch === "function" ? g.fetch : (() => {
+      throw new Error("no fetch implementation available");
+    })());
+  const res = await f("/api/bundle-relay?action=plan");
+  const json = (await res.json()) as { relays?: RelayPlanEntry[]; error?: string } | null;
+  if (!res.ok || !json || !Array.isArray(json.relays)) {
+    throw new Error(
+      `relay plan http ${res.status}: ${json?.error ?? "malformed plan response"}`
+    );
+  }
+  return json.relays;
+}
+
+/**
+ * Browser-facing submit: the launch flow POSTs the PROVIDER-SPECIFIC signed
+ * bundle variants (each built with its own relay's tip account) to the
+ * SAME-ORIGIN proxy route (/api/bundle-relay), which submits them
+ * SEQUENTIALLY — Astralane primary first, bloXroute fallback only on an
+ * explicit reject / unreachable — with their server-side credentials
+ * attached. Zero CORS, zero secret exposure. Returns the route's JSON (the
+ * submission result) or throws with the route's error message when nothing
+ * was accepted.
  */
 export async function submitBundleViaRelayProxy(opts: {
-  base64: string[];
+  /** Provider-specific signed bundle variants keyed by relay id. */
+  bundles: Partial<Record<RelayId, string[]>>;
+  /** Relays to attempt, in order (default: RELAY_ORDER). */
   relays?: RelayId[];
   fetchFn?: typeof fetch;
 }): Promise<RelayFanoutResult> {
@@ -588,7 +914,7 @@ export async function submitBundleViaRelayProxy(opts: {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
-      base64: opts.base64,
+      bundles: opts.bundles,
       relays: opts.relays ?? RELAY_ORDER,
     }),
   });

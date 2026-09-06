@@ -1,20 +1,31 @@
-// Milestone M2: Jito bundle assembly and submission.
+// Jito bundle ASSEMBLY + status helpers.
 //
-// A Jito bundle is up to 5 transactions, executed sequentially and atomically
-// in one slot, all-or-nothing. Rules implemented here (from KNOWLEDGE-BASE.md
-// and the live Jito block-engine API):
+// ROLE (2026-09-06): Jito is a LEGACY relay, no longer part of the active
+// Tier 2 path (Astralane Iris primary + bloXroute optional fallback, see
+// lib/bundle/relays.ts). What survives from M2 and is still used:
+//
+// - assembleBundle is the RELAY-AGNOSTIC atomic-bundle assembler: it clones
+//   unsigned launch txs, appends a tip transfer (ANY relay's tip account) to
+//   the LAST tx, sets one shared blockhash and signs. fanout-submit.ts calls
+//   it once PER relay with that relay's own official tip account, which is
+//   how provider-specific variants are built (a Jito-tipped bundle is never
+//   shared across relays anymore).
+// - simulateBundle + the Invalid-grace helpers feed the launch panel's
+//   honest pre-flight and the legacy jito status poll (pollProxyStatus in
+//   fanout-submit.ts).
+// - JitoBundleClient.submitWithRetry / sendBundle / getTipAccounts /
+//   pollUntilFinal are the legacy Jito block-engine submission path, kept as
+//   compatibility for the diagnostic smoke (scripts/mainnet-bundle-smoke.mjs)
+//   and the jito live probe. The ACTIVE Tier 2 path does not use them.
+//
+// Rules implemented here (from KNOWLEDGE-BASE.md and the live Jito API):
 //
 // - Every tx in the bundle shares ONE recent blockhash.
-// - The tip (a SOL transfer, minimum 1000 lamports) sits in the LAST tx of
-//   the bundle, paid to one of the 8 tip accounts returned by getTipAccounts.
-// - sendBundle takes base64-encoded signed txs, no auth header.
+// - The tip (a SOL transfer) sits in the LAST tx of the bundle; Jito's
+//   minimum is 1000 lamports (Astralane/bloXroute floor at 1M lamports, see
+//   RELAY_MIN_TIP_LAMPORTS in relays.ts).
 // - Invalid means "no longer in the system", not necessarily a transaction
 //   simulation failure. Never hang: each poll is bounded.
-//
-// Devnet reality (verified at build time): devnet.block-engine.jito.wtf does
-// not resolve, so devnet bundles cannot land. The construction stays fully
-// testable without Jito (Tier 1 sends the same txs as normal transactions),
-// and encoding + tip are validated against the reachable mainnet endpoint.
 
 import { JitoJsonRpcClient } from "jito-js-rpc";
 import {

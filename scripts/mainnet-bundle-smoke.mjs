@@ -28,9 +28,12 @@
 // than the required budget). There is no token launch: the receiver is a
 // throwaway keypair the script prints for the record.
 //
-// The bundle is submitted through the relay fan-out engine (Jito primary +
-// bloXroute + Astralane when their credentials exist in the env, mirroring
-// the proxy route), so the smoke doubles as the fan-out's first real test.
+// The smoke is a JITO block-engine diagnostic: it submits the jito-tipped
+// bundle ONLY to the Jito block engine and polls its in-flight status, which
+// is exactly the legacy path (the ACTIVE Tier 2 path — Astralane primary,
+// bloXroute fallback — assembles a provider-specific bundle per relay and
+// submits sequentially through the same-origin proxy, so it is not exercised
+// here). See lib/bundle/relays.ts submitRelaysSequentially.
 //
 // Usage:
 //   node scripts/mainnet-bundle-smoke.mjs --dry-run
@@ -193,16 +196,21 @@ async function main() {
   console.log(`bundle: ${base64.length} tx(s), tip ${paidTip} lamports -> ${tipAccount}`);
   console.log(`receiver balance before: ${(await connection.getBalance(receiver.publicKey)).toLocaleString()} lamports`);
 
-  // ---- submit through the relay fan-out engine ------------------------
-  const { enabled, overrides } = relays.resolveRelayEndpointsFromEnv();
-  console.log(`fan-out relays enabled: ${enabled.join(", ")}`);
+  // ---- submit through the legacy Jito block engine ----------------------
+  // This smoke is a JITO end-to-end diagnostic (it polls the jito block
+  // engine's in-flight status afterwards), so it submits ONLY to jito with
+  // the jito-tipped bundle. The ACTIVE Tier 2 path (Astralane primary /
+  // bloXroute fallback) never uses this engine: it assembles a
+  // PROVIDER-SPECIFIC bundle per relay and submits sequentially via the
+  // same-origin proxy (lib/bundle/relays.ts submitRelaysSequentially).
   const fanout = await relays.fanOutToRelays({
     base64,
-    enabled,
-    overrides,
+    relays: ["jito"],
+    enabled: ["jito"],
+    overrides: {},
     timeoutMs: 15_000,
   });
-  console.log(`fan-out: ${relays.summarizeFanout(fanout)}`);
+  console.log(`jito submission: ${relays.summarizeFanout(fanout)}`);
   const winner = fanout.accepted;
   if (!winner || !winner.bundleId) {
     console.error("NO RELAY ACCEPTED the smoke bundle; nothing was sent on chain. No SOL moved.");
