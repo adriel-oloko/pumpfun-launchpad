@@ -18,12 +18,14 @@ import { expect } from "chai";
 import {
   fanOutToRelays,
   buildRelayRequest,
+  buildJitoSimulateParams,
   classifyRelayResponse,
   RELAY_ORDER,
   RELAY_BUNDLE_CAPS,
   type RelayLegResult,
   type RelayFanoutResult,
 } from "../lib/bundle/relays";
+import { shouldFinalizeInvalidStatus } from "../lib/bundle/jito";
 
 /** Deterministic fake relay: answers after a fixed delay with a real-dialect
  *  response (accept/reject/error), or throws (unreachable). Records hits. */
@@ -147,6 +149,27 @@ function assertLegs(legs: RelayLegResult[], expected: Record<string, string>): v
 }
 
 describe("pumpfun (M7b: relay fan-out engine)", () => {
+  it("waits through a transient Invalid before finalizing the status", () => {
+    expect(shouldFinalizeInvalidStatus(1, 0, false)).to.equal(false);
+    expect(shouldFinalizeInvalidStatus(3, 2_999, false)).to.equal(false);
+    expect(shouldFinalizeInvalidStatus(3, 3_000, false)).to.equal(true);
+    expect(shouldFinalizeInvalidStatus(1, 0, true)).to.equal(true);
+  });
+
+  it("builds Jito simulateBundle params with required aligned account configs", () => {
+    const txs = ["dHgx", "dHgy", "dHgz"];
+    expect(buildJitoSimulateParams(txs)).to.deep.equal([
+      { encodedTransactions: txs },
+      {
+        preExecutionAccountsConfigs: [null, null, null],
+        postExecutionAccountsConfigs: [null, null, null],
+        skipSigVerify: true,
+        transactionEncoding: "base64",
+        replaceRecentBlockhash: true,
+      },
+    ]);
+  });
+
   it("builds the exact per-relay request dialects (encoding level)", () => {
     const jito = buildRelayRequest("jito", TXS_2);
     expect(jito.url).to.equal("https://mainnet.block-engine.jito.wtf/api/v1/bundles");

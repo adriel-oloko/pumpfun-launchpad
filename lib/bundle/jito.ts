@@ -8,8 +8,8 @@
 // - The tip (a SOL transfer, minimum 1000 lamports) sits in the LAST tx of
 //   the bundle, paid to one of the 8 tip accounts returned by getTipAccounts.
 // - sendBundle takes base64-encoded signed txs, no auth header.
-// - On rejection, re-submit with an escalating tip (no gas-price games; Solana
-//   has no nonces or gas prices). Never hang: each poll is bounded.
+// - Invalid means "no longer in the system", not necessarily a transaction
+//   simulation failure. Never hang: each poll is bounded.
 //
 // Devnet reality (verified at build time): devnet.block-engine.jito.wtf does
 // not resolve, so devnet bundles cannot land. The construction stays fully
@@ -89,6 +89,16 @@ export interface BundleSubmissionResult {
   landedSlot?: number | null;
   attempts: BundleAttempt[];
   note?: string;
+}
+
+/** Finalizes a reason-less Invalid only after repeated observations and a
+ * short propagation grace. A concrete rejection reason is immediately final. */
+export function shouldFinalizeInvalidStatus(
+  observations: number,
+  elapsedMs: number,
+  hasRejectionReason: boolean
+): boolean {
+  return hasRejectionReason || (observations >= 3 && elapsedMs >= 3_000);
 }
 
 function errMsg(e: unknown): string {
@@ -215,10 +225,19 @@ export class JitoBundleClient {
     intervalMs: number
   ): Promise<{ status: string; landedSlot: number | null } | "timeout"> {
     const start = Date.now();
+    let invalidObservations = 0;
     for (;;) {
       const s = await this.inflightStatus(bundleId).catch(() => null);
-      if (s && (s.status === "Landed" || s.status === "Failed" || s.status === "Invalid")) {
+      if (s && (s.status === "Landed" || s.status === "Failed")) {
         return s;
+      }
+      if (s?.status === "Invalid") {
+        invalidObservations += 1;
+        if (shouldFinalizeInvalidStatus(invalidObservations, Date.now() - start, false)) {
+          return s;
+        }
+      } else if (s) {
+        invalidObservations = 0;
       }
       if (Date.now() - start > timeoutMs) return "timeout";
       await new Promise((r) => setTimeout(r, intervalMs));

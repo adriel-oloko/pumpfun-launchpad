@@ -19,7 +19,10 @@
 // pinpoint WHICH tx reverted and why.
 
 import { NextResponse } from "next/server";
-import { resolveJitoRpcUrl } from "../../../lib/bundle/relays";
+import {
+  buildJitoSimulateParams,
+  resolveJitoRpcUrl,
+} from "../../../lib/bundle/relays";
 
 export const runtime = "nodejs";
 
@@ -83,14 +86,7 @@ export async function POST(req: Request): Promise<NextResponse> {
         // `[base64Array, {encoding:"base64"}]` shape. replaceRecentBlockhash +
         // skipSigVerify let us re-run an already-signed bundle against current
         // chain state to surface the exact revert (the diagnostic goal).
-        params: [
-          { encodedTransactions: base64 },
-          {
-            skipSigVerify: true,
-            transactionEncoding: "base64",
-            replaceRecentBlockhash: true,
-          },
-        ],
+        params: buildJitoSimulateParams(base64 as string[]),
       }),
     });
   } catch (e) {

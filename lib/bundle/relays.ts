@@ -142,6 +142,23 @@ export function resolveJitoRpcUrl(): string {
   return (env.JITO_RPC_URL ?? "").trim();
 }
 
+/** Builds the Jito-Solana RPC `simulateBundle` params. The jito-rpc schema
+ * requires pre/post account config arrays aligned 1:1 with the transactions,
+ * even when no account snapshots are requested. */
+export function buildJitoSimulateParams(base64: string[]): unknown[] {
+  const accountConfigs = base64.map(() => null);
+  return [
+    { encodedTransactions: base64 },
+    {
+      preExecutionAccountsConfigs: accountConfigs,
+      postExecutionAccountsConfigs: [...accountConfigs],
+      skipSigVerify: true,
+      transactionEncoding: "base64",
+      replaceRecentBlockhash: true,
+    },
+  ];
+}
+
 /** One prepared relay request: the exact HTTP call a leg will make. Built by
  *  the dialect builders below, executed by the route or the mock harness
  *  (injectable fetch keeps this module testable without a live network). */

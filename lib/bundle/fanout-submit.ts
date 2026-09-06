@@ -1,5 +1,5 @@
-// Milestone M7b: fan-out bundle submission in a single attempt at the
-// configured tip (no tip escalation), the Tier 2 submission path for the
+// Milestone M7b: fan-out bundle submission at the configured tip (no tip
+// escalation), the Tier 2 submission path for the
 // launch panel. Drop-in for
 // JitoBundleClient.submitWithRetry: SAME BundleSubmissionResult shape and
 // SAME honest semantics (only a LANDED bundle is a launch; everything else
@@ -14,10 +14,12 @@
 // and POSTs the base64 txs to its own origin; the route attaches the relay
 // credentials and fans out (the v4 flashbots-proxy pattern).
 //
-// SINGLE ATTEMPT: one submission at the configured tip (no retry loop, no
-// tip escalation). Re-assembly happens client-side with a fresh shared
-// blockhash so the proxy stays stateless (it never holds a tip budget or a
-// blockhash).
+// SAFE RETRIES: Jito's official status documentation defines Invalid as "no
+// longer in the system", not "simulation failed". It can also appear briefly
+// before a new bundle propagates to the status service. We apply a short grace
+// window, then retry a dropped bundle with a fresh blockhash at the same tip.
+// Atomic create semantics make this safe: if an earlier bundle lands, a later
+// one fails at create and cannot reach the tip instruction.
 //
 // STATUS POLLING: only Jito exposes an in-flight bundle status API. When the
 // winning relay is Jito, status polls through the proxy (GET
@@ -40,7 +42,11 @@ import {
 } from "@solana/web3.js";
 import bs58 from "bs58";
 import { DEFAULT_JITO_TIP_LAMPORTS } from "../fees";
-import { JitoBundleClient, MIN_TIP_LAMPORTS } from "./jito";
+import {
+  JitoBundleClient,
+  MIN_TIP_LAMPORTS,
+  shouldFinalizeInvalidStatus,
+} from "./jito";
 import {
   submitBundleViaRelayProxy,
   type RelayFanoutResult,
@@ -60,6 +66,8 @@ function errMsg(e: unknown): string {
 function sleepMs(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
 }
+
+const RETRY_DELAY_MS = 1_200;
 
 /** True when the relay that accepted is status-pollable (Jito). */
 function isPollableRelay(relay: RelayId): boolean {
@@ -137,6 +145,7 @@ async function pollProxyStatus(
   fetchFn: typeof fetch
 ): Promise<ProxyStatusPoll | "timeout"> {
   const start = Date.now();
+  let invalidObservations = 0;
   for (;;) {
     const polled = await fetchProxyStatusOnce(bundleId, fetchFn);
     if (polled) {
@@ -152,8 +161,16 @@ async function pollProxyStatus(
           const detailed = await tightRetryDetailedStatus(bundleId, fetchFn);
           if (detailed) return detailed;
         }
+        if (polled.status === "Invalid" && !polled.rejectionReason) {
+          invalidObservations += 1;
+          if (!shouldFinalizeInvalidStatus(invalidObservations, Date.now() - start, false)) {
+            await sleepMs(Math.min(pollIntervalMs, 600));
+            continue;
+          }
+        }
         return polled;
       }
+      invalidObservations = 0;
     }
     if (Date.now() - start > pollTimeoutMs) return "timeout";
     await sleepMs(pollIntervalMs);
@@ -190,7 +207,8 @@ export interface FanoutSubmitOptions {
   /** Tip in lamports for the submission attempt (default lib/fees
    *  DEFAULT_JITO_TIP_LAMPORTS). Used as-is; no escalation. */
   initialTipLamports?: number;
-  /** Max submission attempts (default 1: a single attempt, no retries). */
+  /** Max submission attempts (default 3). Dropped/failed attempts use a fresh
+   *  blockhash at the same configured tip. */
   maxAttempts?: number;
   pollTimeoutMs?: number;
   pollIntervalMs?: number;
@@ -201,9 +219,8 @@ export interface FanoutSubmitOptions {
 }
 
 /**
- * Submits a launch bundle through the relay fan-out proxy. Makes one
- * submission attempt at the configured tip (no retry, no tip escalation,
- * unless the caller overrides maxAttempts). Returns the same
+ * Submits a launch bundle through the relay fan-out proxy. Dropped/failed
+ * bundles are retried with a fresh blockhash at the same configured tip. Returns the same
  * BundleSubmissionResult as submitWithRetry so the caller's honest reporting
  * (bundleDropMessage, "BUNDLE DID NOT LAND") works unchanged.
  */
@@ -212,7 +229,7 @@ export async function submitBundleViaFanoutWithRetry(
 ): Promise<BundleSubmissionResult> {
   const { txs, signersByTx, tipPayer, connection } = opts;
   const initialTipLamports = opts.initialTipLamports ?? DEFAULT_JITO_TIP_LAMPORTS;
-  const maxAttempts = opts.maxAttempts ?? 1;
+  const maxAttempts = opts.maxAttempts ?? 3;
   const pollTimeoutMs = opts.pollTimeoutMs ?? 40_000;
   const pollIntervalMs = opts.pollIntervalMs ?? 2_500;
   const fetchFn =
@@ -225,6 +242,7 @@ export async function submitBundleViaFanoutWithRetry(
   const assembler = new JitoBundleClient("https://mainnet.block-engine.jito.wtf/api/v1");
 
   for (let i = 0; i < maxAttempts; i++) {
+    if (i > 0) await sleepMs(RETRY_DELAY_MS);
     const tipLamports = Math.max(MIN_TIP_LAMPORTS, initialTipLamports);
     if (!tipAccount) {
       try {
@@ -344,9 +362,9 @@ export async function submitBundleViaFanoutWithRetry(
       // so the caller logs the why while the details are still in hand. The
       // rejection reason comes from getBundleStatuses, which the proxy
       // route's GET handler merges with the coarse in-flight verdict (it is
-      // NOT opaque; see app/api/bundle-relay/route.ts). With a single attempt
-      // (the default) there is no re-submission; the diagnostic is what
-      // drives the next fix.
+      // NOT opaque; see app/api/bundle-relay/route.ts). Invalid means the
+      // bundle is gone from Jito's system, and Failed means all regions failed
+      // before forwarding, so either verdict is safe to retry.
       if (opts.onAttempt) opts.onAttempt(finalAttempt);
       continue;
     }
