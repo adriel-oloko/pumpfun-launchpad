@@ -60,3 +60,5 @@ HANDOFF.md
 /target/idl/*
 !/target/idl/pumpfun.json
 .verify-shots/
+
+pastes/

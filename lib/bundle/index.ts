@@ -13,9 +13,10 @@
 //                 fanOutToRelays, submitBundleViaRelayProxy, RELAY_ORDER,
 //                 JITO_BLOCK_ENGINE_MAINNET, ASTRALANE_EDGE_URL,
 //                 BLOXROUTE_SOLANA_URL, RELAY_BUNDLE_CAPS
-//   fanout-submit.ts - M7b escalating-tip submitter through the relay proxy
-//                 (submitBundleViaFanoutWithRetry); drop-in for
-//                 submitWithRetry with the same BundleSubmissionResult
+//   fanout-submit.ts - M7b single-attempt submitter (no tip escalation)
+//                 through the relay proxy (submitBundleViaFanoutWithRetry);
+//                 drop-in for submitWithRetry with the same
+//                 BundleSubmissionResult
 
 export * from "./launch";
 export * from "./jito";

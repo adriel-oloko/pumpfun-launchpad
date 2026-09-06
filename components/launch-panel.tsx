@@ -544,7 +544,8 @@ export function LaunchPanel({
                     // bloXroute (JWT) and Astralane (api key) in parallel,
                     // first-accept-wins. Credentials stay server-side; only the signed
                     // base64 txs leave this page. The submitter mirrors submitWithRetry
-                    // (escalating tip, same honest BundleSubmissionResult). On devnet
+                    // (single attempt at the configured tip, same honest
+                    // BundleSubmissionResult). On devnet
                     // this branch is never reached (unreachable above; the devnet
                     // probe keeps a devnet rehearsal honest). A mainnet deployment
                     // flips the reachability probe to JITO_MAINNET_ENDPOINT and the
@@ -556,7 +557,6 @@ export function LaunchPanel({
                         tipPayer: creator,
                         tipAccount,
                         initialTipLamports: jitoTipLamports,
-                        maxAttempts: 3,
                         pollTimeoutMs: 40_000,
                         pollIntervalMs: 2_500,
                         connection,

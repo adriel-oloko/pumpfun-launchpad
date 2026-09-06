@@ -46,6 +46,7 @@ import {
   fanOutToRelays,
   summarizeFanout,
   resolveRelayEndpointsFromEnv,
+  resolveJitoRpcUrl,
   type RelayFanoutResult,
   type RelayId,
   RELAY_ORDER,
@@ -168,8 +169,18 @@ export async function GET(req: Request): Promise<NextResponse> {
   }
   const { overrides } = resolveRelayEndpointsFromEnv();
   const base = overrides.jito.url.replace(/\/+$/, "");
-  const post = async (method: string, params: unknown[]) => {
-    const res = await fetch(`${base}/bundles`, {
+  // getInflightBundleStatuses (coarse lifecycle: Pending/Landed/Failed/
+  // Invalid) is a BLOCK ENGINE method only. getBundleStatuses' rejection_reason
+  // is only populated by a Jito-Solana RPC (Quicknode "Lil Jit" / Triton /
+  // Helius), NOT the public block engine (which returns value: [] for it). So
+  // poll the coarse status from the block engine and the detailed status from
+  // the Jito RPC when one is configured; otherwise fall back to the block
+  // engine for both (rejection_reason then comes back null, the old behavior).
+  const jitoRpcUrl = resolveJitoRpcUrl();
+  const blockEngineBundles = `${base}/bundles`;
+  const rpcRoot = jitoRpcUrl ? jitoRpcUrl.replace(/\/+$/, "") : blockEngineBundles;
+  const post = async (endpoint: string, method: string, params: unknown[]) => {
+    const res = await fetch(endpoint, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }),
@@ -186,8 +197,8 @@ export async function GET(req: Request): Promise<NextResponse> {
     // BOTH and merge so the client can show WHY a bundle was rejected instead
     // of the opaque "Invalid" it currently reports.
     const [inflight, detailed] = await Promise.all([
-      post("getInflightBundleStatuses", [[bundleId]]),
-      post("getBundleStatuses", [[bundleId]]),
+      post(blockEngineBundles, "getInflightBundleStatuses", [[bundleId]]),
+      post(rpcRoot, "getBundleStatuses", [[bundleId]]),
     ]);
     const inflightErr = inflight.error?.message;
     const detailedErr = detailed.error?.message;

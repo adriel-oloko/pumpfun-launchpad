@@ -226,18 +226,19 @@ export class JitoBundleClient {
   }
 
   /**
-   * Submits the bundle with an escalating tip on failure. Each attempt uses a
-   * fresh shared blockhash, re-assembles with tip * 2^attempt, sends, and
-   * polls for a final status. Bounded: maxAttempts * (send + poll window).
+   * Submits the bundle with a single attempt at the configured tip. Uses a
+   * fresh shared blockhash, assembles, sends, and polls for a final status.
+   * Re-submits only if the caller overrides maxAttempts (>1); the tip never
+   * escalates. Bounded: maxAttempts * (send + poll window).
    */
   async submitWithRetry(opts: {
     txs: Transaction[];
     signersByTx: Keypair[][];
     tipPayer: Keypair;
     tipAccount?: PublicKey;
-    /** Initial tip in lamports; when omitted, lib/fees.ts DEFAULT_JITO_TIP_LAMPORTS
-     *  applies (env-tunable via NEXT_PUBLIC_JITO_TIP_LAMPORTS). Escalates 2x
-     *  per failed attempt. */
+    /** Tip in lamports; when omitted, lib/fees.ts DEFAULT_JITO_TIP_LAMPORTS
+     *  applies (env-tunable via NEXT_PUBLIC_JITO_TIP_LAMPORTS). Used as-is:
+     *  no escalation. */
     initialTipLamports?: number;
     maxAttempts?: number;
     pollTimeoutMs?: number;
@@ -247,14 +248,14 @@ export class JitoBundleClient {
   }): Promise<BundleSubmissionResult> {
     const { txs, signersByTx, tipPayer, connection } = opts;
     const initialTipLamports = opts.initialTipLamports ?? DEFAULT_JITO_TIP_LAMPORTS;
-    const maxAttempts = opts.maxAttempts ?? 3;
+    const maxAttempts = opts.maxAttempts ?? 1;
     const pollTimeoutMs = opts.pollTimeoutMs ?? 40_000;
     const pollIntervalMs = opts.pollIntervalMs ?? 2_500;
     let tipAccount = opts.tipAccount;
     const attempts: BundleAttempt[] = [];
 
     for (let i = 0; i < maxAttempts; i++) {
-      const tipLamports = Math.max(MIN_TIP_LAMPORTS, initialTipLamports * 2 ** i);
+      const tipLamports = Math.max(MIN_TIP_LAMPORTS, initialTipLamports);
       if (!tipAccount) {
         try {
           tipAccount = new PublicKey(await this.pickTipAccount());
@@ -324,7 +325,8 @@ export class JitoBundleClient {
       if (status.status === "Landed") {
         return { outcome: "landed", bundleId, landedSlot: status.landedSlot, attempts };
       }
-      // Failed / Invalid: escalate the tip and re-submit.
+      // Failed / Invalid: no tip escalation; re-submit only if maxAttempts
+      // was overridden (>1).
     }
     return { outcome: "rejected", attempts, note: "all attempts rejected or failed to land" };
   }

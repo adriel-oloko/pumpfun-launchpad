@@ -19,8 +19,8 @@
 //     RECOMMENDED_MAINNET_PRIORITY_FEE_MICRO_LAMPORTS).
 //   - DEFAULT_JITO_TIP_LAMPORTS is 0.001 SOL, a below-median mainnet tip;
 //     bump toward RECOMMENDED_MAINNET_JITO_TIP_LAMPORTS (0.005 SOL) under
-//     real competition. The bundle layer already escalates the tip 2x per
-//     failed attempt (lib/bundle/jito.ts submitWithRetry).
+//     real competition. Bundles are submitted once at the configured tip (no
+//     escalation), so this value is what actually gets paid.
 //
 // OVERRIDES (env, inlined at build time like every NEXT_PUBLIC var):
 //   NEXT_PUBLIC_PRIORITY_FEE_MICRO_LAMPORTS
@@ -53,8 +53,8 @@ export const DEFAULT_JITO_TIP_LAMPORTS: number = envInt(
   1_000_000
 );
 
-/** Recommended mainnet Jito tip: 0.005 SOL per bundle. Escalates 2x per
- *  failed attempt inside submitWithRetry. */
+/** Recommended mainnet Jito tip: 0.005 SOL per bundle. Bundles are submitted
+ *  once at the configured tip (no escalation inside the submission layer). */
 export const RECOMMENDED_MAINNET_JITO_TIP_LAMPORTS: number = 5_000_000;
 
 /** Human line for logs: what fees the current build will pay. */

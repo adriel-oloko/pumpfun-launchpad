@@ -1,5 +1,6 @@
-// Milestone M7b: fan-out bundle submission with escalating tip, the Tier 2
-// submission path for the launch panel. Drop-in for
+// Milestone M7b: fan-out bundle submission in a single attempt at the
+// configured tip (no tip escalation), the Tier 2 submission path for the
+// launch panel. Drop-in for
 // JitoBundleClient.submitWithRetry: SAME BundleSubmissionResult shape and
 // SAME honest semantics (only a LANDED bundle is a launch; everything else
 // reports rejected/pending/unreachable with per-attempt detail), but the
@@ -13,18 +14,19 @@
 // and POSTs the base64 txs to its own origin; the route attaches the relay
 // credentials and fans out (the v4 flashbots-proxy pattern).
 //
-// ESCALATION: same as submitWithRetry, re-assembly happens client-side with a
-// fresh shared blockhash and tip * 2^attempt on every failed attempt, so the
-// proxy stays stateless (it never holds a tip budget or a blockhash).
+// SINGLE ATTEMPT: one submission at the configured tip (no retry loop, no
+// tip escalation). Re-assembly happens client-side with a fresh shared
+// blockhash so the proxy stays stateless (it never holds a tip budget or a
+// blockhash).
 //
 // STATUS POLLING: only Jito exposes an in-flight bundle status API. When the
 // winning relay is Jito, status polls through the proxy (GET
 // ?action=status&relay=jito&bundleId=...). The proxy merges the coarse
 // getInflightBundleStatuses verdict with getBundleStatuses' rejection_reason
 // (TransactionFailure / ExceedsCostModel / BlockhashNotFound / TipError / ...),
-// and this module surfaces it on the attempt + in the final note BEFORE the
-// tip escalates, so a rejected bundle logs WHY it was rejected while the
-// detailed status is still available (it ages out in seconds). When a non-Jito
+// and this module surfaces it on the attempt + in the final note, so a
+// rejected bundle logs WHY it was rejected while the detailed status is still
+// available (it ages out in seconds). When a non-Jito
 // relay accepted (bloXroute/Astralane), there is no status API: the outcome is
 // "pending" with an honest note and the caller's own on-chain verification
 // (the mint appearing) is the ground truth, exactly the M7a rule that only a
@@ -185,9 +187,10 @@ export interface FanoutSubmitOptions {
   /** Pays the tip transfer (added to the LAST tx on assembly). */
   tipPayer: Keypair;
   tipAccount?: PublicKey;
-  /** Initial tip in lamports (default lib/fees DEFAULT_JITO_TIP_LAMPORTS).
-   *  Escalates 2x per failed attempt, same as submitWithRetry. */
+  /** Tip in lamports for the submission attempt (default lib/fees
+   *  DEFAULT_JITO_TIP_LAMPORTS). Used as-is; no escalation. */
   initialTipLamports?: number;
+  /** Max submission attempts (default 1: a single attempt, no retries). */
   maxAttempts?: number;
   pollTimeoutMs?: number;
   pollIntervalMs?: number;
@@ -198,17 +201,18 @@ export interface FanoutSubmitOptions {
 }
 
 /**
- * Submits a launch bundle through the relay fan-out proxy with an escalating
- * tip. Returns the same BundleSubmissionResult as submitWithRetry so the
- * caller's honest reporting (bundleDropMessage, "BUNDLE DID NOT LAND") works
- * unchanged.
+ * Submits a launch bundle through the relay fan-out proxy. Makes one
+ * submission attempt at the configured tip (no retry, no tip escalation,
+ * unless the caller overrides maxAttempts). Returns the same
+ * BundleSubmissionResult as submitWithRetry so the caller's honest reporting
+ * (bundleDropMessage, "BUNDLE DID NOT LAND") works unchanged.
  */
 export async function submitBundleViaFanoutWithRetry(
   opts: FanoutSubmitOptions
 ): Promise<BundleSubmissionResult> {
   const { txs, signersByTx, tipPayer, connection } = opts;
   const initialTipLamports = opts.initialTipLamports ?? DEFAULT_JITO_TIP_LAMPORTS;
-  const maxAttempts = opts.maxAttempts ?? 3;
+  const maxAttempts = opts.maxAttempts ?? 1;
   const pollTimeoutMs = opts.pollTimeoutMs ?? 40_000;
   const pollIntervalMs = opts.pollIntervalMs ?? 2_500;
   const fetchFn =
@@ -221,7 +225,7 @@ export async function submitBundleViaFanoutWithRetry(
   const assembler = new JitoBundleClient("https://mainnet.block-engine.jito.wtf/api/v1");
 
   for (let i = 0; i < maxAttempts; i++) {
-    const tipLamports = Math.max(MIN_TIP_LAMPORTS, initialTipLamports * 2 ** i);
+    const tipLamports = Math.max(MIN_TIP_LAMPORTS, initialTipLamports);
     if (!tipAccount) {
       try {
         tipAccount = new PublicKey(await assembler.pickTipAccount());
@@ -337,12 +341,12 @@ export async function submitBundleViaFanoutWithRetry(
       }
       // Invalid / Failed: emit the full diagnostic (bundle id, verdict,
       // rejection reason + message, blockhash, height, tip, tx signatures)
-      // BEFORE escalating the tip, so the caller logs the why while the
-      // details are still in hand. The rejection reason comes from
-      // getBundleStatuses, which the proxy route's GET handler merges with
-      // the coarse in-flight verdict (it is NOT opaque; see
-      // app/api/bundle-relay/route.ts). Escalating the tip cannot fix a
-      // reverting tx; the diagnostic is what drives the next fix.
+      // so the caller logs the why while the details are still in hand. The
+      // rejection reason comes from getBundleStatuses, which the proxy
+      // route's GET handler merges with the coarse in-flight verdict (it is
+      // NOT opaque; see app/api/bundle-relay/route.ts). With a single attempt
+      // (the default) there is no re-submission; the diagnostic is what
+      // drives the next fix.
       if (opts.onAttempt) opts.onAttempt(finalAttempt);
       continue;
     }

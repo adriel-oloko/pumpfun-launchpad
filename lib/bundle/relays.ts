@@ -128,6 +128,20 @@ export function resolveRelayEndpointsFromEnv(): {
   return { enabled, overrides };
 }
 
+/**
+ * Jito-Solana RPC endpoint (e.g. Quicknode "Lil Jit", Triton, Helius). The
+ * PUBLIC block engine does NOT populate getBundleStatuses' `rejection_reason`
+ * (it returns `value: []`) and removed `simulateBundle` (returns -32601); a
+ * Jito-Solana RPC serves both. Read from the server env as JITO_RPC_URL
+ * (a SERVER secret, never NEXT_PUBLIC_). Empty string when unconfigured.
+ * Guarded for browser contexts (no process.env) like the resolver above.
+ */
+export function resolveJitoRpcUrl(): string {
+  const env: Record<string, string | undefined> =
+    typeof process !== "undefined" && process.env ? process.env : {};
+  return (env.JITO_RPC_URL ?? "").trim();
+}
+
 /** One prepared relay request: the exact HTTP call a leg will make. Built by
  *  the dialect builders below, executed by the route or the mock harness
  *  (injectable fetch keeps this module testable without a live network). */
