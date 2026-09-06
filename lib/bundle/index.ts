@@ -8,8 +8,9 @@
 //                 assembleBundle, used once per relay with that relay's own
 //                 tip account), simulateBundle, plus the LEGACY Jito
 //                 submission path (submitWithRetry) kept as compatibility.
-//   relays.ts   - Tier 2 relay submission: Astralane Iris PRIMARY +
-//                 bloXroute OPTIONAL FALLBACK (submitRelaysSequentially),
+//   relays.ts   - Tier 2 relay submission: NextBlock PRIMARY + Astralane
+//                 Iris / bloXroute OPTIONAL FALLBACKS
+//                 (submitRelaysSequentially),
 //                 official per-relay tip accounts + 0.001 SOL tip floors,
 //                 exact request dialects, response classification, the
 //                 server-env resolver/plan, and the legacy parallel
@@ -21,9 +22,9 @@
 //                 submitWithRetry with the same BundleSubmissionResult.
 //   lookup.ts   - address-lookup-table helpers for the preflight sandbox.
 //
-// Tier 2 order (RELAY_ORDER): astralane -> bloxroute. Jito is NOT in the
-// active order; it is kept as legacy compatibility (diagnostic scripts, the
-// jito status poll, submitWithRetry).
+// Tier 2 order (RELAY_ORDER): nextblock -> astralane -> bloxroute. Jito is
+// NOT in the active order; it is kept as legacy compatibility (diagnostic
+// scripts, the jito status poll, submitWithRetry).
 
 export * from "./launch";
 export * from "./jito";

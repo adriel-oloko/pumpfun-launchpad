@@ -13,12 +13,13 @@
 //                     sendSequentially as normal devnet txs.
 //   Tier 2:           the same sequence as an ATOMIC relay bundle submitted
 //                     through the same-origin proxy (/api/bundle-relay):
-//                     Astralane Iris PRIMARY, bloXroute optional fallback.
-//                     The browser assembles a provider-specific signed
-//                     bundle per enabled relay (each pays that relay's own
-//                     recognized tip account in its final tx); the proxy
-//                     submits them sequentially, Astralane first, bloXroute
-//                     only on an explicit reject / unreachable. Relays are
+//                     NextBlock PRIMARY, Astralane + bloXroute optional
+//                     fallbacks. The browser assembles a provider-specific
+//                     signed bundle per enabled relay (each pays that
+//                     relay's own recognized tip account in its final tx);
+//                     the proxy submits them sequentially, NextBlock first,
+//                     Astralane/bloXroute only on an explicit reject /
+//                     unreachable. Relays are
 //                     mainnet services; with no server-side credentials Tier
 //                     2 honestly reports the not-configured state after
 //                     proving the construction (assemble + simulate). An
@@ -118,7 +119,7 @@ const EXPLORER = 'https://explorer.solana.com'
 const EXPLORER_QS = solanaNetwork() === 'devnet' ? '?cluster=devnet' : ''
 const DEFAULT_SOL_IN = '0.01'
 /** Default Tier 2 relay tip (SOL) shown in the tip field: 0.001 SOL, the
- *  Astralane (free tier) / bloXroute minimum and lib/fees default. */
+ *  NextBlock / Astralane / bloXroute minimum and lib/fees default. */
 const DEFAULT_TIP_SOL = (DEFAULT_JITO_TIP_LAMPORTS / LAMPORTS_PER_SOL).toString()
 
 function errMsg(e: unknown): string {
@@ -238,9 +239,9 @@ export function LaunchPanel({
 
     /** Parses the Tier 2 relay tip field (SOL) into lamports. Empty falls
      *  back to DEFAULT_JITO_TIP_LAMPORTS (0.001 SOL). Any value below the
-     *  1_000_000-lamport (0.001 SOL) floor of BOTH active Tier 2 relays
-     *  (Astralane free tier, bloXroute) is rejected up front — a sub-floor
-     *  bundle cannot be accepted. */
+     *  1_000_000-lamport (0.001 SOL) floor of the active Tier 2 relays
+     *  (NextBlock primary, Astralane, bloXroute) is rejected up front — a
+     *  sub-floor bundle cannot be accepted. */
     const parseTip = (): number => {
         const raw = tipSol.trim()
         if (raw === '') return DEFAULT_JITO_TIP_LAMPORTS
@@ -249,10 +250,10 @@ export function LaunchPanel({
             throw new Error(`tip must be a non-negative SOL amount, got "${raw}"`)
         }
         const lamports = Math.round(n * LAMPORTS_PER_SOL)
-        const floor = RELAY_MIN_TIP_LAMPORTS.astralane
+        const floor = RELAY_MIN_TIP_LAMPORTS.nextblock
         if (lamports < floor) {
             throw new Error(
-                `tip ${raw} SOL (${lamports} lamports) is below the ${floor}-lamport (0.001 SOL) minimum required by the Tier 2 relays (Astralane primary / bloXroute fallback)`
+                `tip ${raw} SOL (${lamports} lamports) is below the ${floor}-lamport (0.001 SOL) minimum required by the Tier 2 relays (NextBlock primary / Astralane + bloXroute fallback)`
             )
         }
         return lamports
@@ -479,13 +480,14 @@ export function LaunchPanel({
                     `sent ${sent.length} txs: ${sent.map((s) => s.label).join(', ')}`
                 )
             } else {
-                // Tier 2 (atomic relay bundle: Astralane Iris PRIMARY,
-                // bloXroute OPTIONAL fallback). Relay credentials live
-                // server-side; the browser assembles a PROVIDER-SPECIFIC
+                // Tier 2 (atomic relay bundle: NextBlock PRIMARY, Astralane
+                // Iris + bloXroute OPTIONAL fallbacks). Relay credentials
+                // live server-side; the browser assembles a PROVIDER-SPECIFIC
                 // signed bundle per enabled relay (each paying that relay's
                 // own recognized tip account) and the same-origin proxy
-                // (/api/bundle-relay) submits them sequentially — Astralane
-                // first, bloXroute only on an explicit reject / unreachable.
+                // (/api/bundle-relay) submits them sequentially — NextBlock
+                // first, Astralane/bloXroute only on an explicit reject /
+                // unreachable.
                 // M7a: a non-landing bundle must NEVER fall through to the
                 // "launch complete" block below, so the tier-2 outcome is
                 // captured here and a non-landing result throws before any
@@ -523,26 +525,27 @@ export function LaunchPanel({
                     ...seq.buyTxs.map((b) => b.tx),
                 ].filter((t): t is NonNullable<typeof t> => t !== null)
                 const bundleSigners = seq.signersByTx
-                // Astralane and bloXroute bundles cap at 4 txs (pump.fun buy
-                // ixs pack 2 wallets per tx, measured M10), so a launch over
-                // ~6 funded wallets exceeds the cap. Surface that BEFORE the
-                // assembler's cryptic cap error with the actionable fix.
+                // NextBlock / Astralane / bloXroute bundles cap at 4 txs
+                // (pump.fun buy ixs pack 2 wallets per tx, measured M10), so
+                // a launch over ~6 funded wallets exceeds the cap. Surface
+                // that BEFORE the assembler's cryptic cap error with the
+                // actionable fix.
                 const TIER2_BUNDLE_CAP = 4
                 if (bundleTxs.length > TIER2_BUNDLE_CAP) {
                     const nonBuyTxs = bundleTxs.length - seq.buyTxs.length
                     const maxWallets = 2 * (TIER2_BUNDLE_CAP - nonBuyTxs)
                     throw new Error(
-                        `TIER 2 BUNDLE CAP: ${bundleTxs.length} txs > the ${TIER2_BUNDLE_CAP}-tx Astralane/bloXroute bundle limit (pump.fun buy ixs pack 2 wallets per tx). Reduce the selected dev wallets to at most ${maxWallets} or use Tier 1 (sequential sends).`
+                        `TIER 2 BUNDLE CAP: ${bundleTxs.length} txs > the ${TIER2_BUNDLE_CAP}-tx NextBlock/Astralane/bloXroute bundle limit (pump.fun buy ixs pack 2 wallets per tx). Reduce the selected dev wallets to at most ${maxWallets} or use Tier 1 (sequential sends).`
                     )
                 }
                 // Representative tip account for the sandbox sim: the PRIMARY
                 // configured relay's official tip account (first configured
-                // relay in order; the astralane constant when nothing is
+                // relay in order; the nextblock constant when nothing is
                 // configured, so a no-creds rehearsal still proves the
                 // construction). The real per-relay tips are chosen inside
                 // the submitter for EVERY enabled relay.
                 const simRelay: RelayId =
-                    enabledRelays.length > 0 ? enabledRelays[0] : 'astralane'
+                    enabledRelays.length > 0 ? enabledRelays[0] : 'nextblock'
                 const simTipAccount = new PublicKey(
                     defaultTipAccountForRelay(simRelay)
                 )
@@ -578,7 +581,7 @@ export function LaunchPanel({
                         'TIER 2 RESULT: bundle assembled + simulated; submission impossible (no relay credentials configured server-side). No fabricated landing claim.'
                     )
                     throw new Error(
-                        'TIER 2 NOT CONFIGURED: no Tier 2 relay credentials on the server. Set ASTRALANE_API_KEY (primary; portal.astralane.io) and optionally BLOXROUTE_JWT (fallback) in the server env — never NEXT_PUBLIC_ — then re-run. NOTHING WAS CREATED. On devnet, Tier 2 relays are mainnet services: use Tier 1 normal sends.'
+                        'TIER 2 NOT CONFIGURED: no Tier 2 relay credentials on the server. Set NEXTBLOCK_API_KEY (primary; docs.nextblock.io) and optionally ASTRALANE_API_KEY / BLOXROUTE_JWT (fallbacks) in the server env — never NEXT_PUBLIC_ — then re-run. NOTHING WAS CREATED. On devnet, Tier 2 relays are mainnet services: use Tier 1 normal sends.'
                     )
                 } else {
                     log(
@@ -588,9 +591,10 @@ export function LaunchPanel({
                     // signed bundle per enabled relay (each paying that
                     // relay's own recognized tip account in its final tx) and
                     // submitted through /api/bundle-relay SEQUENTIALLY:
-                    // Astralane primary first, bloXroute fallback only when
-                    // Astralane explicitly rejects or is unreachable — never
-                    // simultaneously. Credentials stay server-side; only the
+                    // NextBlock primary first, Astralane/bloXroute fallback
+                    // only when NextBlock explicitly rejects or is
+                    // unreachable — never simultaneously. Credentials stay
+                    // server-side; only the
                     // signed base64 variants leave this page. Each attempt
                     // re-assembles with a fresh blockhash at the same tip
                     // (safe: a landed create makes later attempts revert).
@@ -1128,7 +1132,7 @@ export function LaunchPanel({
                     <div className="flex items-center gap-2">
                         <label
                             className="label-mono flex items-center gap-1.5 opacity-80"
-                            title="Tier 2 relay tip in SOL (Astralane primary / bloXroute fallback; minimum 0.001 SOL). Empty uses the default.">
+                            title="Tier 2 relay tip in SOL (NextBlock primary / Astralane + bloXroute fallback; minimum 0.001 SOL). Empty uses the default.">
                             tip
                             <Input
                                 type="number"

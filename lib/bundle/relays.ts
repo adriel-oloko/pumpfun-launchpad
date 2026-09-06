@@ -1,5 +1,6 @@
-// Tier 2 atomic-launch relay submission (Astralane Iris PRIMARY + bloXroute
-// OPTIONAL FALLBACK), the Solana analog of v4-launchpad's flashbots-proxy.
+// Tier 2 atomic-launch relay submission (NextBlock PRIMARY + Astralane Iris
+// and bloXroute OPTIONAL FALLBACKS), the Solana analog of v4-launchpad's
+// flashbots-proxy.
 //
 // WHY RELAYS: a launch (fund -> create -> buy) must land atomically (all txs
 // or none) inside one slot, which only a block-engine bundle guarantees.
@@ -18,6 +19,14 @@
 // KNOWN_BLOXROUTE_TIP_ACCOUNTS / lib/bundle/jito.ts KNOWN_TIP_ACCOUNTS.
 //
 // DIALECTS (researched live 2026-09-06 against the official docs):
+//   - NextBlock submit-batch (HTTP POST to
+//     https://<region>.nextblock.io/api/v2/submit-batch with an Authorization
+//     api key header, server-side secret): body
+//     {entries:[{transaction:{content}}]}. Atomic 2-4 tx bundle; NO useBundle
+//     flag (the endpoint IS the bundle). Tip = plain SOL transfer to a
+//     NextBlock tip wallet (>= 0.001 SOL), in the final tx. Response
+//     {signature} on 200; {code,message} on 400. No bundle status API.
+//     Docs: docs.nextblock.io.
 //   - Astralane Iris sendBundle (JSON-RPC POST to
 //     https://edge.astralane.io/iris?api-key=<key>, regional gateways share
 //     /iris): params [[base64...], {encoding:"base64", mevProtect:true,
@@ -51,21 +60,22 @@
 
 /** Relay identifiers. jito is a legacy compatibility relay, NOT part of the
  *  active Tier 2 order (see the module header). */
-export type RelayId = "jito" | "bloxroute" | "astralane";
+export type RelayId = "jito" | "bloxroute" | "astralane" | "nextblock";
 
 /** Role of each relay in the Tier 2 plan (drives UI/log copy). */
 export type RelayRole = "primary" | "fallback" | "legacy";
 
 export const RELAY_ROLE: Record<RelayId, RelayRole> = {
-  astralane: "primary",
+  nextblock: "primary",
+  astralane: "fallback",
   bloxroute: "fallback",
   jito: "legacy",
 };
 
-/** ACTIVE Tier 2 submission order: Astralane Iris first, bloXroute as the
- *  optional fallback. Sequential: the next relay is only tried when the
- *  previous one explicitly rejects or is unreachable. */
-export const TIER2_RELAY_ORDER: RelayId[] = ["astralane", "bloxroute"];
+/** ACTIVE Tier 2 submission order: NextBlock PRIMARY, Astralane Iris and
+ *  bloXroute as OPTIONAL fallbacks. Sequential: the next relay is only tried
+ *  when the previous one explicitly rejects or is unreachable. */
+export const TIER2_RELAY_ORDER: RelayId[] = ["nextblock", "astralane", "bloxroute"];
 
 /** Backwards-compatible name for the active Tier 2 order. */
 export const RELAY_ORDER: RelayId[] = TIER2_RELAY_ORDER;
@@ -84,11 +94,22 @@ export const ASTRALANE_EDGE_URL = "https://edge.astralane.io/iris";
 export const BLOXROUTE_SOLANA_URL =
   "https://ny.solana.dex.blxrbdn.com/api/v2/submit-batch";
 
-/** Per-relay bundle caps (tx count). The ACTIVE Tier 2 relays (Astralane,
- *  bloXroute) cap bundles at 4 txs; Jito (legacy) allows 5. A bundle over a
- *  relay's cap is skipped for that relay with an honest rejection, never
- *  truncated. A 3-tx launch (fund, create, buy+tip) fits both active caps. */
+/** NextBlock submit-batch endpoint (the atomic bundle path, 2-4 txs). The
+ *  Authorization API key rides as a header; ny is the default region and
+ *  other region hosts (frankfurt/amsterdam/london/singapore/tokyo/slc/
+ *  dublin/vilnius.nextblock.io) share /api/v2/submit-batch. */
+export const NEXTBLOCK_SUBMIT_BATCH_URL =
+  "https://ny.nextblock.io/api/v2/submit-batch";
+
+/** Per-relay bundle caps (tx count). The ACTIVE Tier 2 relays (NextBlock,
+ *  Astralane, bloXroute) cap bundles at 4 txs; Jito (legacy) allows 5.
+ *  NextBlock also enforces a 2-tx MINIMUM on submit-batch (the atomic launch
+ *  is always >= 3 txs so this never bites, but a 1-tx batch is invalid there).
+ *  A bundle over a relay's cap is skipped for that relay with an honest
+ *  rejection, never truncated. A 3-tx launch (fund, create, buy+tip) fits
+ *  every active cap. */
 export const RELAY_BUNDLE_CAPS: Record<RelayId, number> = {
+  nextblock: 4,
   astralane: 4,
   bloxroute: 4,
   jito: 5,
@@ -140,11 +161,28 @@ export const KNOWN_BLOXROUTE_TIP_ACCOUNTS: string[] = [
   "bLxv4Hnub7nDJWHs8s17o9bGU65Bnx6Yqp2fqtMgHmm",
 ];
 
-/** Per-relay minimum bundle tip, lamports. Astralane (docs fee tiers: free
- *  tier min tip 0.001 SOL) and bloXroute (docs: min required tip 0.001 SOL)
- *  both floor at 1_000_000 lamports. Jito's block engine floor is 1000
- *  lamports (legacy path only). */
+/** Official NextBlock tip wallets (docs Quickstart "Tip Wallets"). A plain
+ *  SOL transfer to one of these IS the tip; higher tip = higher priority.
+ *  Rotate to reduce write-lock contention. The docs submit-batch sample pays
+ *  nEXTBLockYgngeRmRrjDV31mGSekVPqZoMGhQEZtPVG. */
+export const KNOWN_NEXTBLOCK_TIP_ACCOUNTS: string[] = [
+  "NextbLoCkVtMGcV47JzewQdvBpLqT9TxQFozQkN98pE",
+  "NexTbLoCkWykbLuB1NkjXgFWkX9oAtcoagQegygXXA2",
+  "NeXTBLoCKs9F1y5PJS9CKrFNNLU1keHW71rfh7KgA1X",
+  "NexTBLockJYZ7QD7p2byrUa6df8ndV2WSd8GkbWqfbb",
+  "neXtBLock1LeC67jYd1QdAa32kbVeubsfPNTJC1V5At",
+  "nEXTBLockYgngeRmRrjDV31mGSekVPqZoMGhQEZtPVG",
+  "NEXTbLoCkB51HpLBLojQfpyVAMorm3zzKg7w9NFdqid",
+  "nextBLoCkPMgmG8ZgJtABeScP35qLa2AMCNKntAP7Xc",
+];
+
+/** Per-relay minimum bundle tip, lamports. NextBlock (docs: "fee too low;
+ *  transaction contains low tip" error + tip floor API), Astralane (free
+ *  tier min 0.001 SOL) and bloXroute (docs: min required tip 0.001 SOL) all
+ *  floor at 1_000_000 lamports. Jito's block engine floor is 1000 lamports
+ *  (legacy path only). */
 export const RELAY_MIN_TIP_LAMPORTS: Record<RelayId, number> = {
+  nextblock: 1_000_000,
   astralane: 1_000_000,
   bloxroute: 1_000_000,
   jito: 1_000,
@@ -156,6 +194,8 @@ export const RELAY_MIN_TIP_LAMPORTS: Record<RelayId, number> = {
  *  static official lists, which is what the provider-specific assembly uses. */
 export function tipAccountsForRelay(relay: RelayId): string[] {
   switch (relay) {
+    case "nextblock":
+      return KNOWN_NEXTBLOCK_TIP_ACCOUNTS;
     case "astralane":
       return KNOWN_ASTRALANE_TIP_ACCOUNTS;
     case "bloxroute":
@@ -178,9 +218,10 @@ export function defaultTipAccountForRelay(relay: RelayId): string {
 
 /**
  * Resolves the ENABLED relays and their endpoint/auth overrides from the
- * server env. The active Tier 2 order is Astralane (primary, needs
+ * server env. The active Tier 2 order is NextBlock (primary, needs
+ * NEXTBLOCK_API_KEY) then Astralane (optional fallback, needs
  * ASTRALANE_API_KEY) then bloXroute (optional fallback, needs BLOXROUTE_JWT).
- * Both are SERVER secrets: they must live in non-NEXT_PUBLIC env vars
+ * All are SERVER secrets: they must live in non-NEXT_PUBLIC env vars
  * (NEXT_PUBLIC_ would inline them into the browser bundle). A relay without
  * credentials reports "disabled" and is never fired. jito is NEVER
  * auto-enabled: it is a legacy compatibility relay, deliberately absent from
@@ -205,6 +246,19 @@ export function resolveRelayEndpointsFromEnv(): {
     id: "jito",
     url: env.RELAY_JITO_URL ?? JITO_BLOCK_ENGINE_MAINNET,
   };
+
+  const nextblockKey = env.NEXTBLOCK_API_KEY?.trim();
+  if (nextblockKey) {
+    overrides.nextblock = {
+      id: "nextblock",
+      url: env.NEXTBLOCK_URL ?? NEXTBLOCK_SUBMIT_BATCH_URL,
+      // NextBlock authenticates with a single API key in the Authorization
+      // (docs use the lowercase `authorization`) header.
+      authHeaderValue: nextblockKey,
+      authHeaderName: "authorization",
+    };
+    enabled.push("nextblock");
+  }
 
   const astraKey = env.ASTRALANE_API_KEY?.trim();
   if (astraKey) {
@@ -383,13 +437,28 @@ function bloxrouteSubmitBatchBody(base64: string[]): string {
   });
 }
 
+/** NextBlock submit-batch body (translated dialect): {entries:[{transaction:
+ *  {content}}]}. Atomic 2-4 tx bundle; NO useBundle flag (the endpoint IS
+ *  the bundle), no per-entry skipPreflight. The tip is a plain SOL transfer
+ *  to a KNOWN_NEXTBLOCK_TIP_ACCOUNTS wallet in the final tx (already done by
+ *  the provider-specific assembly). frontRunningProtection is only documented
+ *  on the single /submit endpoint; left unset here until confirmed for
+ *  submit-batch. */
+function nextblockSubmitBatchBody(base64: string[]): string {
+  return JSON.stringify({
+    entries: base64.map((content) => ({
+      transaction: { content },
+    })),
+  });
+}
+
 /** Builds the exact HTTP request for one relay from the shared signed
  *  bundle. Auth (JWT / api key) is NOT attached here: the route injects it
  *  from server-side env via the endpoint override. */
 export function buildRelayRequest(
   relay: RelayId,
   base64: string[],
-  overrides?: Record<RelayId, RelayEndpointOverride>
+  overrides?: Partial<Record<RelayId, RelayEndpointOverride>>
 ): RelayLegRequest {
   switch (relay) {
     case "jito": {
@@ -440,6 +509,26 @@ export function buildRelayRequest(
         headers,
         method: "submit-batch",
         body: bloxrouteSubmitBatchBody(base64),
+      };
+    }
+    case "nextblock": {
+      const ov = overrides?.nextblock;
+      const url = ov?.url ?? NEXTBLOCK_SUBMIT_BATCH_URL;
+      const headers: Record<string, string> = {
+        "Content-Type": "application/json",
+      };
+      if (ov?.authHeaderValue) {
+        // Docs use the lowercase `authorization` header (case-insensitive in
+        // HTTP, but mirror it verbatim). The resolver sets authHeaderName to
+        // "authorization"; fall back here for direct callers.
+        headers[ov.authHeaderName ?? "authorization"] = ov.authHeaderValue;
+      }
+      return {
+        relay,
+        url,
+        headers,
+        method: "submit-batch",
+        body: nextblockSubmitBatchBody(base64),
       };
     }
   }
@@ -553,6 +642,18 @@ export function classifyRelayResponse(
         status: "rejected",
         detail: `unexpected submit-batch response: ${rawBody.slice(0, 200)}`,
       };
+    }
+    case "nextblock": {
+      // submit-batch 200: {signature:"bundle-signature"}. Accepted when a
+      // signature is present. Error 400: {code, message} = rejected.
+      const obj = json as { signature?: string; message?: string; code?: number } | null;
+      if (obj?.signature) {
+        return { status: "accepted", bundleId: obj.signature };
+      }
+      const msg = obj?.message
+        ? `${obj.message}${obj.code != null ? ` (code ${obj.code})` : ""}`
+        : `http ${httpStatus}: ${rawBody.slice(0, 200)}`;
+      return { status: "rejected", detail: msg };
     }
   }
 }
@@ -728,9 +829,9 @@ export interface SequentialSubmitOptions {
    *  tip account in its final tx (see the module header); a variant is only
    *  ever sent to its own relay. A relay without an entry is skipped. */
   bundles: Partial<Record<RelayId, string[]>>;
-  /** Relays to attempt, in order (default: RELAY_ORDER = Astralane primary,
-   *  bloXroute fallback). The NEXT relay is only tried when the current one
-   *  explicitly rejects or is unreachable — never in parallel. */
+  /** Relays to attempt, in order (default: RELAY_ORDER = NextBlock primary,
+   *  Astralane/bloXroute fallbacks). The NEXT relay is only tried when the
+   *  current one explicitly rejects or is unreachable — never in parallel. */
   relays?: RelayId[];
   /** Which relays are configured (have server-side credentials). A relay not
    *  in this set reports disabled and is never fired. */
@@ -747,8 +848,8 @@ export interface SequentialSubmitOptions {
 
 /**
  * The ACTIVE Tier 2 submission engine: tries each relay SEQUENTIALLY in
- * order (Astralane primary, then bloXroute fallback), each with its OWN
- * provider-specific signed bundle, and stops at the first ACCEPT. A relay is
+ * order (NextBlock primary, then Astralane/bloXroute fallback), each with its
+ * OWN provider-specific signed bundle, and stops at the first ACCEPT. A relay is
  * only attempted after the previous one explicitly REJECTED or was
  * UNREACHABLE — never simultaneously, so the same launch content cannot be
  * racing two relays at once. Every relay gets a bounded timeout. All leg
@@ -896,8 +997,8 @@ export async function fetchRelayPlan(opts?: {
  * Browser-facing submit: the launch flow POSTs the PROVIDER-SPECIFIC signed
  * bundle variants (each built with its own relay's tip account) to the
  * SAME-ORIGIN proxy route (/api/bundle-relay), which submits them
- * SEQUENTIALLY — Astralane primary first, bloXroute fallback only on an
- * explicit reject / unreachable — with their server-side credentials
+ * SEQUENTIALLY — NextBlock primary first, Astralane/bloXroute fallback only
+ * on an explicit reject / unreachable — with their server-side credentials
  * attached. Zero CORS, zero secret exposure. Returns the route's JSON (the
  * submission result) or throws with the route's error message when nothing
  * was accepted.

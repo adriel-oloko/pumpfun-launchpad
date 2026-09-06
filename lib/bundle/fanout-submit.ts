@@ -1,15 +1,16 @@
 // Tier 2 atomic bundle submission at the configured tip (no tip escalation),
 // through the same-origin relay proxy (app/api/bundle-relay/route.ts).
 //
-// RELAY MODEL (2026-09-06): Astralane Iris is the PRIMARY Tier 2 relay and
-// bloXroute is an OPTIONAL fallback. Every relay only recognizes ITS OWN tip
-// accounts, so a Jito-tipped bundle cannot be shared: this submitter
-// assembles a PROVIDER-SPECIFIC signed bundle per target relay — each with
+// RELAY MODEL (2026-09-06): NextBlock is the PRIMARY Tier 2 relay and
+// Astralane Iris / bloXroute are OPTIONAL fallbacks. Every relay only
+// recognizes ITS OWN tip accounts, so a NextBlock-tipped bundle cannot be
+// shared: this submitter assembles a PROVIDER-SPECIFIC signed bundle per
+// target relay — each with
 // that relay's recognized tip account (official Astralane `astra...` /
 // bloXroute `bLx...`/`3UQU...` constants in lib/bundle/relays.ts) in the
 // LAST tx — and POSTs the variants to the same-origin proxy, which submits
-// them SEQUENTIALLY (Astralane first; bloXroute only on an explicit reject /
-// unreachable). Jito is a legacy compatibility relay and is NOT part of the
+// them SEQUENTIALLY (NextBlock first; Astralane/bloXroute only on an
+// explicit reject / unreachable). Jito is a legacy compatibility relay and is NOT part of the
 // active order; the only Jito-specific machinery left here is the status
 // poll for a legacy jito winner.
 //
@@ -226,7 +227,7 @@ export interface FanoutSubmitOptions {
    *  Used as-is; no escalation. */
   initialTipLamports?: number;
   /** Relays to assemble provider-specific variants for and submit, in order
-   *  (default RELAY_ORDER: astralane primary, bloxroute fallback). */
+   *  (default RELAY_ORDER: nextblock primary, astralane/bloxroute fallback). */
   relays?: RelayId[];
   /** Max submission attempts (default 3). Dropped/failed attempts use a fresh
    *  blockhash at the same configured tip. */
@@ -305,8 +306,9 @@ export async function assembleRelayVariants(opts: {
 
 /**
  * Submits a launch bundle through the relay proxy: assembles a
- * provider-specific signed bundle per target relay (Astralane primary,
- * bloXroute fallback — each paying its own recognized tip account) and lets
+ * provider-specific signed bundle per target relay (NextBlock primary,
+ * Astralane/bloXroute fallback — each paying its own recognized tip account)
+ * and lets
  * the proxy submit them SEQUENTIALLY. Dropped/failed bundles are retried
  * with a fresh blockhash at the same configured tip. Returns the same
  * BundleSubmissionResult as submitWithRetry so the caller's honest reporting
@@ -393,10 +395,10 @@ export async function submitBundleViaFanoutWithRetry(
       base64: canonical?.base64 ?? [],
     };
 
-    // Submit sequentially through the same-origin proxy (Astralane primary,
-    // bloXroute fallback on explicit reject/unreachable; credentials stay
-    // server-side). Only the provider-specific base64 variants cross the
-    // proxy.
+    // Submit sequentially through the same-origin proxy (NextBlock primary,
+    // Astralane/bloXroute fallback on explicit reject/unreachable;
+    // credentials stay server-side). Only the provider-specific base64
+    // variants cross the proxy.
     const bundles: Partial<Record<RelayId, string[]>> = {};
     for (const [relay, variant] of Object.entries(variants) as [RelayId, RelayVariant][]) {
       bundles[relay] = variant.base64;

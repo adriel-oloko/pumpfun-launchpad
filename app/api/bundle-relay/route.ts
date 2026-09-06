@@ -1,16 +1,21 @@
 // Tier 2 atomic-launch relay proxy (same-origin route).
 //
 // The Solana analog of v4-launchpad's app/api/flashbots-proxy/route.ts. The
-// browser cannot (and should not) hold relay credentials: bloXroute needs a
-// JWT and Astralane needs an API key, both server-side secrets. This route
-// receives the ALREADY-SIGNED provider-specific bundle variants (base64 txs;
-// the browser assembled and signed each variant locally with that relay's own
-// tip account, so no key material ever touches this server) and submits them
-// SEQUENTIALLY — Astralane Iris primary first, bloXroute fallback ONLY when
-// Astralane explicitly rejects or is unreachable. Jito is a legacy
-// compatibility relay and is never enabled here.
+// browser cannot (and should not) hold relay credentials: NextBlock needs an
+// API key, bloXroute needs a JWT and Astralane needs an API key — all
+// server-side secrets. This route receives the ALREADY-SIGNED
+// provider-specific bundle variants (base64 txs; the browser assembled and
+// signed each variant locally with that relay's own tip account, so no key
+// material ever touches this server) and submits them SEQUENTIALLY —
+// NextBlock primary first, Astralane/bloXroute fallback ONLY when NextBlock
+// explicitly rejects or is unreachable. Jito is a legacy compatibility relay
+// and is never enabled here.
 //
 // Dialect notes (researched live 2026-09-06 against the official docs):
+//   - NextBlock: HTTP POST /api/v2/submit-batch with an authorization api
+//     key header and body {entries:[{transaction:{content}}]}. Atomic 2-4 tx
+//     bundle (no useBundle flag). Tip = plain SOL transfer to a NextBlock tip
+//     wallet. Response {signature} on 200; {code,message} on 400.
 //   - Astralane: JSON-RPC sendBundle to https://edge.astralane.io/iris
 //     ?api-key=<key> (regional gateways share /iris), params [[base64...],
 //     {encoding:"base64", mevProtect:true, revertProtection:false}]. API key
@@ -31,7 +36,7 @@
 //   body  { bundles: { [relay]: string[] }, relays?: RelayId[] }
 //         bundles = PROVIDER-SPECIFIC signed txs per relay (each relay only
 //         ever receives ITS OWN variant). relays = attempt order (default
-//         RELAY_ORDER: astralane then bloxroute).
+//         RELAY_ORDER: nextblock then astralane then bloxroute).
 //   200   { accepted: RelayLegResult | null, legs: RelayLegResult[] } when a
 //         relay accepted (accepted non-null) OR all relays rejected/skipped/
 //         disabled cleanly (accepted null, every leg has a concrete verdict).
@@ -44,8 +49,8 @@
 //   ?action=plan    -> { relays: RelayPlanEntry[] } — which relays are
 //         configured server-side (ids + configured flags ONLY, no secrets).
 //         The browser uses it to assemble exactly the enabled relays'
-//         variants and to print honest "astralane primary / bloxroute
-//         fallback" status.
+//         variants and to print honest "nextblock primary / astralane +
+//         bloxroute fallback" status.
 //   ?action=status&relay=jito&bundleId=...  -> legacy Jito status polling
 //         (the active Tier 2 relays expose no bundle status API; this stays
 //         for the legacy diagnostic path).

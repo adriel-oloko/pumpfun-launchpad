@@ -1,17 +1,19 @@
 // Tier 2 relay submission tests (no network).
 //
 // Proves the 2026-09-06 Tier 2 relay semantics WITHOUT any live relay
-// (relays have no testnet; bloXroute needs a JWT and Astralane needs an API
-// key that this repo does not hold): Astralane Iris PRIMARY + bloXroute
-// OPTIONAL FALLBACK, each relay receiving its OWN provider-specific signed
-// bundle (its own recognized tip account in the final tx — never one shared
-// Jito-tipped bundle). The engine in lib/bundle/relays.ts and the assembly
-// in lib/bundle/fanout-submit.ts run against mock relays that speak the REAL
-// dialects (Astralane JSON-RPC sendBundle with the mevProtect/revertProtection
-// config, bloXroute Trader API submit-batch with frontRunningProtection), so
-// the request SHAPES are verified byte-for-byte at the encoding level and
-// the behavior (sequential Astralane-first fallback, disabled fallback,
-// per-relay tip placement, bundle caps) is proven deterministically.
+// (relays have no testnet; NextBlock needs an API key, bloXroute needs a JWT
+// and Astralane needs an API key that this repo does not hold): NextBlock
+// PRIMARY + Astralane Iris / bloXroute OPTIONAL FALLBACKS, each relay
+// receiving its OWN provider-specific signed bundle (its own recognized tip
+// account in the final tx — never one shared Jito-tipped bundle). The engine
+// in lib/bundle/relays.ts and the assembly in lib/bundle/fanout-submit.ts run
+// against mock relays that speak the REAL dialects (NextBlock submit-batch
+// {entries:[...]}, Astralane JSON-RPC sendBundle with the
+// mevProtect/revertProtection config, bloXroute Trader API submit-batch with
+// frontRunningProtection), so the request SHAPES are verified byte-for-byte at
+// the encoding level and the behavior (sequential NextBlock-first fallback,
+// disabled fallback, per-relay tip placement, bundle caps) is proven
+// deterministically.
 //
 // Run: with the local-validator ts-mocha recipe
 //   ANCHOR_PROVIDER_URL=http://127.0.0.1:8899 ANCHOR_WALLET=$HOME/.config/solana/devnet.json ./node_modules/.bin/ts-mocha -p ./tsconfig.test.json -t 1000000 "tests/pumpfun-m7b-relays.ts"
@@ -39,6 +41,7 @@ import {
   RELAY_BUNDLE_CAPS,
   RELAY_MIN_TIP_LAMPORTS,
   defaultTipAccountForRelay,
+  KNOWN_NEXTBLOCK_TIP_ACCOUNTS,
   KNOWN_ASTRALANE_TIP_ACCOUNTS,
   KNOWN_BLOXROUTE_TIP_ACCOUNTS,
   type RelayLegResult,
@@ -58,11 +61,13 @@ interface MockRelay {
 }
 
 function makeMockRelays(cfg: {
+  nextblock?: Partial<MockRelay>;
   astralane?: Partial<MockRelay>;
   bloxroute?: Partial<MockRelay>;
   jito?: Partial<MockRelay>;
 }): Record<string, MockRelay> {
   const mocks: Record<string, MockRelay> = {
+    nextblock: { delayMs: 5, mode: "accept", seenBodies: [], seenUrls: [] },
     astralane: { delayMs: 5, mode: "accept", seenBodies: [], seenUrls: [] },
     bloxroute: { delayMs: 5, mode: "accept", seenBodies: [], seenUrls: [] },
     jito: { delayMs: 5, mode: "accept", seenBodies: [], seenUrls: [] },
@@ -83,13 +88,15 @@ function mockFetch(
   variants: Partial<Record<RelayId, string[]>>
 ) {
   return async (url: string, init?: { body?: string }): Promise<Response> => {
-    const id: RelayId | null = url.includes("mock-astra")
-      ? "astralane"
-      : url.includes("mock-blox")
-        ? "bloxroute"
-        : url.includes("mock-jito")
-          ? "jito"
-          : null;
+    const id: RelayId | null = url.includes("mock-nextblock")
+      ? "nextblock"
+      : url.includes("mock-astra")
+        ? "astralane"
+        : url.includes("mock-blox")
+          ? "bloxroute"
+          : url.includes("mock-jito")
+            ? "jito"
+            : null;
     if (!id) throw new Error(`mock fetch: unknown url ${url}`);
     const mock = mocks[id];
     mock.seenUrls.push(url);
@@ -99,6 +106,17 @@ function mockFetch(
     // Dialect shape checks (the encoding-level verification).
     const body = JSON.parse(rawBody);
     const variant = variants[id];
+    if (id === "nextblock") {
+      // NextBlock submit-batch: {entries:[{transaction:{content}}]} — NO
+      // useBundle flag (the endpoint IS the bundle), no per-entry flags.
+      expect(Array.isArray(body.entries)).to.equal(true);
+      const contents = body.entries.map((e: { transaction: { content: string } }) => e.transaction.content);
+      expect(contents).to.deep.equal(variant); // its OWN variant, verbatim
+      expect(body.useBundle).to.equal(undefined); // no bloXroute useBundle flag
+      for (const e of body.entries) {
+        expect(typeof e.transaction.content).to.equal("string");
+      }
+    }
     if (id === "astralane") {
       expect(url.includes("?api-key=")).to.equal(true);
       expect(body.method).to.equal("sendBundle");
@@ -138,25 +156,29 @@ function mockFetch(
     let rawBody2: string;
     if (mock.mode === "reject") {
       rawBody2 =
-        id === "bloxroute"
-          ? JSON.stringify({ transactions: [{ signature: "sigX", submitted: false }] })
-          : JSON.stringify({ jsonrpc: "2.0", id: 1, error: { code: -32603, message: "simulation failed" } });
+        id === "nextblock"
+          ? JSON.stringify({ code: 2, message: "fee too low; transaction contains low tip" })
+          : id === "bloxroute"
+            ? JSON.stringify({ transactions: [{ signature: "sigX", submitted: false }] })
+            : JSON.stringify({ jsonrpc: "2.0", id: 1, error: { code: -32603, message: "simulation failed" } });
     } else {
       rawBody2 =
-        id === "bloxroute"
-          ? JSON.stringify({
-              transactions: [
-                { signature: "sigblx1", submitted: true },
-                { signature: "sigblx2", submitted: true },
-              ],
-            })
-          : id === "astralane"
+        id === "nextblock"
+          ? JSON.stringify({ signature: "nb-sig-1" })
+          : id === "bloxroute"
             ? JSON.stringify({
-                jsonrpc: "2.0",
-                id: 1,
-                result: ["astra-sig-1", "astra-sig-2"],
+                transactions: [
+                  { signature: "sigblx1", submitted: true },
+                  { signature: "sigblx2", submitted: true },
+                ],
               })
-            : JSON.stringify({ jsonrpc: "2.0", id: 1, result: `bundle-jito` });
+            : id === "astralane"
+              ? JSON.stringify({
+                  jsonrpc: "2.0",
+                  id: 1,
+                  result: ["astra-sig-1", "astra-sig-2"],
+                })
+              : JSON.stringify({ jsonrpc: "2.0", id: 1, result: `bundle-jito` });
     }
     return new Response(rawBody2, { status });
   };
@@ -164,6 +186,12 @@ function mockFetch(
 
 /** Mock endpoints (distinct hosts so mockFetch can route each leg). */
 const MOCK_OVERRIDES = {
+  nextblock: {
+    id: "nextblock" as const,
+    url: "https://mock-nextblock.local/api/v2/submit-batch",
+    authHeaderValue: "mock-nb-key",
+    authHeaderName: "authorization",
+  },
   astralane: {
     id: "astralane" as const,
     url: "https://mock-astra.local/iris",
@@ -184,6 +212,7 @@ const MOCK_OVERRIDES = {
  *  own array (identical arrays across relays would be the old cross-send
  *  hazard the tests must catch). */
 const VARIANTS: Partial<Record<RelayId, string[]>> = {
+  nextblock: ["bmV4dDE=", "bmV4dDI=", "bmV4dDM="],
   astralane: ["YXN0cmEx", "YXN0cmEy", "YXN0cmEz"],
   bloxroute: ["YmxveDE=", "YmxveDI=", "YmxveDM="],
   jito: ["aml0bzE=", "aml0bzI="],
@@ -229,6 +258,7 @@ function transferRecipientsOf(txBase64: string): string[] {
 
 /** The official tip accounts of every relay (for tip-detection assertions). */
 const ALL_TIP_ACCOUNTS = [
+  ...KNOWN_NEXTBLOCK_TIP_ACCOUNTS,
   ...KNOWN_ASTRALANE_TIP_ACCOUNTS,
   ...KNOWN_BLOXROUTE_TIP_ACCOUNTS,
 ];
@@ -239,7 +269,7 @@ function assertLegs(legs: RelayLegResult[], expected: Record<string, string>): v
   }
 }
 
-describe("pumpfun (Tier 2: Astralane primary + bloXroute fallback)", () => {
+describe("pumpfun (Tier 2: NextBlock primary + Astralane/bloXroute fallback)", () => {
   it("keeps the transient-Invalid grace finalization rule (legacy jito path)", () => {
     expect(shouldFinalizeInvalidStatus(1, 0, false)).to.equal(false);
     expect(shouldFinalizeInvalidStatus(3, 2_999, false)).to.equal(false);
@@ -261,34 +291,51 @@ describe("pumpfun (Tier 2: Astralane primary + bloXroute fallback)", () => {
     ]);
   });
 
-  it("the active Tier 2 order is Astralane primary then bloXroute fallback (no jito)", () => {
-    expect(TIER2_RELAY_ORDER).to.deep.equal(["astralane", "bloxroute"]);
+  it("the active Tier 2 order is NextBlock primary then Astralane/bloXroute fallback (no jito)", () => {
+    expect(TIER2_RELAY_ORDER).to.deep.equal(["nextblock", "astralane", "bloxroute"]);
     expect(RELAY_ORDER).to.deep.equal(TIER2_RELAY_ORDER);
-    expect(RELAY_ROLE.astralane).to.equal("primary");
+    expect(RELAY_ROLE.nextblock).to.equal("primary");
+    expect(RELAY_ROLE.astralane).to.equal("fallback");
     expect(RELAY_ROLE.bloxroute).to.equal("fallback");
     expect(RELAY_ROLE.jito).to.equal("legacy");
     expect(TIER2_RELAY_ORDER.includes("jito")).to.equal(false);
     // active relays cap bundles at 4 txs; jito (legacy) allows 5
+    expect(RELAY_BUNDLE_CAPS.nextblock).to.equal(4);
     expect(RELAY_BUNDLE_CAPS.astralane).to.equal(4);
     expect(RELAY_BUNDLE_CAPS.bloxroute).to.equal(4);
     expect(RELAY_BUNDLE_CAPS.jito).to.equal(5);
-    // both active relays floor tips at 0.001 SOL (1M lamports)
+    // all active relays floor tips at 0.001 SOL (1M lamports)
+    expect(RELAY_MIN_TIP_LAMPORTS.nextblock).to.equal(1_000_000);
     expect(RELAY_MIN_TIP_LAMPORTS.astralane).to.equal(1_000_000);
     expect(RELAY_MIN_TIP_LAMPORTS.bloxroute).to.equal(1_000_000);
   });
 
-  it("the official tip accounts are known per relay (astra... / bLx..., never shared)", () => {
+  it("the official tip accounts are known per relay (Nextb... / astra... / bLx..., never shared)", () => {
+    expect(defaultTipAccountForRelay("nextblock")).to.equal(
+      KNOWN_NEXTBLOCK_TIP_ACCOUNTS[0]
+    );
     expect(defaultTipAccountForRelay("astralane")).to.equal(
       KNOWN_ASTRALANE_TIP_ACCOUNTS[0]
     );
     expect(defaultTipAccountForRelay("bloxroute")).to.equal(
       KNOWN_BLOXROUTE_TIP_ACCOUNTS[0]
     );
-    // the official astralane + bloxroute wallets are disjoint sets
-    const overlap = KNOWN_ASTRALANE_TIP_ACCOUNTS.filter((a) =>
+    // the official tip wallet sets are pairwise disjoint
+    const nbAstra = KNOWN_NEXTBLOCK_TIP_ACCOUNTS.filter((a) =>
+      KNOWN_ASTRALANE_TIP_ACCOUNTS.includes(a)
+    );
+    const nbBlox = KNOWN_NEXTBLOCK_TIP_ACCOUNTS.filter((a) =>
       KNOWN_BLOXROUTE_TIP_ACCOUNTS.includes(a)
     );
-    expect(overlap).to.deep.equal([]);
+    const astraBlox = KNOWN_ASTRALANE_TIP_ACCOUNTS.filter((a) =>
+      KNOWN_BLOXROUTE_TIP_ACCOUNTS.includes(a)
+    );
+    expect(nbAstra).to.deep.equal([]);
+    expect(nbBlox).to.deep.equal([]);
+    expect(astraBlox).to.deep.equal([]);
+    for (const n of KNOWN_NEXTBLOCK_TIP_ACCOUNTS) {
+      new PublicKey(n); // must parse as a valid pubkey
+    }
     for (const a of KNOWN_ASTRALANE_TIP_ACCOUNTS) {
       expect(a.startsWith("astra")).to.equal(true);
       new PublicKey(a); // must parse as a valid pubkey
@@ -332,6 +379,23 @@ describe("pumpfun (Tier 2: Astralane primary + bloXroute fallback)", () => {
     const jito = buildRelayRequest("jito", TXS);
     expect(jito.url).to.equal("https://mainnet.block-engine.jito.wtf/api/v1/bundles");
     expect(JSON.parse(jito.body).params).to.deep.equal([TXS, { encoding: "base64" }]);
+
+    const nb = buildRelayRequest("nextblock", TXS, {
+      nextblock: {
+        id: "nextblock",
+        url: "https://ny.nextblock.io/api/v2/submit-batch",
+        authHeaderValue: "nb-key",
+        authHeaderName: "authorization",
+      },
+    });
+    expect(nb.url).to.equal("https://ny.nextblock.io/api/v2/submit-batch");
+    expect(nb.headers["authorization"]).to.equal("nb-key");
+    const nbBody = JSON.parse(nb.body);
+    expect(nbBody.entries.length).to.equal(2);
+    expect(nbBody.entries[0].transaction.content).to.equal(TXS[0]);
+    expect(nbBody.entries[0].skipPreflight).to.equal(undefined); // no per-entry flags
+    expect(nbBody.useBundle).to.equal(undefined); // no bloXroute useBundle flag
+    expect(nbBody.frontRunningProtection).to.equal(undefined);
   });
 
   it("classifies real-dialect responses (astralane list-of-signatures too)", () => {
@@ -367,6 +431,22 @@ describe("pumpfun (Tier 2: Astralane primary + bloXroute fallback)", () => {
       JSON.stringify({ transactions: [{ signature: "s1", submitted: true }] })
     );
     expect(blox).to.deep.equal({ status: "accepted", bundleId: "s1", detail: "1 txs accepted" });
+
+    const nb = classifyRelayResponse(
+      "nextblock",
+      200,
+      JSON.stringify({ signature: "nb-sig-1" })
+    );
+    expect(nb).to.deep.equal({ status: "accepted", bundleId: "nb-sig-1" });
+
+    const nbReject = classifyRelayResponse(
+      "nextblock",
+      400,
+      JSON.stringify({ code: 2, message: "fee too low; transaction contains low tip", details: [] })
+    );
+    expect(nbReject.status).to.equal("rejected");
+    expect(nbReject.detail).to.contain("fee too low");
+    expect(nbReject.detail).to.contain("code 2");
   });
 
   it("assembles a PROVIDER-SPECIFIC bundle per relay: each pays its OWN official tip account in the LAST tx", async () => {
@@ -419,6 +499,29 @@ describe("pumpfun (Tier 2: Astralane primary + bloXroute fallback)", () => {
     );
   });
 
+  it("assembles a NextBlock variant paying its OWN NextBlock tip account in the LAST tx", async () => {
+    const payer = seedKeypair(7);
+    const dest = seedKeypair(8).publicKey;
+    const txs = [makeTx(payer, dest, 10_000), makeTx(payer, dest, 20_000)];
+    const { variants } = await assembleRelayVariants({
+      txs,
+      signersByTx: [[payer], [payer]],
+      blockhash: payer.publicKey.toBase58(),
+      lastValidBlockHeight: 0,
+      tipLamports: 1_000_000,
+      tipPayer: payer,
+      relays: ["nextblock"],
+    });
+    const nb = variants.nextblock!;
+    expect(nb.base64.length).to.equal(2);
+    expect(nb.tipAccount).to.equal(defaultTipAccountForRelay("nextblock"));
+    const nbLast = transferRecipientsOf(nb.base64[1]);
+    expect(nbLast).to.include(defaultTipAccountForRelay("nextblock"));
+    // never pays another provider's wallet
+    expect(nbLast.some((r) => KNOWN_ASTRALANE_TIP_ACCOUNTS.includes(r))).to.equal(false);
+    expect(nbLast.some((r) => KNOWN_BLOXROUTE_TIP_ACCOUNTS.includes(r))).to.equal(false);
+  });
+
   it("rejects a tip below a relay's 0.001 SOL floor at assembly time", async () => {
     const payer = seedKeypair(3);
     const dest = seedKeypair(4).publicKey;
@@ -441,14 +544,55 @@ describe("pumpfun (Tier 2: Astralane primary + bloXroute fallback)", () => {
     expect(err).to.contain("0.001 SOL");
   });
 
+  it("submits NextBlock FIRST in the active order: a NextBlock accept stops the run — no fallback fires", async () => {
+    const mocks = makeMockRelays({ nextblock: { delayMs: 5, mode: "accept" } });
+    const fetchFn = mockFetch(mocks, VARIANTS);
+    const r = await submitRelaysSequentially({
+      bundles: VARIANTS,
+      relays: RELAY_ORDER,
+      enabled: RELAY_ORDER,
+      overrides: MOCK_OVERRIDES,
+      fetchFn: fetchFn as unknown as typeof fetch,
+    });
+    expect(r.accepted?.relay).to.equal("nextblock");
+    expect(r.accepted?.bundleId).to.equal("nb-sig-1");
+    // the fallbacks were NEVER attempted
+    expect(mocks.astralane.seenBodies.length).to.equal(0);
+    expect(mocks.bloxroute.seenBodies.length).to.equal(0);
+    expect(mocks.nextblock.seenBodies.length).to.equal(1);
+    expect(r.legs.map((l) => l.relay)).to.deep.equal(["nextblock"]);
+  });
+
+  it("falls back to Astralane ONLY when NextBlock rejects", async () => {
+    const mocks = makeMockRelays({
+      nextblock: { mode: "reject" },
+      astralane: { mode: "accept" },
+    });
+    const fetchFn = mockFetch(mocks, VARIANTS);
+    const r = await submitRelaysSequentially({
+      bundles: VARIANTS,
+      relays: RELAY_ORDER,
+      enabled: RELAY_ORDER,
+      overrides: MOCK_OVERRIDES,
+      fetchFn: fetchFn as unknown as typeof fetch,
+    });
+    expect(r.accepted?.relay).to.equal("astralane");
+    const nb = r.legs.find((l) => l.relay === "nextblock");
+    expect(nb?.status).to.equal("rejected");
+    expect(nb?.detail).to.contain("fee too low");
+    expect(mocks.nextblock.seenBodies.length).to.equal(1);
+    expect(mocks.astralane.seenBodies.length).to.equal(1);
+    expect(mocks.bloxroute.seenBodies.length).to.equal(0);
+  });
+
   it("submits SEQUENTIALLY: an Astralane accept stops the run — bloXroute is never fired", async () => {
     const mocks = makeMockRelays({ astralane: { delayMs: 5, mode: "accept" } });
     const fetchFn = mockFetch(mocks, VARIANTS);
     const started = Date.now();
     const r: RelayFanoutResult = await submitRelaysSequentially({
       bundles: VARIANTS,
-      relays: RELAY_ORDER,
-      enabled: RELAY_ORDER,
+      relays: ["astralane", "bloxroute"],
+      enabled: ["astralane", "bloxroute"],
       overrides: MOCK_OVERRIDES,
       fetchFn: fetchFn as unknown as typeof fetch,
       timeoutMs: 3_000,
@@ -472,8 +616,8 @@ describe("pumpfun (Tier 2: Astralane primary + bloXroute fallback)", () => {
     const fetchFn = mockFetch(mocks, VARIANTS);
     const r = await submitRelaysSequentially({
       bundles: VARIANTS,
-      relays: RELAY_ORDER,
-      enabled: RELAY_ORDER,
+      relays: ["astralane", "bloxroute"],
+      enabled: ["astralane", "bloxroute"],
       overrides: MOCK_OVERRIDES,
       fetchFn: fetchFn as unknown as typeof fetch,
     });
@@ -496,8 +640,8 @@ describe("pumpfun (Tier 2: Astralane primary + bloXroute fallback)", () => {
     const fetchFn = mockFetch(mocks, VARIANTS);
     const r = await submitRelaysSequentially({
       bundles: VARIANTS,
-      relays: RELAY_ORDER,
-      enabled: RELAY_ORDER,
+      relays: ["astralane", "bloxroute"],
+      enabled: ["astralane", "bloxroute"],
       overrides: MOCK_OVERRIDES,
       fetchFn: fetchFn as unknown as typeof fetch,
     });
@@ -513,7 +657,7 @@ describe("pumpfun (Tier 2: Astralane primary + bloXroute fallback)", () => {
     const fetchFn = mockFetch(mocks, VARIANTS);
     const r = await submitRelaysSequentially({
       bundles: VARIANTS,
-      relays: RELAY_ORDER,
+      relays: ["astralane", "bloxroute"],
       enabled: ["astralane"],
       overrides: MOCK_OVERRIDES,
       fetchFn: fetchFn as unknown as typeof fetch,
@@ -531,7 +675,7 @@ describe("pumpfun (Tier 2: Astralane primary + bloXroute fallback)", () => {
     const fetchFn = mockFetch(mocks, VARIANTS);
     const r = await submitRelaysSequentially({
       bundles: VARIANTS,
-      relays: RELAY_ORDER,
+      relays: ["astralane", "bloxroute"],
       enabled: ["bloxroute"],
       overrides: MOCK_OVERRIDES,
       fetchFn: fetchFn as unknown as typeof fetch,
@@ -551,8 +695,8 @@ describe("pumpfun (Tier 2: Astralane primary + bloXroute fallback)", () => {
     const fetchFn = mockFetch(mocks, VARIANTS);
     const r = await submitRelaysSequentially({
       bundles: VARIANTS,
-      relays: RELAY_ORDER,
-      enabled: RELAY_ORDER,
+      relays: ["astralane", "bloxroute"],
+      enabled: ["astralane", "bloxroute"],
       overrides: MOCK_OVERRIDES,
       fetchFn: fetchFn as unknown as typeof fetch,
     });
@@ -569,8 +713,8 @@ describe("pumpfun (Tier 2: Astralane primary + bloXroute fallback)", () => {
     const fetchFn = mockFetch(mocks, big);
     const r = await submitRelaysSequentially({
       bundles: big,
-      relays: RELAY_ORDER,
-      enabled: RELAY_ORDER,
+      relays: ["astralane", "bloxroute"],
+      enabled: ["astralane", "bloxroute"],
       overrides: MOCK_OVERRIDES,
       fetchFn: fetchFn as unknown as typeof fetch,
     });
@@ -588,8 +732,8 @@ describe("pumpfun (Tier 2: Astralane primary + bloXroute fallback)", () => {
     const fetchFn = mockFetch(mocks, { bloxroute: VARIANTS.bloxroute! });
     const r = await submitRelaysSequentially({
       bundles: { bloxroute: VARIANTS.bloxroute! },
-      relays: RELAY_ORDER,
-      enabled: RELAY_ORDER,
+      relays: ["astralane", "bloxroute"],
+      enabled: ["astralane", "bloxroute"],
       overrides: MOCK_OVERRIDES,
       fetchFn: fetchFn as unknown as typeof fetch,
     });
@@ -599,33 +743,41 @@ describe("pumpfun (Tier 2: Astralane primary + bloXroute fallback)", () => {
     expect(r.legs[0].detail).to.contain("no provider-specific signed bundle");
   });
 
-  it("resolves the relay plan from the server env: astralane primary when the key exists, bloxroute fallback only with a JWT, jito never", () => {
+  it("resolves the relay plan from the server env: nextblock primary with the API key, astralane/bloxroute fallback, jito never", () => {
+    const prevN = process.env.NEXTBLOCK_API_KEY;
     const prevA = process.env.ASTRALANE_API_KEY;
     const prevB = process.env.BLOXROUTE_JWT;
     const prevJ = process.env.RELAY_JITO_URL;
     try {
+      delete process.env.NEXTBLOCK_API_KEY;
       delete process.env.ASTRALANE_API_KEY;
       delete process.env.BLOXROUTE_JWT;
       delete process.env.RELAY_JITO_URL;
       const none = resolveRelayEndpointsFromEnv();
       expect(none.enabled).to.deep.equal([]);
       const planNone = relayPlanFromEnv();
-      expect(planNone.map((r) => r.configured)).to.deep.equal([false, false]);
+      expect(planNone.map((r) => r.configured)).to.deep.equal([false, false, false]);
 
+      process.env.NEXTBLOCK_API_KEY = "nb-key";
       process.env.ASTRALANE_API_KEY = "astra-key";
       process.env.BLOXROUTE_JWT = "blox-jwt";
-      const both = resolveRelayEndpointsFromEnv();
-      // order matters: astralane first (primary), bloxroute second (fallback)
-      expect(both.enabled).to.deep.equal(["astralane", "bloxroute"]);
+      const all = resolveRelayEndpointsFromEnv();
+      // order matters: nextblock first (primary), then astralane, then bloxroute
+      expect(all.enabled).to.deep.equal(["nextblock", "astralane", "bloxroute"]);
       const plan = relayPlanFromEnv();
       expect(plan).to.deep.equal([
-        { id: "astralane", configured: true, role: "primary" },
+        { id: "nextblock", configured: true, role: "primary" },
+        { id: "astralane", configured: true, role: "fallback" },
         { id: "bloxroute", configured: true, role: "fallback" },
       ]);
 
+      delete process.env.NEXTBLOCK_API_KEY;
+      const noPrimary = resolveRelayEndpointsFromEnv();
+      expect(noPrimary.enabled).to.deep.equal(["astralane", "bloxroute"]);
+
       delete process.env.ASTRALANE_API_KEY;
-      const fallbackOnly = resolveRelayEndpointsFromEnv();
-      expect(fallbackOnly.enabled).to.deep.equal(["bloxroute"]);
+      const bloxOnly = resolveRelayEndpointsFromEnv();
+      expect(bloxOnly.enabled).to.deep.equal(["bloxroute"]);
 
       // even with a jito URL configured, jito is NEVER enabled on the
       // active Tier 2 path
@@ -633,6 +785,8 @@ describe("pumpfun (Tier 2: Astralane primary + bloXroute fallback)", () => {
       delete process.env.BLOXROUTE_JWT;
       expect(resolveRelayEndpointsFromEnv().enabled).to.deep.equal([]);
     } finally {
+      if (prevN === undefined) delete process.env.NEXTBLOCK_API_KEY;
+      else process.env.NEXTBLOCK_API_KEY = prevN;
       if (prevA === undefined) delete process.env.ASTRALANE_API_KEY;
       else process.env.ASTRALANE_API_KEY = prevA;
       if (prevB === undefined) delete process.env.BLOXROUTE_JWT;
