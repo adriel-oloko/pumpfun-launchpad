@@ -120,7 +120,9 @@ const EXPLORER_QS = solanaNetwork() === 'devnet' ? '?cluster=devnet' : ''
 const DEFAULT_SOL_IN = '0.01'
 /** Default Tier 2 relay tip (SOL) shown in the tip field: 0.001 SOL, the
  *  NextBlock / Astralane / bloXroute minimum and lib/fees default. */
-const DEFAULT_TIP_SOL = (DEFAULT_JITO_TIP_LAMPORTS / LAMPORTS_PER_SOL).toString()
+const DEFAULT_TIP_SOL = (
+    DEFAULT_JITO_TIP_LAMPORTS / LAMPORTS_PER_SOL
+).toString()
 
 function errMsg(e: unknown): string {
     if (e instanceof Error) return e.message
@@ -247,7 +249,9 @@ export function LaunchPanel({
         if (raw === '') return DEFAULT_JITO_TIP_LAMPORTS
         const n = Number(raw)
         if (!Number.isFinite(n) || n < 0) {
-            throw new Error(`tip must be a non-negative SOL amount, got "${raw}"`)
+            throw new Error(
+                `tip must be a non-negative SOL amount, got "${raw}"`
+            )
         }
         const lamports = Math.round(n * LAMPORTS_PER_SOL)
         const floor = RELAY_MIN_TIP_LAMPORTS.nextblock
@@ -333,12 +337,20 @@ export function LaunchPanel({
                 } catch (e) {
                     const msg = errMsg(e)
                     if (msg.includes('METADATA BACKEND NOT CONFIGURED')) {
-                        log('NOTE: no metadata backend is configured on the server.')
-                        log('  - set METADATA_BACKEND=vps + METADATA_VPS_UPLOAD_URL /')
-                        log('    METADATA_VPS_BASE_URL / METADATA_VPS_SECRET (preferred,')
+                        log(
+                            'NOTE: no metadata backend is configured on the server.'
+                        )
+                        log(
+                            '  - set METADATA_BACKEND=vps + METADATA_VPS_UPLOAD_URL /'
+                        )
+                        log(
+                            '    METADATA_VPS_BASE_URL / METADATA_VPS_SECRET (preferred,'
+                        )
                         log('    see tools/metadata-vps/server.mjs), OR')
                         log('  - set METADATA_BACKEND=ipfs + PINATA_JWT, OR')
-                        log('  - enable "manual metadata uri" in Advanced for a')
+                        log(
+                            '  - enable "manual metadata uri" in Advanced for a'
+                        )
                         log('    devnet launch with no backend.')
                     }
                     throw e
@@ -404,11 +416,23 @@ export function LaunchPanel({
                     Buffer.byteLength(symbol, 'utf8') +
                     Buffer.byteLength(finalUri, 'utf8')
                 const createRent =
-                    BigInt(await connection.getMinimumBalanceForRentExemption(mintSize)) + // Token-2022 mint
-                    BigInt(await connection.getMinimumBalanceForRentExemption(151)) + // bonding curve
-                    BigInt(await connection.getMinimumBalanceForRentExemption(170)) + // Token-2022 ATA
-                    BigInt(await connection.getMinimumBalanceForRentExemption(340)) + // mayhem_state (ephemeral)
-                    BigInt(await connection.getMinimumBalanceForRentExemption(170)) // mayhem_token_vault (ephemeral)
+                    BigInt(
+                        await connection.getMinimumBalanceForRentExemption(
+                            mintSize
+                        )
+                    ) + // Token-2022 mint
+                    BigInt(
+                        await connection.getMinimumBalanceForRentExemption(151)
+                    ) + // bonding curve
+                    BigInt(
+                        await connection.getMinimumBalanceForRentExemption(170)
+                    ) + // Token-2022 ATA
+                    BigInt(
+                        await connection.getMinimumBalanceForRentExemption(340)
+                    ) + // mayhem_state (ephemeral)
+                    BigInt(
+                        await connection.getMinimumBalanceForRentExemption(170)
+                    ) // mayhem_token_vault (ephemeral)
                 const createMargin =
                     createRent + postBuyFloorLamports() + BigInt(30_000)
                 const needed = totalFund + createMargin
@@ -683,12 +707,16 @@ export function LaunchPanel({
                     log(
                         `  rejection reason     : ${lastA?.rejectionReason ?? 'n/a'}`
                     )
-                    log(`  rejection msg        : ${lastA?.rejectionMsg ?? 'n/a'}`)
+                    log(
+                        `  rejection msg        : ${lastA?.rejectionMsg ?? 'n/a'}`
+                    )
                     log(`  blockhash            : ${lastA?.blockhash ?? 'n/a'}`)
                     log(
                         `  lastValidBlockHeight : ${lastA?.lastValidBlockHeight ?? 'n/a'}`
                     )
-                    log(`  tip (lamports)       : ${lastA?.tipLamports ?? 'n/a'}`)
+                    log(
+                        `  tip (lamports)       : ${lastA?.tipLamports ?? 'n/a'}`
+                    )
                     log(
                         `  tx signatures        : ${
                             lastA?.txSignatures?.length
@@ -817,9 +845,7 @@ export function LaunchPanel({
                 log(
                     'NOTE: metadata backend not configured. Enable "manual metadata'
                 )
-                log(
-                    '      uri" in Advanced (devnet) or set METADATA_BACKEND +'
-                )
+                log('      uri" in Advanced (devnet) or set METADATA_BACKEND +')
                 log(
                     '      METADATA_VPS_* / PINATA_JWT in the server env (mainnet).'
                 )
@@ -969,26 +995,13 @@ export function LaunchPanel({
                             <span className="label-mono opacity-70">
                                 token metadata · auto-published on launch
                             </span>
-                            <label className="label-mono flex items-center gap-2 cursor-pointer text-[11px] opacity-80">
-                                <input
-                                    type="checkbox"
-                                    className="checkbox-brutal"
-                                    checked={manualMetadata}
-                                    onChange={(e) =>
-                                        setManualMetadata(e.target.checked)
-                                    }
-                                />
-                                manual metadata uri
-                            </label>
                         </div>
                         {manualMetadata ? (
                             <div className="mt-3">
                                 <Field label="Metadata URI">
                                     <Input
                                         value={uri}
-                                        onChange={(e) =>
-                                            setUri(e.target.value)
-                                        }
+                                        onChange={(e) => setUri(e.target.value)}
                                         placeholder="https://.../metadata.json"
                                         spellCheck={false}
                                     />
@@ -1009,62 +1022,68 @@ export function LaunchPanel({
                                         />
                                     </Field>
                                 </div>
-                                <Field
-                                    label="Token Image"
-                                    aside={
-                                        imageFile
-                                            ? imageFile.name
-                                            : 'OPTIONAL - png/jpg/gif/webp/svg'
-                                    }>
-                                    <input
-                                        type="file"
-                                        accept="image/png,image/jpeg,image/gif,image/webp,image/svg+xml"
-                                        className="input-brutal cursor-pointer file:mr-2 file:border-0 file:bg-ink file:px-2 file:py-1 file:font-mono file:text-[10px] file:text-paper file:uppercase"
-                                        onChange={(e) => {
-                                            const f = e.target.files
-                                            setImageFile(
-                                                f && f.length > 0 ? f[0] : null
-                                            )
-                                        }}
-                                    />
-                                </Field>
-                                <Field label="Website">
-                                    <Input
-                                        value={website}
-                                        onChange={(e) =>
-                                            setWebsite(e.target.value)
-                                        }
-                                        placeholder="https://yoursite.com"
-                                        spellCheck={false}
-                                    />
-                                </Field>
-                                <Field label="X / Twitter">
-                                    <Input
-                                        value={twitter}
-                                        onChange={(e) =>
-                                            setTwitter(e.target.value)
-                                        }
-                                        placeholder="@handle or https://x.com/handle"
-                                        spellCheck={false}
-                                    />
-                                </Field>
-                                <Field label="Telegram">
-                                    <Input
-                                        value={telegram}
-                                        onChange={(e) =>
-                                            setTelegram(e.target.value)
-                                        }
-                                        placeholder="@handle or https://t.me/group"
-                                        spellCheck={false}
-                                    />
-                                </Field>
+                                <div className="flex flex-col gap-4">
+                                    <Field
+                                        label="Token Image"
+                                        aside={
+                                            imageFile
+                                                ? imageFile.name
+                                                : 'OPTIONAL - png/jpg/gif/webp/svg'
+                                        }>
+                                        <input
+                                            type="file"
+                                            accept="image/png,image/jpeg,image/gif,image/webp,image/svg+xml"
+                                            className="input-brutal cursor-pointer file:mr-2 file:border-0 file:bg-ink file:px-2 file:py-1 file:font-mono file:text-[10px] file:text-paper file:uppercase"
+                                            onChange={(e) => {
+                                                const f = e.target.files
+                                                setImageFile(
+                                                    f && f.length > 0
+                                                        ? f[0]
+                                                        : null
+                                                )
+                                            }}
+                                        />
+                                    </Field>
+                                    <div className="grid md:grid-cols-2 lg:grid-cols-3 gap-4">
+                                        <Field label="Website">
+                                            <Input
+                                                value={website}
+                                                onChange={(e) =>
+                                                    setWebsite(e.target.value)
+                                                }
+                                                placeholder="https://yoursite.com"
+                                                spellCheck={false}
+                                            />
+                                        </Field>
+                                        <Field label="X / Twitter">
+                                            <Input
+                                                value={twitter}
+                                                onChange={(e) =>
+                                                    setTwitter(e.target.value)
+                                                }
+                                                placeholder="@handle or https://x.com/handle"
+                                                spellCheck={false}
+                                            />
+                                        </Field>
+                                        <Field label="Telegram">
+                                            <Input
+                                                value={telegram}
+                                                onChange={(e) =>
+                                                    setTelegram(e.target.value)
+                                                }
+                                                placeholder="@handle or https://t.me/group"
+                                                spellCheck={false}
+                                            />
+                                        </Field>
+                                    </div>
+                                </div>
                             </div>
                         )}
                     </div>
 
                     {/* M10: pump.fun auto-migrates on graduation (the old M3
                     custom-program toggles are gone; the create args are ONLY
-                    name/symbol/uri) + funding */}
+                    name/symbol/uri) + funding 
                     <div className="lg:col-span-4">
                         <div className="flex flex-wrap items-center gap-4 border-2 border-ink px-3 py-2">
                             
@@ -1081,6 +1100,7 @@ export function LaunchPanel({
                             </label>
                         </div>
                     </div>
+                    */}
 
                     {/* per-wallet sol_in for the selected dev wallets */}
                     <div className="lg:col-span-4">
@@ -1172,12 +1192,7 @@ export function LaunchPanel({
                         className="w-full shadow-none!">
                         {sellBusy ? 'Selling...' : 'Sell All'}
                     </Btn>
-                    {!mint ? (
-                        <StatusLine
-                            text="ENTER THE TOKEN MINT IN THE TRADE PANEL TO SELL ALL (A LAUNCH PRE-FILLS IT)"
-                            tone="idle"
-                        />
-                    ) : null}
+
                     {mint && keyedCount === 0 ? (
                         <StatusLine
                             text="NO KEYED WALLETS. IMPORT BASE58 SECRETS IN THE ROSTER FIRST"
@@ -1226,9 +1241,12 @@ function SellAllReportView({ report }: { report: SellAllReport }) {
             : `ROUTE: PUMSWAP SELL (GRADUATED) · pool ${shortAddress(report.poolKey ?? '', 6)}`
     return (
         <div className="flex flex-col gap-1 border-2 border-ink px-2 py-1.5">
-            <p className="label-mono !text-[10px] font-bold break-all">{routeLabel}</p>
+            <p className="label-mono !text-[10px] font-bold break-all">
+                {routeLabel}
+            </p>
             <p className="label-mono !text-[11px] font-bold">
-                SOLD {report.sold}/{report.total} · SKIPPED {report.skipped} · FAILED {report.failed}
+                SOLD {report.sold}/{report.total} · SKIPPED {report.skipped} ·
+                FAILED {report.failed}
             </p>
             <div className="flex flex-col gap-0.5">
                 {report.outcomes.map((o) => (
@@ -1261,7 +1279,9 @@ function SellOutcomeRow({ outcome }: { outcome: SellOutcome }) {
             </span>
         )
     } else if (outcome.status === 'skipped') {
-        body = <span>SKIPPED ({outcome.reason ?? 'no key / zero balance'})</span>
+        body = (
+            <span>SKIPPED ({outcome.reason ?? 'no key / zero balance'})</span>
+        )
     } else {
         body = <span>FAILED ({outcome.reason ?? 'error'})</span>
     }
