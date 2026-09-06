@@ -1465,7 +1465,7 @@ export function TradePanel({
                                     </button>
                                 </div>
                                 {api.importError ? (
-                                    <p className="label-mono text-[10px] font-bold mt-1">
+                                    <p className="reveal-up label-mono text-[10px] font-bold mt-1">
                                         {api.importError}
                                     </p>
                                 ) : null}
@@ -1581,10 +1581,10 @@ export function TradePanel({
                         role="dialog"
                         aria-modal="true"
                         aria-label="Withdraw to destination address"
-                        className="fixed inset-0 z-[100] flex items-center justify-center bg-ink/60 p-4"
+                        className="modal-overlay fixed inset-0 z-[100] flex items-center justify-center bg-ink/60 p-4"
                         onClick={() => setWithdrawOpen(false)}>
                         <div
-                            className="card-brutal relative w-full max-w-sm bg-paper p-4"
+                            className="modal-card card-brutal relative w-full max-w-sm bg-paper p-4"
                             onClick={(e) => e.stopPropagation()}>
                             <button
                                 type="button"
@@ -1614,7 +1614,7 @@ export function TradePanel({
 
                                 {withdrawDest.trim() &&
                                 !isValidPubkey(withdrawDest.trim()) ? (
-                                    <p className="label-mono mt-1 text-[10px] font-bold">
+                                    <p className="reveal-up label-mono mt-1 text-[10px] font-bold">
                                         NOT A VALID BASE58 ADDRESS
                                     </p>
                                 ) : null}
@@ -1680,7 +1680,7 @@ function ManualReportView({ report }: { report: ManualBatchReport }) {
     const verb = side === 'buy' ? 'BOUGHT' : 'SOLD'
     const total = result.completed + result.skipped + result.failed
     return (
-        <div className="flex flex-col gap-1 border-2 border-ink px-2 py-1.5">
+        <div className="reveal-up flex flex-col gap-1 border-2 border-ink px-2 py-1.5">
             <p className="label-mono !text-[11px] font-bold">
                 {side === 'buy' ? 'BUY' : 'SELL'} {pct}%: {verb}{' '}
                 {result.completed}/{total} · SKIPPED {result.skipped} · FAILED{' '}
@@ -1725,7 +1725,7 @@ function DistributeReportView({ report }: { report: DistributeReport }) {
     if (report.kind === 'disperse') {
         const { result, hub } = report
         return (
-            <div className="flex flex-col gap-1 border-2 border-ink px-2 py-1.5">
+            <div className="reveal-up flex flex-col gap-1 border-2 border-ink px-2 py-1.5">
                 <p className="label-mono !text-[11px] font-bold break-all">
                     DISPERSED {result.count} WALLET
                     {result.count === 1 ? '' : 'S'} ·{' '}
@@ -1744,7 +1744,7 @@ function DistributeReportView({ report }: { report: DistributeReport }) {
         const failed = outcomes.filter((o) => o.status === 'failed').length
         const skipped = outcomes.filter((o) => o.status === 'skipped').length
         return (
-            <div className="flex flex-col gap-1 border-2 border-ink px-2 py-1.5">
+            <div className="reveal-up flex flex-col gap-1 border-2 border-ink px-2 py-1.5">
                 <p className="label-mono !text-[11px] font-bold break-all">
                     WITHDREW {sent}/{outcomes.length} TO {shortAddress(dest, 6)}{' '}
                     · SKIPPED {skipped} · FAILED {failed}
@@ -1761,7 +1761,7 @@ function DistributeReportView({ report }: { report: DistributeReport }) {
     }
     const { removed, skipped, deleted } = report
     return (
-        <div className="flex flex-col gap-1 border-2 border-ink px-2 py-1.5">
+        <div className="reveal-up flex flex-col gap-1 border-2 border-ink px-2 py-1.5">
             <p className="label-mono !text-[11px] font-bold">
                 DELETE: REMOVED {removed} · SKIPPED {skipped} (NOT EMPTY /
                 UNKNOWN BALANCE)
@@ -1981,7 +1981,7 @@ function TokenSocials({ metaJson }: { metaJson: TokenMetaJson | null }) {
     }
     if (items.length === 0) return null
     return (
-        <div className="flex flex-wrap items-center gap-x-4 gap-y-1 border-t-2 border-ink/40 pt-2">
+        <div className="reveal-up flex flex-wrap items-center gap-x-4 gap-y-1 border-t-2 border-ink/40 pt-2">
             {items.map((it) => (
                 <a
                     key={it.kind}

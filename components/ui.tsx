@@ -143,7 +143,12 @@ export function StatusLine({
             : tone === 'ok'
               ? 'font-bold'
               : 'opacity-70'
-    return <p className={`label-mono text-[11px] break-all ${cls}`}>{text}</p>
+    // reveal-up: newly mounted feedback (errors, done states) rises in gently
+    return (
+        <p className={`label-mono text-[11px] break-all reveal-up ${cls}`}>
+            {text}
+        </p>
+    )
 }
 
 /* ---------- explorer links (Solana) ---------- */
@@ -170,7 +175,7 @@ export function ExplorerLink({
             href={href}
             target="_blank"
             rel="noreferrer"
-            className={`underline underline-offset-2 ${
+            className={`underline underline-offset-2 transition-colors duration-150 ease-out ${
                 inverted
                     ? 'hover:bg-paper hover:text-ink'
                     : 'hover:bg-ink hover:text-paper'
@@ -204,7 +209,9 @@ export function Collapse({
                 {open ? '−' : '+'} {label}
             </Btn>
             {open ? (
-                <div className="mt-3 flex flex-col gap-3">{children}</div>
+                <div className="reveal-up mt-3 flex flex-col gap-3">
+                    {children}
+                </div>
             ) : null}
         </div>
     )

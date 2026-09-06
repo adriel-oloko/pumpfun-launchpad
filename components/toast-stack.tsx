@@ -20,6 +20,9 @@ import { ExplorerLink } from "./ui";
 /** How long each notification stays visible (matches the timer bar). */
 export const TOAST_MS = 3000;
 
+/** Exit animation length before the parent unmounts a toast. */
+const TOAST_EXIT_MS = 150;
+
 /** How many notifications stack at once; the oldest is evicted beyond this. */
 const MAX_TOASTS = 5;
 
@@ -98,16 +101,25 @@ function ToastItem({
 }) {
   const { action, amount, txHash, id, tone } = toast;
   const isError = tone === "error";
+  const [leaving, setLeaving] = useState(false);
 
-  // Auto-dismiss after TOAST_MS; the CSS timer bar runs the same window.
+  // Two-phase life: visible for TOAST_MS, then exit animates out before the
+  // parent unmounts. The dismiss × runs the same exit, so every removal
+  // slides back toward the right edge instead of vanishing mid-frame.
   useEffect(() => {
-    const t = setTimeout(() => onDone(id), TOAST_MS);
+    if (leaving) {
+      const t = setTimeout(() => onDone(id), TOAST_EXIT_MS);
+      return () => clearTimeout(t);
+    }
+    const t = setTimeout(() => setLeaving(true), TOAST_MS);
     return () => clearTimeout(t);
-  }, [id, onDone]);
+  }, [leaving, id, onDone]);
 
   return (
     <div
-      className={`${isError ? "card-brutal-inverted" : "card-brutal"} pointer-events-auto relative`}
+      data-entering="true"
+      data-leaving={leaving}
+      className={`${isError ? "card-brutal-inverted" : "card-brutal"} toast-item pointer-events-auto relative`}
       role={isError ? "alert" : "status"}>
       {/* time slider: shrinks from full width to 0 over TOAST_MS */}
       <div
@@ -129,8 +141,8 @@ function ToastItem({
         <button
           type="button"
           aria-label="Dismiss"
-          onClick={() => onDone(id)}
-          className={`label-mono shrink-0 border-2 px-1.5 leading-[1.2] ${
+          onClick={() => setLeaving(true)}
+          className={`label-mono shrink-0 border-2 px-1.5 leading-[1.2] transition-colors duration-150 ease-out ${
             isError
               ? "border-paper text-paper hover:bg-paper hover:text-ink"
               : "border-ink hover:bg-ink hover:text-paper"

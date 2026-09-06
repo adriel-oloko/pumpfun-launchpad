@@ -664,7 +664,7 @@ export function Roster({ api }: { api: RosterApi }) {
             placement). The without-key skip banner lives in the trade
             panel directly below the managed-wallet tabs. */}
             {api.balancesStale ? (
-                <p className="label-mono text-[10px] opacity-60 mt-1">
+                <p className="reveal-up label-mono text-[10px] opacity-60 mt-1">
                     STALE — LAST-KNOWN-GOOD BALANCES (RPC UNREACHABLE)
                 </p>
             ) : null}
@@ -714,7 +714,7 @@ export function Roster({ api }: { api: RosterApi }) {
                     return (
                         <div
                             key={w.address}
-                            className="roster-row flex items-center gap-2 border-b border-ink/25 px-3 py-1.5 last:border-b-0">
+                            className="roster-row reveal-up flex items-center gap-2 border-b border-ink/25 px-3 py-1.5 last:border-b-0">
                             <div className="flex w-6 shrink-0 items-center">
                                 {isHub ? (
                                     <span
@@ -737,7 +737,11 @@ export function Roster({ api }: { api: RosterApi }) {
                             <button
                                 type="button"
                                 onClick={() => api.copyAddress(w.address)}
-                                className="label-mono min-w-0 flex-1 truncate text-left underline decoration-dotted opacity-80 hover:opacity-100"
+                                className={`label-mono min-w-0 flex-1 truncate text-left transition-colors duration-150 ease-out ${
+                                    copied
+                                        ? 'bg-ink text-paper no-underline'
+                                        : 'underline decoration-dotted opacity-80 hover:opacity-100'
+                                }`}
                                 title={w.address}>
                                 {copied ? 'COPIED' : shortAddress(w.address, 6)}
                             </button>
@@ -758,7 +762,7 @@ export function Roster({ api }: { api: RosterApi }) {
                                         type="button"
                                         title="Remove wallet"
                                         aria-label={`remove ${w.address}`}
-                                        className="p-0.5 text-[13px] leading-none opacity-60 hover:opacity-100"
+                                        className="p-0.5 text-[13px] leading-none opacity-60 transition-opacity duration-150 hover:opacity-100"
                                         onClick={() =>
                                             api.removeWallet(w.address)
                                         }>
@@ -769,7 +773,7 @@ export function Roster({ api }: { api: RosterApi }) {
                                     type="button"
                                     title="Copy private key"
                                     aria-label={`copy private key ${w.address}`}
-                                    className="p-0.5 opacity-60 hover:opacity-100"
+                                    className="p-0.5 opacity-60 transition-opacity duration-150 hover:opacity-100"
                                     onClick={() =>
                                         api.copyPrivateKey(w.address)
                                     }>

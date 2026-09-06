@@ -15,6 +15,17 @@
   --font-mono: "Courier New", Courier, monospace;
 }
 
+/* ---- motion tokens: strong ease-out for entrances, mechanical snap ---- */
+:root {
+  --ease-out: cubic-bezier(0.23, 1, 0.32, 1);
+  --ease-in-out: cubic-bezier(0.77, 0, 0.175, 1);
+  --dur-press: 110ms;
+  --dur-reveal: 160ms;
+  --dur-toast-in: 200ms;
+  --dur-toast-out: 150ms;
+  --dur-tab-in: 140ms;
+}
+
 html,
 body {
   background: var(--color-paper);
@@ -52,12 +63,25 @@ body {
   padding: 8px 12px;
   box-shadow: 0 3px 0 var(--color-ink);
   cursor: pointer;
-  transition: none;
+  /* motion: the plate settles into the press and the color crossfades;
+     only transform/box-shadow/colors, all ~110ms so it stays mechanical */
+  transition:
+    transform 110ms var(--ease-out),
+    box-shadow 110ms var(--ease-out),
+    background-color 120ms ease-out,
+    color 120ms ease-out;
   white-space: nowrap;
 }
-.btn-brutal:hover:not(:disabled) {
-  background: var(--color-paper);
-  color: var(--color-ink);
+.btn-brutal:focus-visible {
+  outline: 2px dashed var(--color-ink);
+  outline-offset: 2px;
+}
+/* hover only applies where a real pointer can hover (no sticky hover on touch) */
+@media (hover: hover) and (pointer: fine) {
+  .btn-brutal:hover:not(:disabled) {
+    background: var(--color-paper);
+    color: var(--color-ink);
+  }
 }
 .btn-brutal:active:not(:disabled) {
   transform: translate(2px, 2px);
@@ -77,9 +101,11 @@ body {
   background: var(--color-paper);
   color: var(--color-ink);
 }
-.btn-brutal-invert:hover:not(:disabled) {
-  background: var(--color-ink);
-  color: var(--color-paper);
+@media (hover: hover) and (pointer: fine) {
+  .btn-brutal-invert:hover:not(:disabled) {
+    background: var(--color-ink);
+    color: var(--color-paper);
+  }
 }
 /* pressed variant for toggle groups */
 .btn-brutal-pressed {
@@ -99,6 +125,7 @@ body {
   font-size: 14px;
   font-family: var(--font-sans);
   color: var(--color-ink);
+  transition: background-color 120ms ease-out;
 }
 .input-brutal:focus {
   outline: none;
@@ -200,6 +227,10 @@ body {
   border-width: 0 2px 2px 0;
   transform: rotate(45deg);
 }
+.checkbox-brutal:focus-visible {
+  outline: 2px dashed var(--color-ink);
+  outline-offset: 2px;
+}
 /* inverted face for checkboxes sitting on ink rows (table headers) */
 .checkbox-brutal-invert {
   border-color: var(--color-paper);
@@ -275,8 +306,11 @@ body {
 .tabs-lift > .tab:not(:first-child) {
   margin-left: -2px; /* collapse adjacent 2px borders to a single line */
 }
-.tabs-lift > .tab:hover:not(:has(input:checked)) {
-  background: rgba(16, 16, 16, 0.08);
+/* hover only applies where a real pointer can hover (no sticky hover on touch) */
+@media (hover: hover) and (pointer: fine) {
+  .tabs-lift > .tab:hover:not(:has(input:checked)) {
+    background: rgba(16, 16, 16, 0.08);
+  }
 }
 .tabs-lift > .tab:has(input:checked) {
   background: var(--color-ink);
@@ -298,11 +332,26 @@ body {
 }
 .tabs-lift > .tab:has(input:checked) + .tab-content {
   display: block;
+  /* content entrance: brief fade + 2px rise so the panel doesn't snap in;
+     display toggles from the radio, so the animation restarts per switch */
+  animation: tab-content-in var(--dur-tab-in) var(--ease-out);
+}
+@keyframes tab-content-in {
+  from {
+    opacity: 0;
+    transform: translateY(2px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
 }
 
 /* ---- managed-wallet roster rows: subtle dark tint on hover ---- */
-.roster-row:hover {
-  background: rgba(16, 16, 16, 0.06);
+@media (hover: hover) and (pointer: fine) {
+  .roster-row:hover {
+    background: rgba(16, 16, 16, 0.06);
+  }
 }
 
 /* ---- toast notifications: timer bar shrinks over the 3s display window ---- */
@@ -316,4 +365,96 @@ body {
 }
 .toast-timer {
   animation: toast-timer 3s linear forwards;
+}
+
+/* ---- toast enter/exit: slide from the right edge (the stack's home) ---- */
+.toast-item {
+  /* exit uses the same direction as enter: back out to the right */
+  transition:
+    opacity var(--dur-toast-out) ease-out,
+    transform var(--dur-toast-out) var(--ease-out);
+}
+.toast-item[data-leaving="true"] {
+  opacity: 0;
+  transform: translateX(16px);
+  /* an early dismiss must cancel the still-running entrance keyframes */
+  animation: none;
+}
+@keyframes toast-in {
+  from {
+    opacity: 0;
+    transform: translateX(16px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}
+.toast-item[data-entering="true"] {
+  animation: toast-in var(--dur-toast-in) var(--ease-out);
+}
+
+/* ---- modal (withdraw dialog): overlay fades, card rises from center ---- */
+.modal-overlay {
+  animation: modal-overlay-in 200ms ease-out;
+}
+.modal-card {
+  /* modals are centered, not trigger-anchored: keep transform-origin center */
+  animation: modal-card-in 200ms var(--ease-out);
+}
+@keyframes modal-overlay-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+@keyframes modal-card-in {
+  from {
+    opacity: 0;
+    transform: translateY(8px) scale(0.98);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+/* ---- reveal utility: newly-mounted feedback blocks fade + rise in ---- */
+@keyframes reveal-up {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+.reveal-up {
+  animation: reveal-up var(--dur-reveal) var(--ease-out);
+}
+
+/* ---- respect reduced motion: keep opacity/color fades, kill travel ---- */
+@media (prefers-reduced-motion: reduce) {
+  .btn-brutal,
+  .btn-brutal-invert,
+  .input-brutal {
+    transition: none;
+  }
+  .toast-item,
+  .toast-item[data-leaving="true"] {
+    transition: none;
+    animation: none;
+  }
+  .tabs-lift > .tab:has(input:checked) + .tab-content,
+  .reveal-up,
+  .modal-overlay,
+  .modal-card {
+    animation: none;
+  }
+  .toast-timer {
+    animation-duration: 3s;
+  }
 }

@@ -6,7 +6,9 @@
 // Form: token name / symbol / metadata URI (direct entry; see the
 // Arweave/IPFS decision comment below), the connected creator key (the
 // SAME wallet the masthead connects via pumpfun.creatorKey.v1), the
-// selected dev wallets with a per-wallet sol_in, and a Launch button that
+// selected dev wallets that each buy with ONE buyPct% of their OWN
+// spendable SOL balance (the creator only covers the create tx; wallets
+// must hold SOL — fund/disperse them first), and a Launch button that
 // drives lib/bundle:
 //
 //   Tier 1 (default): buildLaunchSequence + preflightLaunch +
@@ -117,7 +119,10 @@ import { shortAddress } from './roster'
 const EXPLORER = 'https://explorer.solana.com'
 /** Explorer cluster query: devnet links need ?cluster=devnet; mainnet none. */
 const EXPLORER_QS = solanaNetwork() === 'devnet' ? '?cluster=devnet' : ''
-const DEFAULT_SOL_IN = '0.01'
+/** Default % of each selected dev wallet's OWN spendable SOL balance spent on
+ *  the launch buy (mirrors the manual Buy tab's 95 default: leaves the
+ *  rent/fee/ATA reserves in place so a wallet can still sell later). */
+const DEFAULT_BUY_PCT = '95'
 /** Default Tier 2 relay tip (SOL) shown in the tip field: 0.001 SOL, the
  *  NextBlock / Astralane / bloXroute minimum and lib/fees default. */
 const DEFAULT_TIP_SOL = (
@@ -193,9 +198,11 @@ export function LaunchPanel({
     const [manualMetadata, setManualMetadata] = useState(false)
     const [advancedOpen, setAdvancedOpen] = useState(false)
     const [tier, setTier] = useState<'1' | '2'>('2')
-    const [fundFromCreator, setFundFromCreator] = useState(true)
     const [tipSol, setTipSol] = useState(DEFAULT_TIP_SOL)
-    const [solIns, setSolIns] = useState<Record<string, string>>({})
+    /** One % applied to every selected dev wallet's OWN spendable SOL
+     *  balance: the wallet spends this much on its launch buy. The creator
+     *  does NOT fund dev wallets (it only covers the create tx + fees). */
+    const [buyPct, setBuyPct] = useState(DEFAULT_BUY_PCT)
     const [busy, setBusy] = useState(false)
     const [statusLines, setStatusLines] = useState<string[]>([])
     const [launchError, setLaunchError] = useState<string | null>(null)
@@ -212,10 +219,6 @@ export function LaunchPanel({
 
     const clearLog = useCallback(() => setStatusLines([]), [])
 
-    const setSolIn = (addr: string, value: string) => {
-        setSolIns((prev) => ({ ...prev, [addr]: value }))
-    }
-
     const parseCreator = (): Keypair => {
         if (!creatorKey) {
             throw new Error(
@@ -229,14 +232,17 @@ export function LaunchPanel({
         return Keypair.fromSecretKey(bs58.decode(creatorKey))
     }
 
-    const parseSolIn = (raw: string | undefined): bigint => {
-        const n = Number(raw ?? '')
+    /** Parses the Buy % field into basis points (95 -> 9500). Mirrors the
+     *  manual Buy tab's parseManualPct: clamps to (0, 100]; blank/invalid/
+     *  non-positive input falls back to DEFAULT_BUY_PCT (95). The engine then
+     *  applies pctBps/10000 to each wallet's spendable balance. */
+    const parseBuyPct = (): number => {
+        const raw = buyPct.trim()
+        const n = raw === '' ? Number.NaN : Number(raw)
         if (!Number.isFinite(n) || n <= 0) {
-            throw new Error(
-                `sol_in must be a positive number, got "${raw ?? ''}"`
-            )
+            return Math.round(Number(DEFAULT_BUY_PCT) * 100)
         }
-        return BigInt(Math.round(n * LAMPORTS_PER_SOL))
+        return Math.round(Math.min(100, n) * 100)
     }
 
     /** Parses the Tier 2 relay tip field (SOL) into lamports. Empty falls
@@ -285,25 +291,16 @@ export function LaunchPanel({
             if (selectedWallets.length === 0) {
                 throw new Error('select at least one dev wallet in the roster')
             }
-
-            const buys: BuyAllocation[] = []
-            for (const w of selectedWallets) {
+            // Keyedness validated UP FRONT (before metadata is published on
+            // the backend): watch-only wallets cannot sign buys.
+            const walletKps = selectedWallets.map((w) => {
                 if (!w.key) {
                     throw new Error(
                         `wallet ${shortAddress(w.address, 6)} has no key (watch-only wallets cannot sign buys)`
                     )
                 }
-                const rawSolIn = solIns[w.address]
-                const solIn = parseSolIn(
-                    rawSolIn === undefined || rawSolIn.trim() === ''
-                        ? DEFAULT_SOL_IN
-                        : rawSolIn
-                )
-                buys.push({
-                    wallet: Keypair.fromSecretKey(bs58.decode(w.key)),
-                    solInLamports: solIn,
-                })
-            }
+                return { w, kp: Keypair.fromSecretKey(bs58.decode(w.key)) }
+            })
 
             // M9 metadata: resolve the final on-chain uri BEFORE anything
             // hits the chain. Auto mode publishes the structured fields
@@ -361,89 +358,105 @@ export function LaunchPanel({
                     `uri too long (${Buffer.byteLength(finalUri, 'utf8')} > 200 bytes)`
                 )
 
+            const connection = makeAppConnection()
             log(`=== pumpfun launch (tier ${tier}) ===`)
             log(`creator : ${creator.publicKey.toBase58()}`)
             log(`name/sym: ${name} / ${symbol}`)
             log(`uri     : ${finalUri}`)
-            for (const b of buys) {
-                log(
-                    `  dev ${b.wallet.publicKey.toBase58().slice(0, 12)}... buys ${(Number(b.solInLamports) / LAMPORTS_PER_SOL).toFixed(4)} SOL`
-                )
-            }
-            const connection = makeAppConnection()
             log(
                 `program : pump.fun native (6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P)`
             )
             log(
                 `migrate : automatic (pump.fun migrates to PumpSwap on graduation; create args = name/symbol/uri only)`
             )
-            // Funding math mirrors scripts/launch-bundle.mjs: each wallet needs
-            // sol_in + ATA rent + the rent-exempt floor it must retain post-buy.
+            // Buy sizing: ONE buyPct% applies to every selected dev wallet's
+            // OWN spendable SOL balance — the creator NO LONGER funds dev
+            // wallets (it only covers the create tx + fees). The spendable
+            // base mirrors the manual Buy tab's formula (lib/batch-trade):
+            // live balance minus the rent-exempt floor + fee margin each
+            // wallet must retain post-buy (postBuyFloorLamports) and the
+            // Token-2022 ATA rent. The ATA for the FRESH mint never exists
+            // yet, so its rent is always reserved (the buy ix pair creates
+            // the ATA from the wallet's own lamports).
+            const pctBps = parseBuyPct()
             const ataRent = await ataRentLamports(connection)
-            const fundLamportsPerWallet = fundFromCreator
-                ? buys.map(
-                      (b) =>
-                          b.solInLamports +
-                          BigInt(ataRent) +
-                          postBuyFloorLamports()
-                  )
-                : null
-            if (fundLamportsPerWallet) {
-                const totalFund = fundLamportsPerWallet.reduce(
-                    (a, b) => a + b,
-                    BigInt(0)
+            const reserveLamports = postBuyFloorLamports() + BigInt(ataRent)
+            const buys: BuyAllocation[] = []
+            for (const { w, kp } of walletKps) {
+                const live = BigInt(
+                    await connection.getBalance(kp.publicKey, 'confirmed')
                 )
-                const creatorBal = await connection.getBalance(
-                    creator.publicKey,
-                    'confirmed'
-                )
-                // The pump.fun `create_v2` instruction makes the creator fund
-                // the accounts it allocates, all rent-exempt:
-                //   - Token-2022 mint (~400-570B; metadata lives IN-MINT via the
-                //     Token-2022 metadata extension, growing with the
-                //     name/symbol/uri length — there is NO Metaplex account)
-                //   - bonding curve (151B on live create_v2 tokens)
-                //   - bonding-curve ATA (Token-2022 token account = 170B)
-                //   - mayhem_state + mayhem_token_vault: created then CLOSED
-                //     for non-mayhem tokens (net zero, but the creator must
-                //     cover their rent mid-tx) — reserved as a flat buffer
-                // The creator must also retain its own native rent-exempt
-                // floor after the create and pay the tx fee. Sum the rent
-                // minimums + the ephemeral-mayhem buffer + floor + fee.
-                const mintSize =
-                    340 +
-                    Buffer.byteLength(name, 'utf8') +
-                    Buffer.byteLength(symbol, 'utf8') +
-                    Buffer.byteLength(finalUri, 'utf8')
-                const createRent =
-                    BigInt(
-                        await connection.getMinimumBalanceForRentExemption(
-                            mintSize
-                        )
-                    ) + // Token-2022 mint
-                    BigInt(
-                        await connection.getMinimumBalanceForRentExemption(151)
-                    ) + // bonding curve
-                    BigInt(
-                        await connection.getMinimumBalanceForRentExemption(170)
-                    ) + // Token-2022 ATA
-                    BigInt(
-                        await connection.getMinimumBalanceForRentExemption(340)
-                    ) + // mayhem_state (ephemeral)
-                    BigInt(
-                        await connection.getMinimumBalanceForRentExemption(170)
-                    ) // mayhem_token_vault (ephemeral)
-                const createMargin =
-                    createRent + postBuyFloorLamports() + BigInt(30_000)
-                const needed = totalFund + createMargin
-                log(
-                    `fund    : ${(Number(totalFund) / LAMPORTS_PER_SOL).toFixed(4)} SOL from creator (sol_in + ata rent + floor)`
-                )
-                if (creatorBal < needed) {
+                const spendable = live - reserveLamports
+                if (spendable <= BigInt(0)) {
                     throw new Error(
-                        `creator balance ${(Number(creatorBal) / LAMPORTS_PER_SOL).toFixed(4)} SOL too low; need >= ${(Number(needed) / LAMPORTS_PER_SOL).toFixed(4)} SOL (funding + create margin).`
+                        `dev wallet ${shortAddress(w.address, 6)} has no spendable SOL: balance ${(Number(live) / LAMPORTS_PER_SOL).toFixed(4)} SOL is below the ${(Number(reserveLamports) / LAMPORTS_PER_SOL).toFixed(4)} SOL launch reserve (rent floor + fee margin + ATA rent). Fund/disperse SOL to the selected dev wallets before launching.`
                     )
                 }
+                const solIn = (spendable * BigInt(pctBps)) / BigInt(10_000)
+                if (solIn <= BigInt(0)) {
+                    throw new Error(
+                        `dev wallet ${shortAddress(w.address, 6)}: ${pctBps / 100}% of ${(Number(spendable) / LAMPORTS_PER_SOL).toFixed(4)} SOL spendable rounds to 0 SOL. Raise the buy % or fund the wallet.`
+                    )
+                }
+                buys.push({ wallet: kp, solInLamports: solIn })
+                log(
+                    `  dev ${kp.publicKey.toBase58().slice(0, 12)}... balance ${(Number(live) / LAMPORTS_PER_SOL).toFixed(4)} SOL -> buys ${(Number(solIn) / LAMPORTS_PER_SOL).toFixed(4)} SOL (${pctBps / 100}% of ${(Number(spendable) / LAMPORTS_PER_SOL).toFixed(4)} SOL spendable)`
+                )
+            }
+
+            // The creator funds ONLY the create tx. The pump.fun `create_v2`
+            // instruction makes the creator fund the accounts it allocates,
+            // all rent-exempt:
+            //   - Token-2022 mint (~400-570B; metadata lives IN-MINT via the
+            //     Token-2022 metadata extension, growing with the
+            //     name/symbol/uri length — there is NO Metaplex account)
+            //   - bonding curve (151B on live create_v2 tokens)
+            //   - bonding-curve ATA (Token-2022 token account = 170B)
+            //   - mayhem_state + mayhem_token_vault: created then CLOSED
+            //     for non-mayhem tokens (net zero, but the creator must
+            //     cover their rent mid-tx) — reserved as a flat buffer
+            // The creator is ALSO the fee payer on the create tx and every
+            // packed buy tx (each dev wallet keeps its own balance for the
+            // buy and pays no tx fee at launch), so the margin includes the
+            // base fee for the create + up to one base fee per buy wallet.
+            const mintSize =
+                340 +
+                Buffer.byteLength(name, 'utf8') +
+                Buffer.byteLength(symbol, 'utf8') +
+                Buffer.byteLength(finalUri, 'utf8')
+            const createRent =
+                BigInt(
+                    await connection.getMinimumBalanceForRentExemption(
+                        mintSize
+                    )
+                ) + // Token-2022 mint
+                BigInt(
+                    await connection.getMinimumBalanceForRentExemption(151)
+                ) + // bonding curve
+                BigInt(
+                    await connection.getMinimumBalanceForRentExemption(170)
+                ) + // Token-2022 ATA
+                BigInt(
+                    await connection.getMinimumBalanceForRentExemption(340)
+                ) + // mayhem_state (ephemeral)
+                BigInt(
+                    await connection.getMinimumBalanceForRentExemption(170)
+                ) // mayhem_token_vault (ephemeral)
+            const createMargin =
+                createRent +
+                postBuyFloorLamports() +
+                BigInt(30_000 + 5_000 * buys.length)
+            const creatorBal = await connection.getBalance(
+                creator.publicKey,
+                'confirmed'
+            )
+            log(
+                `fund    : dev wallets spend their OWN SOL; creator covers the create tx only (needs >= ${(Number(createMargin) / LAMPORTS_PER_SOL).toFixed(4)} SOL)`
+            )
+            if (creatorBal < createMargin) {
+                throw new Error(
+                    `creator balance ${(Number(creatorBal) / LAMPORTS_PER_SOL).toFixed(4)} SOL too low; need >= ${(Number(createMargin) / LAMPORTS_PER_SOL).toFixed(4)} SOL for the create tx (rent + floor + fees). Dev wallets are NOT funded from the creator anymore: fund/disperse them first.`
+                )
             }
 
             const seq = await buildLaunchSequence({
@@ -453,7 +466,9 @@ export function LaunchPanel({
                 symbol,
                 uri: finalUri,
                 buys,
-                fundLamportsPerWallet,
+                // No creator -> wallet funding txs: every dev wallet buys from
+                // its OWN pre-funded balance (the buildLaunchSequence default
+                // fundLamportsPerWallet = null emits no fund tx).
                 // Tier 1 has no bundle tip, so the full 1222-byte budget is
                 // available. Tier 2 keeps the default 1150 + 90 tip reserve.
                 // Measured (M10): pump.fun buy ixs pack 2 wallets per tx max.
@@ -994,7 +1009,7 @@ export function LaunchPanel({
                             </span>
                         </div>
                         {manualMetadata ? (
-                            <div className="mt-3">
+                            <div className="reveal-up mt-3">
                                 <Field label="Metadata URI">
                                     <Input
                                         value={uri}
@@ -1005,7 +1020,7 @@ export function LaunchPanel({
                                 </Field>
                             </div>
                         ) : (
-                            <div className="mt-3 grid gap-3 md:grid-cols-2">
+                            <div className="reveal-up mt-3 grid gap-3 md:grid-cols-2">
                                 <div className="md:col-span-2">
                                     <Field label="Description">
                                         <textarea
@@ -1081,28 +1096,10 @@ export function LaunchPanel({
                         )}
                     </div>
 
-                    {/* M10: pump.fun auto-migrates on graduation (the old M3
-                    custom-program toggles are gone; the create args are ONLY
-                    name/symbol/uri) + funding 
-                    <div className="lg:col-span-4">
-                        <div className="flex flex-wrap items-center gap-4 border-2 border-ink px-3 py-2">
-                            
-                            <label className="label-mono flex items-center gap-2 cursor-pointer opacity-80 ml-auto">
-                                <input
-                                    type="checkbox"
-                                    className="checkbox-brutal"
-                                    checked={fundFromCreator}
-                                    onChange={(e) =>
-                                        setFundFromCreator(e.target.checked)
-                                    }
-                                />
-                                fund wallets from creator
-                            </label>
-                        </div>
-                    </div>
-                    */}
-
-                    {/* per-wallet sol_in for the selected dev wallets */}
+                    {/* Buy sizing for the selected dev wallets: ONE buyPct%
+                    applies to every wallet's OWN spendable SOL balance (see
+                    the launch handler). The creator does NOT fund dev
+                    wallets anymore — fund/disperse them first. */}
                     <div className="lg:col-span-4">
                         <div className="flex items-center gap-3">
                             <span className="label-mono opacity-70">
@@ -1112,26 +1109,28 @@ export function LaunchPanel({
                                 {selectedWallets.length} selected
                             </span>
                         </div>
-                    </div>
-                    <div className="min-w-full grid md:grid-cols-2 lg:grid-cols-3 gap-4">
-                        {selectedWallets.map((w) => (
+                        <div className="reveal-up mt-3 flex flex-wrap items-end gap-x-6 gap-y-3">
                             <Field
-                                key={w.address}
-                                label={shortAddress(w.address, 6)}
-                                aside={w.key ? undefined : 'NO KEY'}>
+                                label="Buy % of balance"
+                                aside="per wallet · spendable SOL">
                                 <Input
                                     type="number"
-                                    min={0}
-                                    step={0.001}
-                                    value={solIns[w.address] ?? DEFAULT_SOL_IN}
-                                    onChange={(e) =>
-                                        setSolIn(w.address, e.target.value)
-                                    }
-                                    className="font-mono text-[12px]"
-                                    aria-label={`sol_in for ${shortAddress(w.address, 6)}`}
+                                    min={1}
+                                    max={100}
+                                    step={1}
+                                    value={buyPct}
+                                    onChange={(e) => setBuyPct(e.target.value)}
+                                    className="w-28 font-mono text-[12px]"
+                                    aria-label="Percent of each selected dev wallet's spendable SOL balance to spend on the launch buy"
                                 />
                             </Field>
-                        ))}
+                            <p className="label-mono !text-[10px] opacity-50 max-w-[300px] leading-relaxed">
+                                each wallet buys this % of its OWN balance
+                                (balance − rent floor − fee margin − ATA rent).
+                                creator covers only the create tx. fund or
+                                disperse the wallets first.
+                            </p>
+                        </div>
                     </div>
                 </Collapse>
 
@@ -1211,9 +1210,7 @@ export function LaunchPanel({
                             tone="idle"
                         />
                     ) : null}
-                    {sellReport ? (
-                        <SellAllReportView report={sellReport} />
-                    ) : null}
+                    
                 </div>
 
                 {/* status log (preserved from M4) */}
@@ -1240,7 +1237,7 @@ function SellAllReportView({ report }: { report: SellAllReport }) {
             ? `ROUTE: CURVE SELL (NOT GRADUATED) · creator ${shortAddress(report.creator, 6)}`
             : `ROUTE: PUMSWAP SELL (GRADUATED) · pool ${shortAddress(report.poolKey ?? '', 6)}`
     return (
-        <div className="flex flex-col gap-1 border-2 border-ink px-2 py-1.5">
+        <div className="reveal-up flex flex-col gap-1 border-2 border-ink px-2 py-1.5">
             <p className="label-mono !text-[10px] font-bold break-all">
                 {routeLabel}
             </p>

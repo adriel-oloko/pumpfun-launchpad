@@ -53,7 +53,7 @@ export function Masthead() {
                   Connect Key
                 </Btn>
                 {pkOpen ? (
-                  <div className="flex flex-wrap items-center gap-2 w-full">
+                  <div className="reveal-up flex flex-wrap items-center gap-2 w-full">
                     <Input
                       type="password"
                       autoComplete="off"
@@ -77,7 +77,7 @@ export function Masthead() {
                   </div>
                 ) : null}
                 {pkError ? (
-                  <span className="label-mono text-[10px] font-bold">
+                  <span className="reveal-up label-mono text-[10px] font-bold">
                     {pkError}
                   </span>
                 ) : null}
