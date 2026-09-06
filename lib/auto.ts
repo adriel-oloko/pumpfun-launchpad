@@ -60,9 +60,9 @@ import {
 } from "@solana/web3.js";
 import {
   RENT_EXEMPT_FLOOR,
-  sendAndConfirmWithRetry,
   walletTokenBalance,
 } from "./bundle/launch";
+import { makeProtectedSender, protectedTipReserve } from "./bundle/protected-send";
 import {
   buildPumpBuyIx,
   buildPumpSellIx,
@@ -391,6 +391,8 @@ export async function fireAutoBuy(
   // Live protocol fee recipient (pump.fun rotates it; a stale value reverts
   // every buy with Custom 6000). One read for the whole round.
   const feeRecipient = await resolvePumpFeeRecipient(connection);
+  // Jito-protected sender on mainnet (plain RPC on devnet), one per round.
+  const send = await makeProtectedSender();
 
   // Chain the round's quotes across the simulated reserves: wallet i quotes
   // the state wallets 0..i-1 leave behind (their fills land within the
@@ -420,6 +422,7 @@ export async function fireAutoBuy(
         live -
         BigInt(RENT_EXEMPT_FLOOR) -
         AUTO_TX_FEE_RESERVE_LAMPORTS -
+        BigInt(protectedTipReserve()) -
         reserveAta;
       if (spendable <= BigInt(0)) return "skipped";
       const solIn = (spendable * BigInt(pctNum)) / BigInt(10_000);
@@ -449,7 +452,7 @@ export async function fireAutoBuy(
       // blockhash expires (an expired tx can never land, so re-sending is
       // safe). Confirm timeouts surface as failures (the tx may still land),
       // they are never silently re-fired, which could double a buy.
-      await sendAndConfirmWithRetry(connection, tx, [kp], {
+      await send(connection, tx, [kp], {
         attempts: 2,
         confirmTimeoutMs: AUTO_CONFIRM_TIMEOUT_MS,
         label: "auto buy",
@@ -502,6 +505,8 @@ export async function fireAutoSell(
   // Live protocol fee recipient (pump.fun rotates it; a stale value reverts
   // every sell with Custom 6000). One read for the whole round.
   const feeRecipient = await resolvePumpFeeRecipient(connection);
+  // Jito-protected sender on mainnet (plain RPC on devnet), one per round.
+  const send = await makeProtectedSender();
 
   // Chain the round's min_sol_output quotes across the simulated reserves.
   let vsr = curve.solReserve;
@@ -541,7 +546,7 @@ export async function fireAutoSell(
       });
       tx.add(...ixs);
       // M7a: expiry-safe send + confirm, same semantics as the buy worker.
-      await sendAndConfirmWithRetry(connection, tx, [kp], {
+      await send(connection, tx, [kp], {
         attempts: 2,
         confirmTimeoutMs: AUTO_CONFIRM_TIMEOUT_MS,
         label: "auto sell",

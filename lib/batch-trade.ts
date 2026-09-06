@@ -21,20 +21,15 @@
 // lib/auto.ts's buildAutoBuyIx / buildAutoSellIx (lib/pump.ts hand-built
 // pump.fun ixs: buy/sell take tokens_out/tokens_in quoted client-side with
 // slippage; the curve's creator feeds the creator_vault fee leg) and sends
-// go through lib/bundle/launch.ts's sendAndConfirmWithRetry (expiry-safe
-// re-sends only, never a blind double-fire).
+// go through lib/bundle/protected-send.ts's makeProtectedSender: on MAINNET
+// each trade is a 1-tx Jito bundle (tip attached, hidden from the public
+// mempool) so the whole batch is front-running-protected; on devnet it
+// falls back to sendAndConfirmWithRetry (expiry-safe re-sends only, never a
+// blind double-fire).
 //
 // The curve state (creator + VIRTUAL reserves) is read by the CALLER before
 // this module runs (the trade panel's round gate) and passed in, so both
 // the gate and the batch quote against the same snapshot.
-//
-// Step 2 of the M8A spec (the optional mainnet atomic Jito-bundle path) is
-// deliberately NOT implemented here. The UI now follows the app network
-// (lib/network.ts: NEXT_PUBLIC_SOLANA_NETWORK, default devnet, where the
-// block engine is dead), and the concurrent per-wallet tx path below is the
-// honest, network-agnostic implementation; a mainnet Jito-bundle assembly
-// would slot in behind submitBundleViaFanoutWithRetry for 1..5 selected
-// wallets. TODO (M8A step 2): add that bundle path for mainnet.
 //
 // All amounts are bigint (no bigint literals, project target is ES2017);
 // every tx is signed manually with the wallet's Keypair (anchor Wallet is
@@ -53,9 +48,13 @@ import {
 } from "./auto";
 import {
   RENT_EXEMPT_FLOOR,
-  sendAndConfirmWithRetry,
   walletTokenBalance,
 } from "./bundle/launch";
+import {
+  makeProtectedSender,
+  protectedTipReserve,
+  type SendTx,
+} from "./bundle/protected-send";
 import { resolvePumpFeeRecipient } from "./pump";
 
 /** Final outcome of one manual batch trade (the v4 batch pattern). */
@@ -128,7 +127,10 @@ async function buyOne(
   latest: { blockhash: string; lastValidBlockHeight: number },
   /** Live protocol fee recipient (resolvePumpFeeRecipient), resolved once
    *  per batch. */
-  feeRecipient: PublicKey
+  feeRecipient: PublicKey,
+  /** Send + confirm fn (Jito-protected on mainnet, plain RPC on devnet),
+   *  resolved once per batch by makeProtectedSender. */
+  send: SendTx
 ): Promise<string | null> {
   const kp = Keypair.fromSecretKey(bs58.decode(wallet.key));
   const live = BigInt(await connection.getBalance(kp.publicKey, "confirmed"));
@@ -144,6 +146,7 @@ async function buyOne(
     live -
     BigInt(RENT_EXEMPT_FLOOR) -
     AUTO_TX_FEE_RESERVE_LAMPORTS -
+    BigInt(protectedTipReserve()) -
     reserveAta;
   if (spendable <= BigInt(0)) return null;
   const solIn = (spendable * BigInt(pctNum(pct))) / BigInt(10_000);
@@ -164,7 +167,7 @@ async function buyOne(
     lastValidBlockHeight: latest.lastValidBlockHeight,
   });
   tx.add(...ixs);
-  const { signature } = await sendAndConfirmWithRetry(connection, tx, [kp], {
+  const { signature } = await send(connection, tx, [kp], {
     attempts: 2,
     confirmTimeoutMs: AUTO_CONFIRM_TIMEOUT_MS,
     label: "manual buy",
@@ -185,7 +188,10 @@ async function sellOne(
   latest: { blockhash: string; lastValidBlockHeight: number },
   /** Live protocol fee recipient (resolvePumpFeeRecipient), resolved once
    *  per batch. */
-  feeRecipient: PublicKey
+  feeRecipient: PublicKey,
+  /** Send + confirm fn (Jito-protected on mainnet, plain RPC on devnet),
+   *  resolved once per batch by makeProtectedSender. */
+  send: SendTx
 ): Promise<string | null> {
   const kp = Keypair.fromSecretKey(bs58.decode(wallet.key));
   const balance = await walletTokenBalance(connection, kp.publicKey, mint);
@@ -208,7 +214,7 @@ async function sellOne(
     lastValidBlockHeight: latest.lastValidBlockHeight,
   });
   tx.add(...ixs);
-  const { signature } = await sendAndConfirmWithRetry(connection, tx, [kp], {
+  const { signature } = await send(connection, tx, [kp], {
     attempts: 2,
     confirmTimeoutMs: AUTO_CONFIRM_TIMEOUT_MS,
     label: "manual sell",
@@ -259,9 +265,21 @@ export async function buySelectedWallets(
   const latest = await connection.getLatestBlockhash("confirmed");
   // Live protocol fee recipient (pump.fun rotates it; stale -> Custom 6000).
   const feeRecipient = await resolvePumpFeeRecipient(connection);
+  // Jito-protected sender on mainnet (plain RPC on devnet), one per batch.
+  const send = await makeProtectedSender();
   const settled = await Promise.allSettled(
     wallets.map((w) =>
-      buyOne(connection, mint, curve, w, buyPct, ataRent, latest, feeRecipient)
+      buyOne(
+        connection,
+        mint,
+        curve,
+        w,
+        buyPct,
+        ataRent,
+        latest,
+        feeRecipient,
+        send
+      )
     )
   );
   return tally(settled);
@@ -285,9 +303,11 @@ export async function sellSelectedWallets(
   const latest = await connection.getLatestBlockhash("confirmed");
   // Live protocol fee recipient (pump.fun rotates it; stale -> Custom 6000).
   const feeRecipient = await resolvePumpFeeRecipient(connection);
+  // Jito-protected sender on mainnet (plain RPC on devnet), one per batch.
+  const send = await makeProtectedSender();
   const settled = await Promise.allSettled(
     wallets.map((w) =>
-      sellOne(connection, mint, curve, w, sellPct, latest, feeRecipient)
+      sellOne(connection, mint, curve, w, sellPct, latest, feeRecipient, send)
     )
   );
   return tally(settled);
