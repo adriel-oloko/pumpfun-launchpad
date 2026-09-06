@@ -188,7 +188,7 @@ function mockFetch(
 const MOCK_OVERRIDES = {
   nextblock: {
     id: "nextblock" as const,
-    url: "https://mock-nextblock.local/api/v2/submit-batch",
+    url: "https://mock-nextblock.local",
     authHeaderValue: "mock-nb-key",
     authHeaderName: "authorization",
   },
@@ -383,7 +383,7 @@ describe("pumpfun (Tier 2: NextBlock primary + Astralane/bloXroute fallback)", (
     const nb = buildRelayRequest("nextblock", TXS, {
       nextblock: {
         id: "nextblock",
-        url: "https://ny.nextblock.io/api/v2/submit-batch",
+        url: "https://ny.nextblock.io",
         authHeaderValue: "nb-key",
         authHeaderName: "authorization",
       },

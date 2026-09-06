@@ -94,12 +94,12 @@ export const ASTRALANE_EDGE_URL = "https://edge.astralane.io/iris";
 export const BLOXROUTE_SOLANA_URL =
   "https://ny.solana.dex.blxrbdn.com/api/v2/submit-batch";
 
-/** NextBlock submit-batch endpoint (the atomic bundle path, 2-4 txs). The
- *  Authorization API key rides as a header; ny is the default region and
- *  other region hosts (frankfurt/amsterdam/london/singapore/tokyo/slc/
- *  dublin/vilnius.nextblock.io) share /api/v2/submit-batch. */
-export const NEXTBLOCK_SUBMIT_BATCH_URL =
-  "https://ny.nextblock.io/api/v2/submit-batch";
+/** NextBlock base host (region). The submit-batch endpoint is
+ *  `${base}/api/v2/submit-batch`; the Authorization API key rides as a
+ *  header. ny is the default region; other region hosts (frankfurt /
+ *  amsterdam / london / singapore / tokyo / slc / dublin / vilnius
+ *  .nextblock.io) share the same path. */
+export const NEXTBLOCK_BASE_URL = "https://ny.nextblock.io";
 
 /** Per-relay bundle caps (tx count). The ACTIVE Tier 2 relays (NextBlock,
  *  Astralane, bloXroute) cap bundles at 4 txs; Jito (legacy) allows 5.
@@ -251,7 +251,7 @@ export function resolveRelayEndpointsFromEnv(): {
   if (nextblockKey) {
     overrides.nextblock = {
       id: "nextblock",
-      url: env.NEXTBLOCK_URL ?? NEXTBLOCK_SUBMIT_BATCH_URL,
+      url: env.NEXTBLOCK_URL ?? NEXTBLOCK_BASE_URL,
       // NextBlock authenticates with a single API key in the Authorization
       // (docs use the lowercase `authorization`) header.
       authHeaderValue: nextblockKey,
@@ -513,7 +513,8 @@ export function buildRelayRequest(
     }
     case "nextblock": {
       const ov = overrides?.nextblock;
-      const url = ov?.url ?? NEXTBLOCK_SUBMIT_BATCH_URL;
+      const base = (ov?.url ?? NEXTBLOCK_BASE_URL).replace(/\/+$/, "");
+      const url = `${base}/api/v2/submit-batch`;
       const headers: Record<string, string> = {
         "Content-Type": "application/json",
       };
