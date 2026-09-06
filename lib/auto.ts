@@ -62,7 +62,7 @@ import {
   RENT_EXEMPT_FLOOR,
   walletTokenBalance,
 } from "./bundle/launch";
-import { makeProtectedSender, protectedTipReserve } from "./bundle/protected-send";
+import { makeProtectedSender, protectedReserveLamports } from "./bundle/protected-send";
 import {
   buildPumpBuyIx,
   buildPumpSellIx,
@@ -422,7 +422,7 @@ export async function fireAutoBuy(
         live -
         BigInt(RENT_EXEMPT_FLOOR) -
         AUTO_TX_FEE_RESERVE_LAMPORTS -
-        BigInt(protectedTipReserve()) -
+        BigInt(protectedReserveLamports()) -
         reserveAta;
       if (spendable <= BigInt(0)) return "skipped";
       const solIn = (spendable * BigInt(pctNum)) / BigInt(10_000);

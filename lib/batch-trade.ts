@@ -22,10 +22,10 @@
 // pump.fun ixs: buy/sell take tokens_out/tokens_in quoted client-side with
 // slippage; the curve's creator feeds the creator_vault fee leg) and sends
 // go through lib/bundle/protected-send.ts's makeProtectedSender: on MAINNET
-// each trade is a 1-tx Jito bundle (tip attached, hidden from the public
-// mempool) so the whole batch is front-running-protected; on devnet it
-// falls back to sendAndConfirmWithRetry (expiry-safe re-sends only, never a
-// blind double-fire).
+// each trade is submitted to Helius Sender Max (sender.helius-rpc.com/fast,
+// priority fee + tip, mev-protect) so the whole batch is front-running-
+// protected; on devnet it falls back to sendAndConfirmWithRetry (expiry-safe
+// re-sends only, never a blind double-fire).
 //
 // The curve state (creator + VIRTUAL reserves) is read by the CALLER before
 // this module runs (the trade panel's round gate) and passed in, so both
@@ -52,7 +52,7 @@ import {
 } from "./bundle/launch";
 import {
   makeProtectedSender,
-  protectedTipReserve,
+  protectedReserveLamports,
   type SendTx,
 } from "./bundle/protected-send";
 import { resolvePumpFeeRecipient } from "./pump";
@@ -146,7 +146,7 @@ async function buyOne(
     live -
     BigInt(RENT_EXEMPT_FLOOR) -
     AUTO_TX_FEE_RESERVE_LAMPORTS -
-    BigInt(protectedTipReserve()) -
+    BigInt(protectedReserveLamports()) -
     reserveAta;
   if (spendable <= BigInt(0)) return null;
   const solIn = (spendable * BigInt(pctNum(pct))) / BigInt(10_000);
