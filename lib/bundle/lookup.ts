@@ -134,3 +134,25 @@ export async function ensurePumpLookupTable(
   if (!value) throw new Error("lookup table missing after creation");
   return { account: value, address };
 }
+
+/** Builds an in-memory (NOT on-chain) ALT carrying the pump.fun constant
+ *  accounts. Used to measure the size of a single-tx launch WITHOUT paying to
+ *  create a real ALT (dry-run / tests). The address is a throwaway keypair
+ *  pubkey; only the `addresses` list matters for size measurement. */
+export function syntheticPumpLookupTable(
+  feeRecipient: PublicKey,
+  authority: PublicKey
+): AddressLookupTableAccount {
+  return new AddressLookupTableAccount({
+    key: Keypair.generate().publicKey,
+    state: {
+      // u64::MAX = "never deactivated" (active table). Only the `addresses`
+      // list matters for size measurement; the slot is a placeholder.
+      deactivationSlot: BigInt("18446744073709551615"),
+      authority,
+      lastExtendedSlot: 0,
+      lastExtendedSlotStartIndex: 0,
+      addresses: pumpLookupAccounts(feeRecipient),
+    },
+  });
+}

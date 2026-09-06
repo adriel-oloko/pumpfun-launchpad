@@ -31,3 +31,4 @@ export * from "./jito";
 export * from "./lookup";
 export * from "./relays";
 export * from "./fanout-submit";
+export * from "./single-tx";
