@@ -108,6 +108,10 @@ export interface RosterApi {
     handleRandom: () => void
     toggleAll: () => void
     toggleBatchFrom: (addr: string) => void
+    /** Single-wallet deselection (launch-panel pill x): removes exactly one
+     *  checked wallet, regardless of the roster's batch size. No-op when
+     *  the wallet is not checked. */
+    uncheckWallet: (addr: string) => void
     /** Imperative selection setter: the M5 auto engine flashes each round's
      *  picked wallets here (set exact set), and its deselect timer clears it
      *  ~5s later. Only the engine writes whole sets; row clicks stay batch. */
@@ -519,6 +523,19 @@ export function useRoster(): RosterApi {
         })
     }
 
+    /** Single-wallet deselection (launch-panel pill x): removes exactly one
+     *  checked wallet, regardless of the roster's batch size (toggleBatchFrom
+     *  would drop a whole anchored batch when batchSize > 1). No-op when the
+     *  wallet is not checked. */
+    const uncheckWallet = (addr: string) => {
+        setChecked((prev) => {
+            if (!prev.has(addr)) return prev
+            const next = new Set(prev)
+            next.delete(addr)
+            return next
+        })
+    }
+
     const copyAddress = (addr: string) => {
         navigator.clipboard
             .writeText(addr)
@@ -631,6 +648,7 @@ export function useRoster(): RosterApi {
         handleRandom,
         toggleAll,
         toggleBatchFrom,
+        uncheckWallet,
         setCheckedWallets,
         copyAddress,
         removeWallet,

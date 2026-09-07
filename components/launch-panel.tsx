@@ -1263,10 +1263,50 @@ export function LaunchPanel({
 								{selectedWallets.length} selected
 							</span>
 						</div>
-						<div className="reveal-up mt-3 flex flex-wrap items-end gap-x-6 gap-y-3">
-							<span className="label-mono opacity-80">
-								buy: MAX (full spendable SOL per wallet, under 10% slippage)
-							</span>
+						{/* Selected dev wallets as pills: each commits MAX (its full
+                        spendable SOL under the 10% slippage band) at launch.
+                        The x on a pill's right DESELECTS it (checked-set only:
+                        the wallet stays in the roster; watch-only wallets get
+                        a dimmed WATCH tag and cannot sign launch buys). */}
+						<div className="reveal-up mt-3 flex flex-wrap items-center gap-2">
+							{selectedWallets.length === 0 ? (
+								<span className="label-mono opacity-50">
+									none selected — check dev wallets in the roster
+								</span>
+							) : (
+								selectedWallets.map((w) => (
+									<span
+										key={w.address}
+										title={
+											w.key
+												? "MAX buy: full spendable SOL under the 10% slippage band"
+												: "WATCH-ONLY: no secret key, cannot sign launch buys"
+										}
+										className="label-mono inline-flex items-center gap-1.5 border-2 border-ink bg-paper px-2 py-0.5 text-[11px]">
+										<span
+											className={
+												w.key ? "" : "opacity-60"
+											}>
+											{shortAddress(w.address, 6)}
+										</span>
+										{!w.key ? (
+											<span className="opacity-40">
+												WATCH
+											</span>
+										) : null}
+										<button
+											type="button"
+											onClick={() =>
+												roster.uncheckWallet(w.address)
+											}
+											title="deselect: removes this wallet from the launch buys"
+											aria-label={`deselect ${w.address}`}
+											className="-mr-0.5 p-0.5 leading-none opacity-60 transition-colors duration-150 hover:bg-ink hover:text-paper hover:opacity-100">
+											×
+										</button>
+									</span>
+								))
+							)}
 						</div>
 					</div>
 				</Collapse>
