@@ -37,7 +37,7 @@ test = "./node_modules/.bin/ts-mocha -p ./tsconfig.test.json -t 1000000 \"tests/
 # (ProgramCacheHitMaxLimit). global_config is the AMM's own data account and
 # must exist for createPool to deserialize it.
 [test.validator]
-url = "https://jemima-hw0ue1-fast-mainnet.helius-rpc.com"
+url = "https://mainnet.helius-rpc.com/?api-key=03a5d09b-993b-417b-b2d0-a43581cbce7e"
 
 [[test.validator.clone]]
 address = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
