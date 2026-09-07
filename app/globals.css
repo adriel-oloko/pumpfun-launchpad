@@ -130,6 +130,7 @@ body {
 .input-brutal:focus {
   outline: none;
   background: #fffdf6; /* one-step lighter paper, still a paper tone */
+  color: var(--color-ink);
 }
 .input-brutal::placeholder {
   font-family: var(--font-mono);
