@@ -1282,7 +1282,7 @@ export function LaunchPanel({
 												? "MAX buy: full spendable SOL under the 10% slippage band"
 												: "WATCH-ONLY: no secret key, cannot sign launch buys"
 										}
-										className="label-mono inline-flex items-center gap-1.5 border-2 border-ink bg-paper px-2 py-0.5 text-[11px]">
+										className="label-mono bg-transparent inline-flex items-center gap-1.5 border-2 border-[#3a4956] rounded-full bg-paper p-2 text-[11px]">
 										<span
 											className={
 												w.key ? "" : "opacity-60"
