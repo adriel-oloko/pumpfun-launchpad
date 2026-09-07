@@ -79,8 +79,8 @@ body {
 /* hover only applies where a real pointer can hover (no sticky hover on touch) */
 @media (hover: hover) and (pointer: fine) {
   .btn-brutal:hover:not(:disabled) {
-    background: var(--color-paper);
-    color: var(--color-ink);
+    background: transparent !important;
+    color: #ff0000;
   }
 }
 .btn-brutal:active:not(:disabled) {
@@ -109,7 +109,7 @@ body {
 }
 /* pressed variant for toggle groups */
 .btn-brutal-pressed {
-  background: var(--color-paper);
+  background: #00000000;
   color: var(--color-ink);
   box-shadow: 0 1px 0 var(--color-ink);
   transform: translate(2px, 2px);
@@ -216,7 +216,7 @@ body {
   flex-shrink: 0;
 }
 .checkbox-brutal:checked {
-  background: rgb(204, 255, 0);
+  background: oklab(93.071% -0.12483 0.19143);
 }
 .checkbox-brutal:checked::after {
   content: "";
@@ -233,15 +233,24 @@ body {
   outline: 2px dashed var(--color-ink);
   outline-offset: 2px;
 }
-/* inverted face for checkboxes sitting on ink rows (table headers) */
-.checkbox-brutal-invert {
-  border-color: var(--color-paper);
+/* select-all checkbox on the roster's lime header strip: the face stays a
+   solid ink square (checked or not) and the tick renders white when
+   checked, so it reads against both the ink face and the lime strip. */
+.checkbox-brutal-header {
+  border: 0;
   background: var(--color-ink);
 }
-.checkbox-brutal-invert:checked {
-  background: var(--color-paper);
+.checkbox-brutal-header:checked {
+  background: var(--color-ink);
 }
-.checkbox-brutal-invert:checked::after {
+.checkbox-brutal-header:checked::after {
+  border-color: #fff;
+}
+.checkbox-brutal-header:focus-visible {
+  outline-color: var(--color-paper);
+}
+/* managed-wallet roster rows: black tick on the lime checked face */
+.roster-row .checkbox-brutal:checked::after {
   border-color: var(--color-ink);
 }
 

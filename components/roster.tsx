@@ -678,11 +678,11 @@ export function Roster({ api }: { api: RosterApi }) {
             ) : null}
 
             {/* column header (ink strip) */}
-            <div className="label-mono flex items-center gap-2 border-2 border-ink bg-ink px-3 py-1.5 text-paper">
+            <div className="label-mono flex items-center gap-2 border-2 border-ink bg-[#ccff00] px-3 py-1.5 text-ink">
                 <div className="flex w-6 shrink-0 items-center">
                     <input
                         type="checkbox"
-                        className="checkbox-brutal checkbox-brutal-invert"
+                        className="checkbox-brutal checkbox-brutal-header"
                         checked={api.allChecked}
                         onChange={api.toggleAll}
                         title="toggle all selectable wallets (HUB excluded)"

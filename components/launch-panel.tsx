@@ -1399,7 +1399,7 @@ export function LaunchPanel({
                     <div className="mb-1">
                         <span className="label-mono opacity-50">log</span>
                     </div>
-                    <pre className="min-h-[120px] max-h-[260px] overflow-auto bg-ink text-paper p-3 font-mono text-[11px] leading-relaxed whitespace-pre-wrap">
+                    <pre className="min-h-[120px] max-h-[260px] overflow-auto tab-content bg-transparent! text-paper p-3 font-mono text-[11px] leading-relaxed whitespace-pre-wrap">
                         {statusLines.length === 0
                             ? 'ready. fill the form and press launch.'
                             : statusLines.join('\n')}

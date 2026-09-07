@@ -791,6 +791,9 @@ export function TradePanel({
 		const parts = [`${label}: ${r.completed} COMPLETED`];
 		if (r.skipped > 0) parts.push(`${r.skipped} SKIPPED`);
 		if (r.failed > 0) parts.push(`${r.failed} FAILED`);
+		if ((r.swept ?? 0) > 0) parts.push(`${r.swept ?? 0} SWEPT TO HUB`);
+		if ((r.sweepFailed ?? 0) > 0)
+			parts.push(`${r.sweepFailed ?? 0} SWEEP FAILED`);
 		return parts.join(" · ");
 	};
 
@@ -991,6 +994,9 @@ export function TradePanel({
 			curve: gate.curve as AutoCurveInfo,
 			wallets,
 			sellPct: cfg.sellPct,
+			// The hub (FIRST roster wallet) is the sweep destination: every
+			// wallet whose sell confirms sends the sale proceeds to it.
+			hub: walletsRef.current[0]?.address ?? undefined,
 		})
 			.then((res) => {
 				if (autoRunningRef.current) {

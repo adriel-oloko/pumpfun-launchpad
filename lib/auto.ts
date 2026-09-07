@@ -17,7 +17,11 @@
 //     of their OWN holdings (default 100) via pump.fun's sell instruction.
 //     A wallet with no token balance is SKIPPED. The % input sets the sell
 //     fraction of each wallet's OWN bag directly (there is no MIN % dust
-//     gate against total supply).
+//     gate against total supply). When a hub address is supplied, every
+//     wallet whose sell CONFIRMS automatically sweeps that sale's SOL
+//     proceeds (measured as the wallet's balance delta across the sell,
+//     net of the sell fee) to the hub in a follow-up wallet-signed
+//     transfer, so the proceeds never sit in the seller.
 //   - Trade execution: each picked wallet's trade is its own signed tx (the
 //     wallet is the fee payer), fired concurrently with Promise.allSettled,
 //     reporting only the final completed count (the v4 batch pattern).
@@ -54,6 +58,7 @@ import {
   Keypair,
   LAMPORTS_PER_SOL,
   PublicKey,
+  SystemProgram,
   Transaction,
   TransactionInstruction,
 } from "@solana/web3.js";
@@ -65,6 +70,7 @@ import {
 import {
   buildPumpBuyIx,
   buildPumpSellIx,
+  capBuySolForSlippage,
   quotePumpBuy,
   quotePumpSell,
   readPumpCurveState,
@@ -88,6 +94,11 @@ export const AUTO_CONFIRM_TIMEOUT_MS: number = 40_000;
 /** Lamports reserved above the rent floor on a buy (covers the 5000-lamport
  *  base fee and a small margin). */
 export const AUTO_TX_FEE_RESERVE_LAMPORTS: bigint = BigInt(10_000);
+
+/** Lamports a post-sell sweep leaves behind in the seller (on top of the
+ *  wallet's pre-sell balance) to pay the sweep transfer's own ~5000-lamport
+ *  fee. Mirrors WITHDRAW_FEE_RESERVE_LAMPORTS in lib/disperse.ts. */
+export const AUTO_SWEEP_FEE_RESERVE_LAMPORTS: bigint = BigInt(10_000);
 
 /** A live roster balance for the picker. Matches the shape useRoster keeps. */
 export interface AutoWalletBalance {
@@ -338,6 +349,13 @@ export interface AutoRoundResult {
   completed: number;
   failed: number;
   skipped: number;
+  /** Number of completed sells whose proceeds were swept to the hub
+   *  (auto-sell rounds with a hub address; buy rounds never set it). */
+  swept?: number;
+  /** Number of completed sells whose hub sweep FAILED: the sell landed but
+   *  the proceeds stayed in the seller wallet (auto-sell with a hub
+   *  address). The operator should run a manual Withdraw for those rows. */
+  sweepFailed?: number;
 }
 
 export interface FireAutoBuyOptions {
@@ -413,7 +431,13 @@ export async function fireAutoBuy(
         AUTO_TX_FEE_RESERVE_LAMPORTS -
         reserveAta;
       if (spendable <= BigInt(0)) return "skipped";
-      const solIn = (spendable * BigInt(pctNum)) / BigInt(10_000);
+      const solInRaw = (spendable * BigInt(pctNum)) / BigInt(10_000);
+      // Slippage ceiling: the buy ix commits max_sol_cost = solIn * 1.10
+      // (10% default slippage), which the spendable base does NOT reserve —
+      // at a high % (the 95 default) a full-slippage fill can overdraw a tiny
+      // wallet below its rent floor. Cap the commit at spendable / 1.10.
+      const maxCommit = capBuySolForSlippage(spendable);
+      const solIn = solInRaw > maxCommit ? maxCommit : solInRaw;
       if (solIn <= BigInt(0)) return "skipped";
       const quote = quotePumpBuy({
         solInLamports: solIn,
@@ -469,12 +493,23 @@ export interface FireAutoSellOptions {
   wallets: AutoWallet[];
   /** % of each wallet's OWN holdings to sell (default 100). */
   sellPct?: number;
+  /** Base58 address of the hub wallet (the FIRST roster wallet). When set,
+   *  every wallet whose sell CONFIRMS immediately sweeps that sale's SOL
+   *  proceeds to the hub in a follow-up wallet-signed transfer (the wallet
+   *  keeps its pre-sale balance and a small fee reserve, so it stays open
+   *  and rent-exempt). When unset the engine behaves exactly as before:
+   *  proceeds stay in the seller. */
+  hub?: string;
 }
 
 /**
  * Fires one auto-sell round: every picked wallet sells `sellPct`% of its OWN
  * token holdings as its own signed tx, concurrently. Skipped = live token
- * balance <= 0; failed = build/send/confirm error.
+ * balance <= 0; failed = build/send/confirm error. When `hub` is set, each
+ * wallet whose sell confirms also sends the sale's proceeds (measured as its
+ * SOL balance delta across the sell) to the hub; a failed sweep after a
+ * confirmed sell is reported via `sweepFailed` (the sale still counts as
+ * completed, its proceeds just stayed in the seller).
  */
 export async function fireAutoSell(
   opts: FireAutoSellOptions
@@ -482,10 +517,20 @@ export async function fireAutoSell(
   const { connection, mint, curve, wallets } = opts;
   const sellPct = opts.sellPct ?? AUTO_SELL_PCT;
   if (wallets.length === 0) {
-    return { completed: 0, failed: 0, skipped: 0 };
+    return { completed: 0, failed: 0, skipped: 0, swept: 0, sweepFailed: 0 };
   }
   const pctNum = Math.round(sellPct * 100);
   const creator = new PublicKey(curve.creator);
+  // The hub sweep destination: parse once for the round; an unparseable
+  // address disables the sweep (the sells themselves still run).
+  let hubPk: PublicKey | null = null;
+  if (opts.hub) {
+    try {
+      hubPk = new PublicKey(opts.hub);
+    } catch {
+      hubPk = null;
+    }
+  }
   const latest = await connection.getLatestBlockhash("confirmed");
   // Live protocol fee recipient (pump.fun rotates it; a stale value reverts
   // every sell with Custom 6000). One read for the whole round.
@@ -500,54 +545,111 @@ export async function fireAutoSell(
   let vtr = curve.tokenReserve;
 
   const results = await Promise.allSettled(
-    wallets.map(async (w): Promise<"ok" | "skipped"> => {
-      const kp = Keypair.fromSecretKey(bs58.decode(w.key));
-      const balance = await walletTokenBalance(
-        connection,
-        kp.publicKey,
-        mint
-      );
-      if (balance <= BigInt(0)) return "skipped";
-      const tokenIn = (balance * BigInt(pctNum)) / BigInt(10_000);
-      if (tokenIn <= BigInt(0)) return "skipped";
-      const quote = quotePumpSell({
-        tokensIn: tokenIn,
-        virtualSolReserves: vsr,
-        virtualTokenReserves: vtr,
-      });
-      vsr = vsr + quote.netSolOut;
-      vtr = vtr - tokenIn;
-      const ixs = buildPumpSellIx({
-        mint,
-        seller: kp.publicKey,
-        creator,
-        feeRecipient,
-        tokensIn: tokenIn,
-        minSolOutput: quote.minSolOutput,
-      });
-      const tx = new Transaction({
-        feePayer: kp.publicKey,
-        blockhash: latest.blockhash,
-        lastValidBlockHeight: latest.lastValidBlockHeight,
-      });
-      tx.add(...ixs);
-      // M7a: expiry-safe send + confirm, same semantics as the buy worker.
-      await send(connection, tx, [kp], {
-        attempts: 2,
-        confirmTimeoutMs: AUTO_CONFIRM_TIMEOUT_MS,
-        label: "auto sell",
-      });
-      return "ok";
-    })
+    wallets.map(
+      async (w): Promise<"ok" | "skipped" | "swept" | "sweepFailed"> => {
+        const kp = Keypair.fromSecretKey(bs58.decode(w.key));
+        // Per-worker const so TS narrows past the null checks below.
+        const hubDest = hubPk;
+        const balance = await walletTokenBalance(
+          connection,
+          kp.publicKey,
+          mint
+        );
+        if (balance <= BigInt(0)) return "skipped";
+        const tokenIn = (balance * BigInt(pctNum)) / BigInt(10_000);
+        if (tokenIn <= BigInt(0)) return "skipped";
+        // Pre-sale SOL balance: only read when a hub sweep is armed and the
+        // seller is not the hub itself (the proceeds are measured as the
+        // wallet's balance delta across the sell, net of the sell's own
+        // fee).
+        const sweep = hubDest !== null && !hubDest.equals(kp.publicKey);
+        const solBefore = sweep
+          ? BigInt(await connection.getBalance(kp.publicKey, "confirmed"))
+          : null;
+        const quote = quotePumpSell({
+          tokensIn: tokenIn,
+          virtualSolReserves: vsr,
+          virtualTokenReserves: vtr,
+        });
+        vsr = vsr + quote.netSolOut;
+        vtr = vtr - tokenIn;
+        const ixs = buildPumpSellIx({
+          mint,
+          seller: kp.publicKey,
+          creator,
+          feeRecipient,
+          tokensIn: tokenIn,
+          minSolOutput: quote.minSolOutput,
+        });
+        const tx = new Transaction({
+          feePayer: kp.publicKey,
+          blockhash: latest.blockhash,
+          lastValidBlockHeight: latest.lastValidBlockHeight,
+        });
+        tx.add(...ixs);
+        // M7a: expiry-safe send + confirm, same semantics as the buy worker.
+        await send(connection, tx, [kp], {
+          attempts: 2,
+          confirmTimeoutMs: AUTO_CONFIRM_TIMEOUT_MS,
+          label: "auto sell",
+        });
+        // The sale landed. Now sweep its proceeds to the hub (only what the
+        // sale added: solAfter - solBefore, leaving a fee reserve behind for
+        // this sweep's own transfer fee so the wallet keeps its pre-sale
+        // balance and stays rent-exempt).
+        if (hubDest === null || solBefore === null) return "ok";
+        if (hubDest.equals(kp.publicKey)) return "ok";
+        try {
+          const solAfter = BigInt(
+            await connection.getBalance(kp.publicKey, "confirmed")
+          );
+          const proceeds = solAfter - solBefore;
+          const amount = proceeds - AUTO_SWEEP_FEE_RESERVE_LAMPORTS;
+          if (amount <= BigInt(0)) return "ok";
+          const sweepTx = new Transaction({ feePayer: kp.publicKey });
+          sweepTx.add(
+            SystemProgram.transfer({
+              fromPubkey: kp.publicKey,
+              toPubkey: hubDest,
+              lamports: Number(amount),
+            })
+          );
+          await send(connection, sweepTx, [kp], {
+            attempts: 2,
+            confirmTimeoutMs: AUTO_CONFIRM_TIMEOUT_MS,
+            label: "auto sell sweep",
+          });
+          return "swept";
+        } catch {
+          // The sale is done; a failed sweep must not masquerade as a failed
+          // sell (which the engine never re-fires). Report it separately so
+          // the operator can Withdraw that row manually.
+          return "sweepFailed";
+        }
+      }
+    )
   );
 
   let completed = 0;
   let failed = 0;
   let skipped = 0;
+  let swept = 0;
+  let sweepFailed = 0;
   for (const r of results) {
-    if (r.status === "fulfilled" && r.value === "ok") completed += 1;
-    else if (r.status === "fulfilled") skipped += 1;
-    else failed += 1;
+    if (r.status === "fulfilled") {
+      if (r.value === "skipped") skipped += 1;
+      else if (r.value === "swept") {
+        completed += 1;
+        swept += 1;
+      } else if (r.value === "sweepFailed") {
+        completed += 1;
+        sweepFailed += 1;
+      } else {
+        completed += 1;
+      }
+    } else {
+      failed += 1;
+    }
   }
-  return { completed, failed, skipped };
+  return { completed, failed, skipped, swept, sweepFailed };
 }

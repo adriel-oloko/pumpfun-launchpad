@@ -523,6 +523,23 @@ export function quotePumpSell(opts: {
   return { grossSolOut, netSolOut, minSolOutput };
 }
 
+/** Max SOL a buy may commit given a wallet's spendable balance and the
+ *  slippage headroom: spendable / (1 + slippageBps/10000). The buy
+ *  instruction's max_sol_cost = solIn * (1 + slippage), so committing the
+ *  whole spendable lets a full-slippage fill overdraw the wallet below its
+ *  rent floor (the ATA rent + tx fee are reserved OUT of spendable, but the
+ *  slippage headroom is not). Buyers must stay at or under this ceiling. */
+export function capBuySolForSlippage(
+  spendableLamports: bigint,
+  slippageBps?: bigint
+): bigint {
+  const slip = slippageBps ?? PUMP_DEFAULT_SLIPPAGE_BPS;
+  if (spendableLamports <= BigInt(0)) return BigInt(0);
+  return (
+    (spendableLamports * BigInt(10_000)) / (BigInt(10_000) + slip)
+  );
+}
+
 /* ------------------------------------------------------------------ */
 /* Instruction builders (hand-built TransactionInstructions)            */
 /* ------------------------------------------------------------------ */

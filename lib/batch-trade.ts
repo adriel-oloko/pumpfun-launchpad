@@ -52,7 +52,7 @@ import {
   walletTokenBalance,
 } from "./bundle/launch";
 import type { SendTx } from "./bundle/protected-send";
-import { resolvePumpFeeRecipient } from "./pump";
+import { capBuySolForSlippage, resolvePumpFeeRecipient } from "./pump";
 
 /** Final outcome of one manual batch trade (the v4 batch pattern). */
 export interface ManualBatchResult {
@@ -144,7 +144,13 @@ async function buyOne(
     AUTO_TX_FEE_RESERVE_LAMPORTS -
     reserveAta;
   if (spendable <= BigInt(0)) return null;
-  const solIn = (spendable * BigInt(pctNum(pct))) / BigInt(10_000);
+  const solInRaw = (spendable * BigInt(pctNum(pct))) / BigInt(10_000);
+  // Slippage ceiling: the buy ix commits max_sol_cost = solIn * 1.10 (10%
+  // default slippage), which the spendable base does NOT reserve — at a high
+  // % (the 95 default) a full-slippage fill can overdraw a tiny wallet below
+  // its rent floor. Cap the commit at spendable / 1.10.
+  const maxCommit = capBuySolForSlippage(spendable);
+  const solIn = solInRaw > maxCommit ? maxCommit : solInRaw;
   if (solIn <= BigInt(0)) return null;
   const creator = new PublicKey(curve.creator);
   const ixs = buildAutoBuyIx({
