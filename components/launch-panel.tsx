@@ -1,4 +1,4 @@
-'use client'
+"use client";
 
 // Milestone M4: the launch panel (M4-UI-MATCH restyle), M10: native
 // pump.fun program.
@@ -6,9 +6,10 @@
 // Form: token name / symbol / metadata URI (direct entry; see the
 // Arweave/IPFS decision comment below), the connected creator key (the
 // SAME wallet the masthead connects via pumpfun.creatorKey.v1), the
-// selected dev wallets that each buy with ONE buyPct% of their OWN
-// spendable SOL balance (the creator only covers the create tx; wallets
-// must hold SOL — fund/disperse them first), and a Launch button that
+// selected dev wallets that each buy MAX (their full spendable SOL under
+// the same 10% slippage-band sizing as the manual Buy Max; the creator
+// only covers the create tx; wallets must hold SOL, fund/disperse them
+// first), and a Launch button that
 // drives lib/bundle:
 //
 //   Tier 1 (default): buildLaunchSequence + preflightLaunch +
@@ -63,86 +64,82 @@
 // and ALL M4 launch logic are preserved unchanged.
 
 import {
-    Keypair,
-    LAMPORTS_PER_SOL,
-    PublicKey,
-    SystemProgram,
-    type Connection,
-} from '@solana/web3.js'
-import bs58 from 'bs58'
-import { useCallback, useEffect, useMemo, useState } from 'react'
+	Keypair,
+	LAMPORTS_PER_SOL,
+	PublicKey,
+	SystemProgram,
+	type Connection,
+} from "@solana/web3.js";
+import bs58 from "bs58";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import {
-    ataRentLamports,
-    buildLaunchSequence,
-    ensurePumpLookupTable,
-    holderCount,
-    postBuyFloorLamports,
-    preflightLaunch,
-    readToken2022Metadata,
-    sendSequentially,
-    simulateBundle,
-    walletTokenBalance,
-    type BuyAllocation,
-} from '../lib/bundle'
-import { publishTokenMetadata } from '../lib/metadata'
-import { grindVanityMintKeypair } from '../lib/vanity-client'
+	ataRentLamports,
+	buildLaunchSequence,
+	ensurePumpLookupTable,
+	holderCount,
+	postBuyFloorLamports,
+	preflightLaunch,
+	readToken2022Metadata,
+	sendSequentially,
+	simulateBundle,
+	walletTokenBalance,
+	type BuyAllocation,
+} from "../lib/bundle";
+import { publishTokenMetadata } from "../lib/metadata";
+import { grindVanityMintKeypair } from "../lib/vanity-client";
 import {
-    fetchRelayPlan,
-    defaultTipAccountForRelay,
-    RELAY_MIN_TIP_LAMPORTS,
-    type RelayId,
-    type RelayPlanEntry,
-    type BundleSubmissionResult,
-} from '../lib/bundle'
-import { DEFAULT_JITO_TIP_LAMPORTS } from '../lib/fees'
-import { submitBundleViaFanoutWithRetry } from '../lib/bundle/fanout-submit'
-import { bundleDropMessage, friendlyTxError } from '../lib/tx-errors'
-import { makeAppConnection } from '../lib/connection'
-import { solanaNetwork } from '../lib/network'
-import { useCreatorWallet } from '../lib/creator-wallet'
-import { pubkeyFromSecretKey } from '../lib/managed-wallets'
-import { DECIMALS } from '../lib/params'
+	fetchRelayPlan,
+	defaultTipAccountForRelay,
+	RELAY_MIN_TIP_LAMPORTS,
+	type RelayId,
+	type RelayPlanEntry,
+	type BundleSubmissionResult,
+} from "../lib/bundle";
+import { DEFAULT_JITO_TIP_LAMPORTS } from "../lib/fees";
+import { submitBundleViaFanoutWithRetry } from "../lib/bundle/fanout-submit";
+import { bundleDropMessage, friendlyTxError } from "../lib/tx-errors";
+import { makeAppConnection } from "../lib/connection";
+import { solanaNetwork } from "../lib/network";
+import { useCreatorWallet } from "../lib/creator-wallet";
+import { pubkeyFromSecretKey } from "../lib/managed-wallets";
+import { DECIMALS } from "../lib/params";
 import {
-    claimCreatorFees,
-    isFeeSharingRevert,
-    type CreatorClaimReport,
-} from '../lib/claim-creator-fee'
-import { readPumpCurveState, type PumpCurveState } from '../lib/pump'
+	claimCreatorFees,
+	isFeeSharingRevert,
+	type CreatorClaimReport,
+} from "../lib/claim-creator-fee";
+import { capBuySolForSlippage, readPumpCurveState, type PumpCurveState } from "../lib/pump";
 import {
-    formatSolLamports,
-    sellAllManagedWallets,
-    type SellAllReport,
-    type SellOutcome,
-} from '../lib/sell-all'
-import { useToasts } from './toast-stack'
+	formatSolLamports,
+	sellAllManagedWallets,
+	type SellAllReport,
+	type SellOutcome,
+} from "../lib/sell-all";
+import { useToasts } from "./toast-stack";
 import {
-    Btn,
-    Card,
-    Collapse,
-    ExplorerLink,
-    Field,
-    Input,
-    StatusLine,
-} from './ui'
-import type { RosterApi } from './roster'
-import { shortAddress } from './roster'
+	Btn,
+	Card,
+	Collapse,
+	ExplorerLink,
+	Field,
+	Input,
+	StatusLine,
+} from "./ui";
+import type { RosterApi } from "./roster";
+import { shortAddress } from "./roster";
 
-const EXPLORER = 'https://explorer.solana.com'
+const EXPLORER = "https://explorer.solana.com";
 /** Explorer cluster query: devnet links need ?cluster=devnet; mainnet none. */
-const EXPLORER_QS = solanaNetwork() === 'devnet' ? '?cluster=devnet' : ''
-/** Default % of each selected dev wallet's OWN spendable SOL balance spent on
- *  the launch buy (mirrors the manual Buy tab's 95 default: leaves the
- *  rent/fee/ATA reserves in place so a wallet can still sell later). */
-const DEFAULT_BUY_PCT = '95'
+const EXPLORER_QS = solanaNetwork() === "devnet" ? "?cluster=devnet" : "";
 /** Default Tier 2 relay tip (SOL) shown in the tip field: 0.001 SOL, the
  *  NextBlock / Astralane / bloXroute minimum and lib/fees default. */
 const DEFAULT_TIP_SOL = (
-    DEFAULT_JITO_TIP_LAMPORTS / LAMPORTS_PER_SOL
-).toString()
+	DEFAULT_JITO_TIP_LAMPORTS / LAMPORTS_PER_SOL
+).toString();
 
 function errMsg(e: unknown): string {
-    if (e instanceof Error) return e.message
-    return String(e)
+	if (e instanceof Error) return e.message;
+	return String(e);
 }
 
 /** Bounded on-chain wait for the launch's FRESH mint account to appear
@@ -150,1177 +147,1164 @@ function errMsg(e: unknown): string {
  *  the atomic relay bundle executed, so this is the honest ground truth for a
  *  relay ACCEPT that carries no status API — never a fabricated status. */
 async function waitForMintOnChain(
-    connection: Connection,
-    mint: PublicKey,
-    timeoutMs: number
+	connection: Connection,
+	mint: PublicKey,
+	timeoutMs: number,
 ): Promise<boolean> {
-    const deadline = Date.now() + timeoutMs
-    for (;;) {
-        try {
-            const info = await connection.getAccountInfo(mint, 'confirmed')
-            if (info) return true
-        } catch {
-            // transient RPC error: keep polling until the deadline
-        }
-        if (Date.now() > deadline) return false
-        await new Promise((r) => setTimeout(r, 1_500))
-    }
+	const deadline = Date.now() + timeoutMs;
+	for (;;) {
+		try {
+			const info = await connection.getAccountInfo(mint, "confirmed");
+			if (info) return true;
+		} catch {
+			// transient RPC error: keep polling until the deadline
+		}
+		if (Date.now() > deadline) return false;
+		await new Promise((r) => setTimeout(r, 1_500));
+	}
 }
 
 /** Token amount formatter (trade panel's helper moved with Sell All): raw
  *  base units -> a 4-decimal display string using the program's decimals. */
 function fmtTokens(raw: bigint): string {
-    return `${(Number(raw) / 10 ** DECIMALS).toFixed(4)}`
+	return `${(Number(raw) / 10 ** DECIMALS).toFixed(4)}`;
 }
 
 export function LaunchPanel({
-    roster,
-    onLaunched,
-    mint,
+	roster,
+	onLaunched,
+	mint,
 }: {
-    roster: RosterApi
-    /** Called with the mint after a successful launch (pre-fills the trade
-     *  panel's token-address input, mirroring v4's LAUNCH -> trade flow). */
-    onLaunched?: (mint: string) => void
-    /** The mint the Trade panel tracks (a launch pre-fills it). Drives the
-     *  Sell All button below the Launch button; null disables it. */
-    mint?: string | null
+	roster: RosterApi;
+	/** Called with the mint after a successful launch (pre-fills the trade
+	 *  panel's token-address input, mirroring v4's LAUNCH -> trade flow). */
+	onLaunched?: (mint: string) => void;
+	/** The mint the Trade panel tracks (a launch pre-fills it). Drives the
+	 *  Sell All button below the Launch button; null disables it. */
+	mint?: string | null;
 }) {
-    const {
-        key: creatorKey,
-        pubkey: creatorPubkey,
-        connected,
-        balanceSol,
-    } = useCreatorWallet()
-    const { pushToast } = useToasts()
+	const {
+		key: creatorKey,
+		pubkey: creatorPubkey,
+		connected,
+		balanceSol,
+	} = useCreatorWallet();
+	const { pushToast } = useToasts();
 
-    const [name, setName] = useState('M4 UI Launch')
-    const [symbol, setSymbol] = useState('M4UI')
-    const [uri, setUri] = useState('https://example.com/m4-ui-launch.json')
-    // M9 structured metadata: description / image / socials are
-    // auto-published to the configured backend on launch and the returned
-    // URL becomes the create() uri. manualMetadata keeps the old single-URI
-    // flow (devnet quick launches / no backend configured).
-    const [description, setDescription] = useState('')
-    const [imageFile, setImageFile] = useState<File | null>(null)
-    const [website, setWebsite] = useState('')
-    const [twitter, setTwitter] = useState('')
-    const [telegram, setTelegram] = useState('')
-    const [manualMetadata, setManualMetadata] = useState(false)
-    const [advancedOpen, setAdvancedOpen] = useState(false)
-    const [tier, setTier] = useState<'1' | '2'>('1')
-    const [tipSol, setTipSol] = useState(DEFAULT_TIP_SOL)
-    /** One % applied to every selected dev wallet's OWN spendable SOL
-     *  balance: the wallet spends this much on its launch buy. The creator
-     *  does NOT fund dev wallets (it only covers the create tx + fees). */
-    const [buyPct, setBuyPct] = useState(DEFAULT_BUY_PCT)
-    const [busy, setBusy] = useState(false)
-    const [statusLines, setStatusLines] = useState<string[]>([])
-    const [launchError, setLaunchError] = useState<string | null>(null)
-    const [lastMint, setLastMint] = useState<string | null>(null)
+	const [name, setName] = useState("");
+	const [symbol, setSymbol] = useState("");
+	const [uri, setUri] = useState("https://example.com/m4-ui-launch.json");
+	// M9 structured metadata: description / image / socials are
+	// auto-published to the configured backend on launch and the returned
+	// URL becomes the create() uri. manualMetadata keeps the old single-URI
+	// flow (devnet quick launches / no backend configured).
+	const [description, setDescription] = useState("");
+	const [imageFile, setImageFile] = useState<File | null>(null);
+	const [website, setWebsite] = useState("");
+	const [twitter, setTwitter] = useState("");
+	const [telegram, setTelegram] = useState("");
+	const [manualMetadata, setManualMetadata] = useState(false);
+	const [advancedOpen, setAdvancedOpen] = useState(false);
+	const [tier, setTier] = useState<"1" | "2">("1");
+	const [tipSol, setTipSol] = useState(DEFAULT_TIP_SOL);
+	const [busy, setBusy] = useState(false);
+	const [statusLines, setStatusLines] = useState<string[]>([]);
+	const [launchError, setLaunchError] = useState<string | null>(null);
+	const [lastMint, setLastMint] = useState<string | null>(null);
 
-    const selectedWallets = useMemo(
-        () => roster.wallets.filter((w) => roster.checked.has(w.address)),
-        [roster.wallets, roster.checked]
-    )
+	const selectedWallets = useMemo(
+		() => roster.wallets.filter((w) => roster.checked.has(w.address)),
+		[roster.wallets, roster.checked],
+	);
 
-    const log = useCallback((line: string) => {
-        setStatusLines((prev) => [...prev.slice(-200), line])
-    }, [])
+	const log = useCallback((line: string) => {
+		setStatusLines((prev) => [...prev.slice(-200), line]);
+	}, []);
 
-    const clearLog = useCallback(() => setStatusLines([]), [])
+	const clearLog = useCallback(() => setStatusLines([]), []);
 
-    const parseCreator = (): Keypair => {
-        if (!creatorKey) {
-            throw new Error(
-                'creator key missing: connect the base58 secret of the devnet deploy wallet in the masthead'
-            )
-        }
-        const pubkey = pubkeyFromSecretKey(creatorKey)
-        if (!pubkey) {
-            throw new Error('creator key is not a valid 64-byte base58 secret')
-        }
-        return Keypair.fromSecretKey(bs58.decode(creatorKey))
-    }
+	const parseCreator = (): Keypair => {
+		if (!creatorKey) {
+			throw new Error(
+				"creator key missing: connect the base58 secret of the devnet deploy wallet in the masthead",
+			);
+		}
+		const pubkey = pubkeyFromSecretKey(creatorKey);
+		if (!pubkey) {
+			throw new Error("creator key is not a valid 64-byte base58 secret");
+		}
+		return Keypair.fromSecretKey(bs58.decode(creatorKey));
+	};
 
-    /** Parses the Buy % field into basis points (95 -> 9500). Mirrors the
-     *  manual Buy tab's parseManualPct: clamps to (0, 100]; blank/invalid/
-     *  non-positive input falls back to DEFAULT_BUY_PCT (95). The engine then
-     *  applies pctBps/10000 to each wallet's spendable balance. */
-    const parseBuyPct = (): number => {
-        const raw = buyPct.trim()
-        const n = raw === '' ? Number.NaN : Number(raw)
-        if (!Number.isFinite(n) || n <= 0) {
-            return Math.round(Number(DEFAULT_BUY_PCT) * 100)
-        }
-        return Math.round(Math.min(100, n) * 100)
-    }
+	/** Parses the Tier 2 relay tip field (SOL) into lamports. Empty falls
+	 *  back to DEFAULT_JITO_TIP_LAMPORTS (0.001 SOL). Any value below the
+	 *  1_000_000-lamport (0.001 SOL) floor of the active Tier 2 relays
+	 *  (NextBlock primary, Astralane, bloXroute) is rejected up front — a
+	 *  sub-floor bundle cannot be accepted. */
+	const parseTip = (): number => {
+		const raw = tipSol.trim();
+		if (raw === "") return DEFAULT_JITO_TIP_LAMPORTS;
+		const n = Number(raw);
+		if (!Number.isFinite(n) || n < 0) {
+			throw new Error(
+				`tip must be a non-negative SOL amount, got "${raw}"`,
+			);
+		}
+		const lamports = Math.round(n * LAMPORTS_PER_SOL);
+		const floor = RELAY_MIN_TIP_LAMPORTS.nextblock;
+		if (lamports < floor) {
+			throw new Error(
+				`tip ${raw} SOL (${lamports} lamports) is below the ${floor}-lamport (0.001 SOL) minimum required by the Tier 2 relays (NextBlock primary / Astralane + bloXroute fallback)`,
+			);
+		}
+		return lamports;
+	};
 
-    /** Parses the Tier 2 relay tip field (SOL) into lamports. Empty falls
-     *  back to DEFAULT_JITO_TIP_LAMPORTS (0.001 SOL). Any value below the
-     *  1_000_000-lamport (0.001 SOL) floor of the active Tier 2 relays
-     *  (NextBlock primary, Astralane, bloXroute) is rejected up front — a
-     *  sub-floor bundle cannot be accepted. */
-    const parseTip = (): number => {
-        const raw = tipSol.trim()
-        if (raw === '') return DEFAULT_JITO_TIP_LAMPORTS
-        const n = Number(raw)
-        if (!Number.isFinite(n) || n < 0) {
-            throw new Error(
-                `tip must be a non-negative SOL amount, got "${raw}"`
-            )
-        }
-        const lamports = Math.round(n * LAMPORTS_PER_SOL)
-        const floor = RELAY_MIN_TIP_LAMPORTS.nextblock
-        if (lamports < floor) {
-            throw new Error(
-                `tip ${raw} SOL (${lamports} lamports) is below the ${floor}-lamport (0.001 SOL) minimum required by the Tier 2 relays (NextBlock primary / Astralane + bloXroute fallback)`
-            )
-        }
-        return lamports
-    }
+	const handleLaunch = async () => {
+		if (busy) return;
+		setBusy(true);
+		setLaunchError(null);
+		clearLog();
+		// Signatures observed as the launch progresses (toast txHash = the first).
+		const sentSigs: string[] = [];
+		try {
+			const creator = parseCreator();
 
-    const handleLaunch = async () => {
-        if (busy) return
-        setBusy(true)
-        setLaunchError(null)
-        clearLog()
-        // Signatures observed as the launch progresses (toast txHash = the first).
-        const sentSigs: string[] = []
-        try {
-            const creator = parseCreator()
+			if (Buffer.byteLength(name, "utf8") > 32)
+				throw new Error(
+					`name too long (${Buffer.byteLength(name, "utf8")} > 32 bytes)`,
+				);
+			if (Buffer.byteLength(symbol, "utf8") > 10)
+				throw new Error(
+					`symbol too long (${Buffer.byteLength(symbol, "utf8")} > 10 bytes)`,
+				);
 
-            if (Buffer.byteLength(name, 'utf8') > 32)
-                throw new Error(
-                    `name too long (${Buffer.byteLength(name, 'utf8')} > 32 bytes)`
-                )
-            if (Buffer.byteLength(symbol, 'utf8') > 10)
-                throw new Error(
-                    `symbol too long (${Buffer.byteLength(symbol, 'utf8')} > 10 bytes)`
-                )
+			if (selectedWallets.length === 0) {
+				throw new Error("select at least one dev wallet in the roster");
+			}
+			// Keyedness validated UP FRONT (before metadata is published on
+			// the backend): watch-only wallets cannot sign buys.
+			const walletKps = selectedWallets.map((w) => {
+				if (!w.key) {
+					throw new Error(
+						`wallet ${shortAddress(w.address, 6)} has no key (watch-only wallets cannot sign buys)`,
+					);
+				}
+				return { w, kp: Keypair.fromSecretKey(bs58.decode(w.key)) };
+			});
 
-            if (selectedWallets.length === 0) {
-                throw new Error('select at least one dev wallet in the roster')
-            }
-            // Keyedness validated UP FRONT (before metadata is published on
-            // the backend): watch-only wallets cannot sign buys.
-            const walletKps = selectedWallets.map((w) => {
-                if (!w.key) {
-                    throw new Error(
-                        `wallet ${shortAddress(w.address, 6)} has no key (watch-only wallets cannot sign buys)`
-                    )
-                }
-                return { w, kp: Keypair.fromSecretKey(bs58.decode(w.key)) }
-            })
+			// M9 metadata: resolve the final on-chain uri BEFORE anything
+			// hits the chain. Auto mode publishes the structured fields
+			// (description / image / socials) to the configured backend (VPS
+			// preferred, IPFS via Pinata the alt) and uses the returned URL;
+			// manual mode keeps the raw URI field. The create() arg cap is
+			// checked on the RESOLVED uri (200 bytes, the program limit).
+			let finalUri: string;
+			if (manualMetadata) {
+				finalUri = uri;
+				if (!finalUri.trim()) {
+					throw new Error(
+						"manual metadata uri is empty: enter a URI or disable the manual toggle",
+					);
+				}
+			} else {
+				log("metadata: publishing description / image / socials...");
+				try {
+					const pub = await publishTokenMetadata({
+						name,
+						symbol,
+						description,
+						website,
+						twitter,
+						telegram,
+						image: imageFile,
+					});
+					finalUri = pub.uri;
+					log(
+						`metadata: published via ${pub.backend} -> ${finalUri}`,
+					);
+					if (pub.imageUrl) log(`image   : ${pub.imageUrl}`);
+				} catch (e) {
+					const msg = errMsg(e);
+					if (msg.includes("METADATA BACKEND NOT CONFIGURED")) {
+						log(
+							"NOTE: no metadata backend is configured on the server.",
+						);
+						log(
+							"  - set METADATA_BACKEND=vps + METADATA_VPS_UPLOAD_URL /",
+						);
+						log(
+							"    METADATA_VPS_BASE_URL / METADATA_VPS_SECRET (preferred,",
+						);
+						log("    see tools/metadata-vps/server.mjs), OR");
+						log("  - set METADATA_BACKEND=ipfs + PINATA_JWT, OR");
+						log(
+							'  - enable "manual metadata uri" in Advanced for a',
+						);
+						log("    devnet launch with no backend.");
+					}
+					throw e;
+				}
+			}
+			if (Buffer.byteLength(finalUri, "utf8") > 200)
+				throw new Error(
+					`uri too long (${Buffer.byteLength(finalUri, "utf8")} > 200 bytes)`,
+				);
 
-            // M9 metadata: resolve the final on-chain uri BEFORE anything
-            // hits the chain. Auto mode publishes the structured fields
-            // (description / image / socials) to the configured backend (VPS
-            // preferred, IPFS via Pinata the alt) and uses the returned URL;
-            // manual mode keeps the raw URI field. The create() arg cap is
-            // checked on the RESOLVED uri (200 bytes, the program limit).
-            let finalUri: string
-            if (manualMetadata) {
-                finalUri = uri
-                if (!finalUri.trim()) {
-                    throw new Error(
-                        'manual metadata uri is empty: enter a URI or disable the manual toggle'
-                    )
-                }
-            } else {
-                log('metadata: publishing description / image / socials...')
-                try {
-                    const pub = await publishTokenMetadata({
-                        name,
-                        symbol,
-                        description,
-                        website,
-                        twitter,
-                        telegram,
-                        image: imageFile,
-                    })
-                    finalUri = pub.uri
-                    log(`metadata: published via ${pub.backend} -> ${finalUri}`)
-                    if (pub.imageUrl) log(`image   : ${pub.imageUrl}`)
-                } catch (e) {
-                    const msg = errMsg(e)
-                    if (msg.includes('METADATA BACKEND NOT CONFIGURED')) {
-                        log(
-                            'NOTE: no metadata backend is configured on the server.'
-                        )
-                        log(
-                            '  - set METADATA_BACKEND=vps + METADATA_VPS_UPLOAD_URL /'
-                        )
-                        log(
-                            '    METADATA_VPS_BASE_URL / METADATA_VPS_SECRET (preferred,'
-                        )
-                        log('    see tools/metadata-vps/server.mjs), OR')
-                        log('  - set METADATA_BACKEND=ipfs + PINATA_JWT, OR')
-                        log(
-                            '  - enable "manual metadata uri" in Advanced for a'
-                        )
-                        log('    devnet launch with no backend.')
-                    }
-                    throw e
-                }
-            }
-            if (Buffer.byteLength(finalUri, 'utf8') > 200)
-                throw new Error(
-                    `uri too long (${Buffer.byteLength(finalUri, 'utf8')} > 200 bytes)`
-                )
+			const connection = makeAppConnection();
+			log(`=== pumpfun launch (tier ${tier}) ===`);
+			log(`creator : ${creator.publicKey.toBase58()}`);
+			log(`name/sym: ${name} / ${symbol}`);
+			log(`uri     : ${finalUri}`);
+			log(
+				`program : pump.fun native (6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P)`,
+			);
+			log(
+				`migrate : automatic (pump.fun migrates to PumpSwap on graduation; create args = name/symbol/uri only)`,
+			);
+			// Buy sizing: MAX. Every selected dev wallet commits its FULL
+			// spendable SOL balance, exactly like the manual Buy Max
+			// (lib/batch-trade buyOne): solIn = spendable / 1.10 via
+			// capBuySolForSlippage, and the launch buy's own 10% slippage
+			// quote (quoteLaunchBuys) caps max_sol_cost AT the spendable, so
+			// a live-curve tick between quote and execution is absorbed
+			// instead of reverting (Custom 6002 TooMuchSolRequired) or
+			// pulling the wallet below its reserve. The creator does NOT
+			// fund dev wallets (it only covers the create tx + fees). The
+			// spendable base = live balance minus the rent-exempt floor +
+			// fee margin each wallet must retain post-buy
+			// (postBuyFloorLamports) and the Token-2022 ATA rent. The ATA
+			// for the FRESH mint never exists yet, so its rent is always
+			// reserved (the buy ix pair creates the ATA from the wallet's
+			// own lamports).
+			const ataRent = await ataRentLamports(connection);
+			const reserveLamports = postBuyFloorLamports() + BigInt(ataRent);
+			const buys: BuyAllocation[] = [];
+			for (const { w, kp } of walletKps) {
+				const live = BigInt(
+					await connection.getBalance(kp.publicKey, "confirmed"),
+				);
+				const spendable = live - reserveLamports;
+				if (spendable <= BigInt(0)) {
+					throw new Error(
+						`dev wallet ${shortAddress(w.address, 6)} has no spendable SOL: balance ${(Number(live) / LAMPORTS_PER_SOL).toFixed(4)} SOL is below the ${(Number(reserveLamports) / LAMPORTS_PER_SOL).toFixed(4)} SOL launch reserve (rent floor + fee margin + ATA rent). Fund/disperse SOL to the selected dev wallets before launching.`,
+					);
+				}
+				const solIn = capBuySolForSlippage(spendable);
+				if (solIn <= BigInt(0)) {
+					throw new Error(
+						`dev wallet ${shortAddress(w.address, 6)}: spendable ${(Number(spendable) / LAMPORTS_PER_SOL).toFixed(4)} SOL is below the 10% slippage minimum. Fund the wallet.`,
+					);
+				}
+				buys.push({ wallet: kp, solInLamports: solIn });
+				log(
+					`  dev ${kp.publicKey.toBase58().slice(0, 12)}... balance ${(Number(live) / LAMPORTS_PER_SOL).toFixed(4)} SOL -> buys ${(Number(solIn) / LAMPORTS_PER_SOL).toFixed(4)} SOL (MAX: full ${(Number(spendable) / LAMPORTS_PER_SOL).toFixed(4)} SOL spendable under the 10% slippage band)`,
+				);
+			}
 
-            const connection = makeAppConnection()
-            log(`=== pumpfun launch (tier ${tier}) ===`)
-            log(`creator : ${creator.publicKey.toBase58()}`)
-            log(`name/sym: ${name} / ${symbol}`)
-            log(`uri     : ${finalUri}`)
-            log(
-                `program : pump.fun native (6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P)`
-            )
-            log(
-                `migrate : automatic (pump.fun migrates to PumpSwap on graduation; create args = name/symbol/uri only)`
-            )
-            // Buy sizing: ONE buyPct% applies to every selected dev wallet's
-            // OWN spendable SOL balance — the creator NO LONGER funds dev
-            // wallets (it only covers the create tx + fees). The spendable
-            // base mirrors the manual Buy tab's formula (lib/batch-trade):
-            // live balance minus the rent-exempt floor + fee margin each
-            // wallet must retain post-buy (postBuyFloorLamports) and the
-            // Token-2022 ATA rent. The ATA for the FRESH mint never exists
-            // yet, so its rent is always reserved (the buy ix pair creates
-            // the ATA from the wallet's own lamports).
-            const pctBps = parseBuyPct()
-            const ataRent = await ataRentLamports(connection)
-            const reserveLamports = postBuyFloorLamports() + BigInt(ataRent)
-            const buys: BuyAllocation[] = []
-            for (const { w, kp } of walletKps) {
-                const live = BigInt(
-                    await connection.getBalance(kp.publicKey, 'confirmed')
-                )
-                const spendable = live - reserveLamports
-                if (spendable <= BigInt(0)) {
-                    throw new Error(
-                        `dev wallet ${shortAddress(w.address, 6)} has no spendable SOL: balance ${(Number(live) / LAMPORTS_PER_SOL).toFixed(4)} SOL is below the ${(Number(reserveLamports) / LAMPORTS_PER_SOL).toFixed(4)} SOL launch reserve (rent floor + fee margin + ATA rent). Fund/disperse SOL to the selected dev wallets before launching.`
-                    )
-                }
-                const solIn = (spendable * BigInt(pctBps)) / BigInt(10_000)
-                if (solIn <= BigInt(0)) {
-                    throw new Error(
-                        `dev wallet ${shortAddress(w.address, 6)}: ${pctBps / 100}% of ${(Number(spendable) / LAMPORTS_PER_SOL).toFixed(4)} SOL spendable rounds to 0 SOL. Raise the buy % or fund the wallet.`
-                    )
-                }
-                buys.push({ wallet: kp, solInLamports: solIn })
-                log(
-                    `  dev ${kp.publicKey.toBase58().slice(0, 12)}... balance ${(Number(live) / LAMPORTS_PER_SOL).toFixed(4)} SOL -> buys ${(Number(solIn) / LAMPORTS_PER_SOL).toFixed(4)} SOL (${pctBps / 100}% of ${(Number(spendable) / LAMPORTS_PER_SOL).toFixed(4)} SOL spendable)`
-                )
-            }
+			// The creator funds ONLY the create tx. The pump.fun `create_v2`
+			// instruction makes the creator fund the accounts it allocates,
+			// all rent-exempt:
+			//   - Token-2022 mint (~400-570B; metadata lives IN-MINT via the
+			//     Token-2022 metadata extension, growing with the
+			//     name/symbol/uri length — there is NO Metaplex account)
+			//   - bonding curve (151B on live create_v2 tokens)
+			//   - bonding-curve ATA (Token-2022 token account = 170B)
+			//   - mayhem_state + mayhem_token_vault: created then CLOSED
+			//     for non-mayhem tokens (net zero, but the creator must
+			//     cover their rent mid-tx) — reserved as a flat buffer
+			// The creator is ALSO the fee payer on the create tx and every
+			// packed buy tx (each dev wallet keeps its own balance for the
+			// buy and pays no tx fee at launch), so the margin includes the
+			// base fee for the create + up to one base fee per buy wallet.
+			const mintSize =
+				340 +
+				Buffer.byteLength(name, "utf8") +
+				Buffer.byteLength(symbol, "utf8") +
+				Buffer.byteLength(finalUri, "utf8");
+			const createRent =
+				BigInt(
+					await connection.getMinimumBalanceForRentExemption(
+						mintSize,
+					),
+				) + // Token-2022 mint
+				BigInt(
+					await connection.getMinimumBalanceForRentExemption(151),
+				) + // bonding curve
+				BigInt(
+					await connection.getMinimumBalanceForRentExemption(170),
+				) + // Token-2022 ATA
+				BigInt(
+					await connection.getMinimumBalanceForRentExemption(340),
+				) + // mayhem_state (ephemeral)
+				BigInt(await connection.getMinimumBalanceForRentExemption(170)); // mayhem_token_vault (ephemeral)
+			const createMargin =
+				createRent +
+				postBuyFloorLamports() +
+				BigInt(30_000 + 5_000 * buys.length);
+			const creatorBal = await connection.getBalance(
+				creator.publicKey,
+				"confirmed",
+			);
+			log(
+				`fund    : dev wallets spend their OWN SOL; creator covers the create tx only (needs >= ${(Number(createMargin) / LAMPORTS_PER_SOL).toFixed(4)} SOL)`,
+			);
+			if (creatorBal < createMargin) {
+				throw new Error(
+					`creator balance ${(Number(creatorBal) / LAMPORTS_PER_SOL).toFixed(4)} SOL too low; need >= ${(Number(createMargin) / LAMPORTS_PER_SOL).toFixed(4)} SOL for the create tx (rent + floor + fees). Dev wallets are NOT funded from the creator anymore: fund/disperse them first.`,
+				);
+			}
 
-            // The creator funds ONLY the create tx. The pump.fun `create_v2`
-            // instruction makes the creator fund the accounts it allocates,
-            // all rent-exempt:
-            //   - Token-2022 mint (~400-570B; metadata lives IN-MINT via the
-            //     Token-2022 metadata extension, growing with the
-            //     name/symbol/uri length — there is NO Metaplex account)
-            //   - bonding curve (151B on live create_v2 tokens)
-            //   - bonding-curve ATA (Token-2022 token account = 170B)
-            //   - mayhem_state + mayhem_token_vault: created then CLOSED
-            //     for non-mayhem tokens (net zero, but the creator must
-            //     cover their rent mid-tx) — reserved as a flat buffer
-            // The creator is ALSO the fee payer on the create tx and every
-            // packed buy tx (each dev wallet keeps its own balance for the
-            // buy and pays no tx fee at launch), so the margin includes the
-            // base fee for the create + up to one base fee per buy wallet.
-            const mintSize =
-                340 +
-                Buffer.byteLength(name, 'utf8') +
-                Buffer.byteLength(symbol, 'utf8') +
-                Buffer.byteLength(finalUri, 'utf8')
-            const createRent =
-                BigInt(
-                    await connection.getMinimumBalanceForRentExemption(
-                        mintSize
-                    )
-                ) + // Token-2022 mint
-                BigInt(
-                    await connection.getMinimumBalanceForRentExemption(151)
-                ) + // bonding curve
-                BigInt(
-                    await connection.getMinimumBalanceForRentExemption(170)
-                ) + // Token-2022 ATA
-                BigInt(
-                    await connection.getMinimumBalanceForRentExemption(340)
-                ) + // mayhem_state (ephemeral)
-                BigInt(
-                    await connection.getMinimumBalanceForRentExemption(170)
-                ) // mayhem_token_vault (ephemeral)
-            const createMargin =
-                createRent +
-                postBuyFloorLamports() +
-                BigInt(30_000 + 5_000 * buys.length)
-            const creatorBal = await connection.getBalance(
-                creator.publicKey,
-                'confirmed'
-            )
-            log(
-                `fund    : dev wallets spend their OWN SOL; creator covers the create tx only (needs >= ${(Number(createMargin) / LAMPORTS_PER_SOL).toFixed(4)} SOL)`
-            )
-            if (creatorBal < createMargin) {
-                throw new Error(
-                    `creator balance ${(Number(creatorBal) / LAMPORTS_PER_SOL).toFixed(4)} SOL too low; need >= ${(Number(createMargin) / LAMPORTS_PER_SOL).toFixed(4)} SOL for the create tx (rent + floor + fees). Dev wallets are NOT funded from the creator anymore: fund/disperse them first.`
-                )
-            }
+			// Vanity mint: real pump.fun tokens have base58 mint ADDRESSES
+			// ending in the literal string "pump" (pump.fun grinds them
+			// client-side). Grind ours with a libsodium Web Worker pool
+			// (lib/vanity-client.ts; lib/vanity.ts single-threaded core is the
+			// fallback) so the create tx signs with a genuinely "...pump" mint
+			// keypair. Cosmetic, zero on-chain effect: name/symbol/uri are
+			// untouched — the .pump TICKER suffix is still indexer-applied.
+			// The mint secret key is never logged.
+			//
+			// One status-log slot ('vanity :' lines): the seed line is
+			// replaced in place by each throttled progress tick and finally by
+			// the found line, so the log does not flood during a ~1-2 min
+			// grind.
+			const logVanity = (line: string): void => {
+				setStatusLines((prev) => {
+					const last = prev[prev.length - 1] ?? "";
+					return last.startsWith("vanity :")
+						? [...prev.slice(0, -1), line]
+						: [...prev, line];
+				});
+			};
+			logVanity(
+				'vanity : grinding a mint keypair whose ADDRESS ends in "pump" (Web Workers, ~1-2 min)...',
+			);
+			const mintKeypair = await grindVanityMintKeypair({
+				onProgress: (p) =>
+					logVanity(
+						`vanity : grinding "...pump" mint — ${p.attempts.toLocaleString()} keypairs @ ${p.attemptsPerSecond.toLocaleString()}/s`,
+					),
+			});
+			logVanity(
+				`vanity : mint ${mintKeypair.publicKey.toBase58()} — ADDRESS ends in "pump"`,
+			);
 
-            // Vanity mint: real pump.fun tokens have base58 mint ADDRESSES
-            // ending in the literal string "pump" (pump.fun grinds them
-            // client-side). Grind ours with a libsodium Web Worker pool
-            // (lib/vanity-client.ts; lib/vanity.ts single-threaded core is the
-            // fallback) so the create tx signs with a genuinely "...pump" mint
-            // keypair. Cosmetic, zero on-chain effect: name/symbol/uri are
-            // untouched — the .pump TICKER suffix is still indexer-applied.
-            // The mint secret key is never logged.
-            //
-            // One status-log slot ('vanity :' lines): the seed line is
-            // replaced in place by each throttled progress tick and finally by
-            // the found line, so the log does not flood during a ~1-2 min
-            // grind.
-            const logVanity = (line: string): void => {
-                setStatusLines((prev) => {
-                    const last = prev[prev.length - 1] ?? ''
-                    return last.startsWith('vanity :')
-                        ? [...prev.slice(0, -1), line]
-                        : [...prev, line]
-                })
-            }
-            logVanity(
-                'vanity : grinding a mint keypair whose ADDRESS ends in "pump" (Web Workers, ~1-2 min)...'
-            )
-            const mintKeypair = await grindVanityMintKeypair({
-                onProgress: (p) =>
-                    logVanity(
-                        `vanity : grinding "...pump" mint — ${p.attempts.toLocaleString()} keypairs @ ${p.attemptsPerSecond.toLocaleString()}/s`
-                    ),
-            })
-            logVanity(
-                `vanity : mint ${mintKeypair.publicKey.toBase58()} — ADDRESS ends in "pump"`
-            )
+			const seq = await buildLaunchSequence({
+				connection,
+				creator,
+				name,
+				symbol,
+				uri: finalUri,
+				buys,
+				mintKeypair,
+				// No creator -> wallet funding txs: every dev wallet buys from
+				// its OWN pre-funded balance (the buildLaunchSequence default
+				// fundLamportsPerWallet = null emits no fund tx).
+				// Byte budget: every mainnet-launch buy tx now carries its OWN
+				// Helius Sender tip transfer (~90 bytes) — sendSequentially
+				// submits through the SWQOS-only sender on mainnet — so buy
+				// txs keep the default 1150-byte budget with the 90-byte tip
+				// reserve on BOTH tiers (the old tier-1 1222/0 override is
+				// gone). Measured (M10): pump.fun buy ixs pack 2 wallets/tx.
+			});
+			log(
+				`mint    : ${EXPLORER}/address/${seq.pda.mint.toBase58()}${EXPLORER_QS} (vanity keypair: the mint ADDRESS ends in "pump"; the .pump TICKER suffix is still indexer-applied)`,
+			);
+			log(
+				`curve   : ${EXPLORER}/address/${seq.pda.curveState.toBase58()}${EXPLORER_QS}`,
+			);
+			log(`packing : ${seq.buyTxs.length} buy tx(s):`);
+			for (const bt of seq.buyTxs) {
+				log(`   ${bt.wallets.length} wallets, ${bt.signedSize} bytes`);
+			}
 
-            const seq = await buildLaunchSequence({
-                connection,
-                creator,
-                name,
-                symbol,
-                uri: finalUri,
-                buys,
-                mintKeypair,
-                // No creator -> wallet funding txs: every dev wallet buys from
-                // its OWN pre-funded balance (the buildLaunchSequence default
-                // fundLamportsPerWallet = null emits no fund tx).
-                // Byte budget: every mainnet-launch buy tx now carries its OWN
-                // Helius Sender tip transfer (~90 bytes) — sendSequentially
-                // submits through the SWQOS-only sender on mainnet — so buy
-                // txs keep the default 1150-byte budget with the 90-byte tip
-                // reserve on BOTH tiers (the old tier-1 1222/0 override is
-                // gone). Measured (M10): pump.fun buy ixs pack 2 wallets/tx.
-            })
-            log(
-                `mint    : ${EXPLORER}/address/${seq.pda.mint.toBase58()}${EXPLORER_QS} (vanity keypair: the mint ADDRESS ends in "pump"; the .pump TICKER suffix is still indexer-applied)`
-            )
-            log(
-                `curve   : ${EXPLORER}/address/${seq.pda.curveState.toBase58()}${EXPLORER_QS}`
-            )
-            log(`packing : ${seq.buyTxs.length} buy tx(s):`)
-            for (const bt of seq.buyTxs) {
-                log(`   ${bt.wallets.length} wallets, ${bt.signedSize} bytes`)
-            }
+			log("preflight: simulating create + buy txs...");
+			// The create+buy sandbox overflows the 1232-byte legacy limit after
+			// pump.fun's upgrade, so the pre-flight sims use a shared address
+			// lookup table (created once, reused). Cheap on devnet.
+			const { account: lookupTable } = await ensurePumpLookupTable(
+				connection,
+				creator,
+			);
+			const pre = await preflightLaunch(connection, seq, lookupTable);
+			log(`   create: ${pre.create.unitsConsumed} CU, ok`);
+			for (const c of pre.buyChunks) {
+				log(
+					`   buy${c.buyTxIndex + 1} chunk (${c.walletCount}): ${c.result.unitsConsumed} CU, ok`,
+				);
+			}
 
-            log('preflight: simulating create + buy txs...')
-            // The create+buy sandbox overflows the 1232-byte legacy limit after
-            // pump.fun's upgrade, so the pre-flight sims use a shared address
-            // lookup table (created once, reused). Cheap on devnet.
-            const { account: lookupTable } = await ensurePumpLookupTable(
-                connection,
-                creator
-            )
-            const pre = await preflightLaunch(connection, seq, lookupTable)
-            log(`   create: ${pre.create.unitsConsumed} CU, ok`)
-            for (const c of pre.buyChunks) {
-                log(
-                    `   buy${c.buyTxIndex + 1} chunk (${c.walletCount}): ${c.result.unitsConsumed} CU, ok`
-                )
-            }
+			if (tier === "1") {
+				log(
+					"sending launch txs sequentially (fund -> create -> buys)...",
+				);
+				// sendSequentially routes each launch tx through Helius Sender
+				// SWQOS-only on mainnet (flat 5,000-lamport tip, LAST
+				// instruction, + the tx's own priority fee) and through plain
+				// RPC on devnet.
+				const sent = await sendSequentially(connection, seq, {
+					onSignature: (label, sig) => {
+						sentSigs.push(sig);
+						log(
+							`[${label}] ${sig}  ${EXPLORER}/tx/${sig}${EXPLORER_QS}`,
+						);
+					},
+				});
+				log(
+					`sent ${sent.length} txs: ${sent.map((s) => s.label).join(", ")}`,
+				);
+			} else {
+				// Tier 2 (atomic relay bundle: NextBlock PRIMARY, Astralane
+				// Iris + bloXroute OPTIONAL fallbacks). Relay credentials
+				// live server-side; the browser assembles a PROVIDER-SPECIFIC
+				// signed bundle per enabled relay (each paying that relay's
+				// own recognized tip account) and the same-origin proxy
+				// (/api/bundle-relay) submits them sequentially — NextBlock
+				// first, Astralane/bloXroute only on an explicit reject /
+				// unreachable.
+				// M7a: a non-landing bundle must NEVER fall through to the
+				// "launch complete" block below, so the tier-2 outcome is
+				// captured here and a non-landing result throws before any
+				// verification (pending accepts get a bounded on-chain mint
+				// wait first — an accept is NOT a landing).
+				log("tier 2: assembling atomic relay bundle...");
+				const tier2TipLamports = parseTip();
+				log(
+					`tip     : ${tier2TipLamports} lamports (${(tier2TipLamports / LAMPORTS_PER_SOL).toFixed(6)} SOL)`,
+				);
+				// Relay plan (ids + configured flags only, no secrets): the
+				// SERVER env decides which relays exist. There is no
+				// Jito-specific reachability probe on the active path.
+				let plan: RelayPlanEntry[] = [];
+				try {
+					plan = await fetchRelayPlan();
+				} catch (e) {
+					log(`relay plan fetch failed: ${errMsg(e)}`);
+				}
+				if (plan.length === 0) {
+					log("relay plan: the server reported no relays");
+				}
+				for (const r of plan) {
+					log(
+						`relay   : ${r.id} (${r.role}) ${r.configured ? "configured" : "NOT configured (disabled)"}`,
+					);
+				}
+				const enabledRelays = plan
+					.filter((r) => r.configured)
+					.map((r) => r.id);
+				let tier2Result: BundleSubmissionResult | null = null;
+				const bundleTxs = [
+					seq.fundTx,
+					seq.createTx,
+					...seq.buyTxs.map((b) => b.tx),
+				].filter((t): t is NonNullable<typeof t> => t !== null);
+				const bundleSigners = seq.signersByTx;
+				// NextBlock / Astralane / bloXroute bundles cap at 4 txs
+				// (pump.fun buy ixs pack 2 wallets per tx, measured M10), so
+				// a launch over ~6 funded wallets exceeds the cap. Surface
+				// that BEFORE the assembler's cryptic cap error with the
+				// actionable fix.
+				const TIER2_BUNDLE_CAP = 4;
+				if (bundleTxs.length > TIER2_BUNDLE_CAP) {
+					const nonBuyTxs = bundleTxs.length - seq.buyTxs.length;
+					const maxWallets = 2 * (TIER2_BUNDLE_CAP - nonBuyTxs);
+					throw new Error(
+						`TIER 2 BUNDLE CAP: ${bundleTxs.length} txs > the ${TIER2_BUNDLE_CAP}-tx NextBlock/Astralane/bloXroute bundle limit (pump.fun buy ixs pack 2 wallets per tx). Reduce the selected dev wallets to at most ${maxWallets} or use Tier 1 (sequential sends).`,
+					);
+				}
+				// Representative tip account for the sandbox sim: the PRIMARY
+				// configured relay's official tip account (first configured
+				// relay in order; the nextblock constant when nothing is
+				// configured, so a no-creds rehearsal still proves the
+				// construction). The real per-relay tips are chosen inside
+				// the submitter for EVERY enabled relay.
+				const simRelay: RelayId =
+					enabledRelays.length > 0 ? enabledRelays[0] : "nextblock";
+				const simTipAccount = new PublicKey(
+					defaultTipAccountForRelay(simRelay),
+				);
+				log(
+					`tip acct: ${simTipAccount.toBase58()} (${simRelay}, primary)`,
+				);
+				const tipIx = SystemProgram.transfer({
+					fromPubkey: creator.publicKey,
+					toPubkey: simTipAccount,
+					lamports: tier2TipLamports,
+				});
+				const sims = await simulateBundle(connection, {
+					createIx: seq.createIx,
+					fundIx: seq.fundIx,
+					fundIxPerWallet: seq.fundIxPerWallet,
+					buyTxs: seq.buyTxs.map((bt) => ({
+						wallets: bt.wallets,
+						walletIxs: bt.walletIxs,
+					})),
+					tipIx,
+					creator,
+					mintKeypair: seq.mintKeypair,
+					lookupTable,
+				});
+				for (const s of sims)
+					log(`   ${s.label}: ${s.unitsConsumed} CU, ok`);
+				if (enabledRelays.length === 0) {
+					// Assembly + simulation proved the construction. Without
+					// server-side relay credentials submission is impossible:
+					// report the honest not-configured state, never a
+					// fabricated landing.
+					log(
+						"TIER 2 RESULT: bundle assembled + simulated; submission impossible (no relay credentials configured server-side). No fabricated landing claim.",
+					);
+					throw new Error(
+						"TIER 2 NOT CONFIGURED: no Tier 2 relay credentials on the server. Set NEXTBLOCK_API_KEY (primary; docs.nextblock.io) and optionally ASTRALANE_API_KEY / BLOXROUTE_JWT (fallbacks) in the server env — never NEXT_PUBLIC_ — then re-run. NOTHING WAS CREATED. On devnet, Tier 2 relays are mainnet services: use Tier 1 normal sends.",
+					);
+				} else {
+					log(
+						`submitting provider-specific bundle variants via relay proxy (${enabledRelays.join(" -> ")})...`,
+					);
+					// The launch txs are assembled into ONE PROVIDER-SPECIFIC
+					// signed bundle per enabled relay (each paying that
+					// relay's own recognized tip account in its final tx) and
+					// submitted through /api/bundle-relay SEQUENTIALLY:
+					// NextBlock primary first, Astralane/bloXroute fallback
+					// only when NextBlock explicitly rejects or is
+					// unreachable — never simultaneously. Credentials stay
+					// server-side; only the
+					// signed base64 variants leave this page. Each attempt
+					// re-assembles with a fresh blockhash at the same tip
+					// (safe: a landed create makes later attempts revert).
+					tier2Result = await submitBundleViaFanoutWithRetry({
+						txs: bundleTxs,
+						signersByTx: bundleSigners,
+						tipPayer: creator,
+						initialTipLamports: tier2TipLamports,
+						relays: enabledRelays,
+						pollTimeoutMs: 40_000,
+						pollIntervalMs: 2_500,
+						connection,
+						onAttempt: (a) => {
+							const segs = [
+								`attempt ${a.attempt}`,
+								`tip ${a.tipLamports}`,
+								a.bundleId ? `bundle ${a.bundleId}` : "",
+								a.status ? `status ${a.status}` : "",
+								a.winningRelay ? `relay ${a.winningRelay}` : "",
+								a.rejectionReason
+									? `reason ${a.rejectionReason}`
+									: "",
+								a.rejectionMsg ? `msg ${a.rejectionMsg}` : "",
+								a.blockhash ? `blockhash ${a.blockhash}` : "",
+								a.lastValidBlockHeight != null
+									? `lastValidBlockHeight ${a.lastValidBlockHeight}`
+									: "",
+								a.txSignatures && a.txSignatures.length
+									? `sigs ${a.txSignatures.join(",")}`
+									: "",
+								a.sendError ? `error ${a.sendError}` : "",
+							].filter((s) => s !== "");
+							log(`   ${segs.join(", ")}`);
+						},
+					});
+					log(
+						`TIER 2 RESULT: ${tier2Result.outcome}${tier2Result.bundleId ? ` (bundle ${tier2Result.bundleId})` : ""}${tier2Result.landedSlot != null ? `, landed slot ${tier2Result.landedSlot}` : ""}`,
+					);
+				}
+				// M7a bundle-drop reconciliation: only a LANDED bundle is a
+				// launch. Astralane/bloXroute accepts carry no status API, so
+				// a pending accept is resolved with a bounded on-chain mint
+				// wait (the fresh mint account appears only if the atomic
+				// bundle executed). Anything un-landed throws with an honest
+				// summary and a retry path; the outer catch turns it into the
+				// FAILED toast (no LAUNCHED toast, no trade-panel prefill, no
+				// phantom "launch complete").
+				let tier2Landed = tier2Result?.outcome === "landed";
+				if (tier2Result?.outcome === "pending" && !tier2Landed) {
+					log(
+						"relay accepted the bundle but exposes no status API — verifying the launch on-chain (mint appearing)...",
+					);
+					const mintAppeared = await waitForMintOnChain(
+						connection,
+						seq.pda.mint,
+						25_000,
+					);
+					if (mintAppeared) {
+						log(
+							"mint confirmed on-chain: the relayed bundle LANDED. Proceeding to verification.",
+						);
+						tier2Landed = true;
+					} else {
+						log(
+							"mint NOT confirmed on-chain within 25s: the accepted bundle did not land (nothing was created).",
+						);
+					}
+				}
+				if (!tier2Result || !tier2Landed) {
+					// M7b observability: a rejected bundle leaves a full trace
+					// in the log so the culprit class (TransactionFailure /
+					// ExceedsCostModel / BlockhashNotFound / TipError /
+					// nothing-landed) is identifiable without re-running. The
+					// base64 of each attempt's signed txs rides on
+					// tier2Result.attempts[].base64 for decoding against the
+					// chain (the rejection reason alone cannot name the tx).
+					const lastA = tier2Result?.attempts?.length
+						? tier2Result.attempts[tier2Result.attempts.length - 1]
+						: null;
+					const simSummary = sims
+						.map((s) => `${s.label} ${s.unitsConsumed ?? "?"} CU`)
+						.join(", ");
+					log("tier 2 diagnostic (rejected):");
+					log(
+						`  bundle id            : ${lastA?.bundleId ?? "none"}`,
+					);
+					log(`  status               : ${lastA?.status ?? "n/a"}`);
+					log(
+						`  rejection reason     : ${lastA?.rejectionReason ?? "n/a"}`,
+					);
+					log(
+						`  rejection msg        : ${lastA?.rejectionMsg ?? "n/a"}`,
+					);
+					log(
+						`  blockhash            : ${lastA?.blockhash ?? "n/a"}`,
+					);
+					log(
+						`  lastValidBlockHeight : ${lastA?.lastValidBlockHeight ?? "n/a"}`,
+					);
+					log(
+						`  tip (lamports)       : ${lastA?.tipLamports ?? "n/a"}`,
+					);
+					log(
+						`  tx signatures        : ${
+							lastA?.txSignatures?.length
+								? lastA.txSignatures.join(", ")
+								: "n/a"
+						}`,
+					);
+					log(`  sim/preflight        : ${simSummary || "n/a"}`);
+					log(
+						`  attempts             : ${
+							tier2Result
+								? tier2Result.attempts
+										.map(
+											(t) =>
+												`#${t.attempt} ${t.status ?? ""}${
+													t.rejectionReason
+														? ` (${t.rejectionReason})`
+														: ""
+												}`,
+										)
+										.join("; ")
+								: "n/a"
+						}`,
+					);
+					// Raw signed bundle(s): decode offline to diff every
+					// account/PDA against the chain. The active Tier 2 relays
+					// expose no rejection_reason / status API, so the signed
+					// base64 is the ONLY artifact that names the culprit tx.
+					for (const t of tier2Result?.attempts ?? []) {
+						if (t.base64?.length) {
+							log(
+								`  bundle b64 (attempt ${t.attempt}${
+									t.bundleId ? `, id ${t.bundleId}` : ""
+								}): ${JSON.stringify(t.base64)}`,
+							);
+						}
+					}
+					throw new Error(
+						tier2Result
+							? bundleDropMessage(tier2Result)
+							: "TIER 2 BUNDLE HAD NO RESULT: nothing was created.",
+					);
+				}
+			}
 
-            if (tier === '1') {
-                log(
-                    'sending launch txs sequentially (fund -> create -> buys)...'
-                )
-                // sendSequentially routes each launch tx through Helius Sender
-                // SWQOS-only on mainnet (flat 5,000-lamport tip, LAST
-                // instruction, + the tx's own priority fee) and through plain
-                // RPC on devnet.
-                const sent = await sendSequentially(connection, seq, {
-                    onSignature: (label, sig) => {
-                        sentSigs.push(sig)
-                        log(
-                            `[${label}] ${sig}  ${EXPLORER}/tx/${sig}${EXPLORER_QS}`
-                        )
-                    },
-                })
-                log(
-                    `sent ${sent.length} txs: ${sent.map((s) => s.label).join(', ')}`
-                )
-            } else {
-                // Tier 2 (atomic relay bundle: NextBlock PRIMARY, Astralane
-                // Iris + bloXroute OPTIONAL fallbacks). Relay credentials
-                // live server-side; the browser assembles a PROVIDER-SPECIFIC
-                // signed bundle per enabled relay (each paying that relay's
-                // own recognized tip account) and the same-origin proxy
-                // (/api/bundle-relay) submits them sequentially — NextBlock
-                // first, Astralane/bloXroute only on an explicit reject /
-                // unreachable.
-                // M7a: a non-landing bundle must NEVER fall through to the
-                // "launch complete" block below, so the tier-2 outcome is
-                // captured here and a non-landing result throws before any
-                // verification (pending accepts get a bounded on-chain mint
-                // wait first — an accept is NOT a landing).
-                log('tier 2: assembling atomic relay bundle...')
-                const tier2TipLamports = parseTip()
-                log(
-                    `tip     : ${tier2TipLamports} lamports (${(tier2TipLamports / LAMPORTS_PER_SOL).toFixed(6)} SOL)`
-                )
-                // Relay plan (ids + configured flags only, no secrets): the
-                // SERVER env decides which relays exist. There is no
-                // Jito-specific reachability probe on the active path.
-                let plan: RelayPlanEntry[] = []
-                try {
-                    plan = await fetchRelayPlan()
-                } catch (e) {
-                    log(`relay plan fetch failed: ${errMsg(e)}`)
-                }
-                if (plan.length === 0) {
-                    log('relay plan: the server reported no relays')
-                }
-                for (const r of plan) {
-                    log(
-                        `relay   : ${r.id} (${r.role}) ${r.configured ? 'configured' : 'NOT configured (disabled)'}`
-                    )
-                }
-                const enabledRelays = plan
-                    .filter((r) => r.configured)
-                    .map((r) => r.id)
-                let tier2Result: BundleSubmissionResult | null = null
-                const bundleTxs = [
-                    seq.fundTx,
-                    seq.createTx,
-                    ...seq.buyTxs.map((b) => b.tx),
-                ].filter((t): t is NonNullable<typeof t> => t !== null)
-                const bundleSigners = seq.signersByTx
-                // NextBlock / Astralane / bloXroute bundles cap at 4 txs
-                // (pump.fun buy ixs pack 2 wallets per tx, measured M10), so
-                // a launch over ~6 funded wallets exceeds the cap. Surface
-                // that BEFORE the assembler's cryptic cap error with the
-                // actionable fix.
-                const TIER2_BUNDLE_CAP = 4
-                if (bundleTxs.length > TIER2_BUNDLE_CAP) {
-                    const nonBuyTxs = bundleTxs.length - seq.buyTxs.length
-                    const maxWallets = 2 * (TIER2_BUNDLE_CAP - nonBuyTxs)
-                    throw new Error(
-                        `TIER 2 BUNDLE CAP: ${bundleTxs.length} txs > the ${TIER2_BUNDLE_CAP}-tx NextBlock/Astralane/bloXroute bundle limit (pump.fun buy ixs pack 2 wallets per tx). Reduce the selected dev wallets to at most ${maxWallets} or use Tier 1 (sequential sends).`
-                    )
-                }
-                // Representative tip account for the sandbox sim: the PRIMARY
-                // configured relay's official tip account (first configured
-                // relay in order; the nextblock constant when nothing is
-                // configured, so a no-creds rehearsal still proves the
-                // construction). The real per-relay tips are chosen inside
-                // the submitter for EVERY enabled relay.
-                const simRelay: RelayId =
-                    enabledRelays.length > 0 ? enabledRelays[0] : 'nextblock'
-                const simTipAccount = new PublicKey(
-                    defaultTipAccountForRelay(simRelay)
-                )
-                log(
-                    `tip acct: ${simTipAccount.toBase58()} (${simRelay}, primary)`
-                )
-                const tipIx = SystemProgram.transfer({
-                    fromPubkey: creator.publicKey,
-                    toPubkey: simTipAccount,
-                    lamports: tier2TipLamports,
-                })
-                const sims = await simulateBundle(connection, {
-                    createIx: seq.createIx,
-                    fundIx: seq.fundIx,
-                    fundIxPerWallet: seq.fundIxPerWallet,
-                    buyTxs: seq.buyTxs.map((bt) => ({
-                        wallets: bt.wallets,
-                        walletIxs: bt.walletIxs,
-                    })),
-                    tipIx,
-                    creator,
-                    mintKeypair: seq.mintKeypair,
-                    lookupTable,
-                })
-                for (const s of sims)
-                    log(`   ${s.label}: ${s.unitsConsumed} CU, ok`)
-                if (enabledRelays.length === 0) {
-                    // Assembly + simulation proved the construction. Without
-                    // server-side relay credentials submission is impossible:
-                    // report the honest not-configured state, never a
-                    // fabricated landing.
-                    log(
-                        'TIER 2 RESULT: bundle assembled + simulated; submission impossible (no relay credentials configured server-side). No fabricated landing claim.'
-                    )
-                    throw new Error(
-                        'TIER 2 NOT CONFIGURED: no Tier 2 relay credentials on the server. Set NEXTBLOCK_API_KEY (primary; docs.nextblock.io) and optionally ASTRALANE_API_KEY / BLOXROUTE_JWT (fallbacks) in the server env — never NEXT_PUBLIC_ — then re-run. NOTHING WAS CREATED. On devnet, Tier 2 relays are mainnet services: use Tier 1 normal sends.'
-                    )
-                } else {
-                    log(
-                        `submitting provider-specific bundle variants via relay proxy (${enabledRelays.join(' -> ')})...`
-                    )
-                    // The launch txs are assembled into ONE PROVIDER-SPECIFIC
-                    // signed bundle per enabled relay (each paying that
-                    // relay's own recognized tip account in its final tx) and
-                    // submitted through /api/bundle-relay SEQUENTIALLY:
-                    // NextBlock primary first, Astralane/bloXroute fallback
-                    // only when NextBlock explicitly rejects or is
-                    // unreachable — never simultaneously. Credentials stay
-                    // server-side; only the
-                    // signed base64 variants leave this page. Each attempt
-                    // re-assembles with a fresh blockhash at the same tip
-                    // (safe: a landed create makes later attempts revert).
-                    tier2Result = await submitBundleViaFanoutWithRetry({
-                        txs: bundleTxs,
-                        signersByTx: bundleSigners,
-                        tipPayer: creator,
-                        initialTipLamports: tier2TipLamports,
-                        relays: enabledRelays,
-                        pollTimeoutMs: 40_000,
-                        pollIntervalMs: 2_500,
-                        connection,
-                        onAttempt: (a) => {
-                            const segs = [
-                                `attempt ${a.attempt}`,
-                                `tip ${a.tipLamports}`,
-                                a.bundleId ? `bundle ${a.bundleId}` : '',
-                                a.status ? `status ${a.status}` : '',
-                                a.winningRelay ? `relay ${a.winningRelay}` : '',
-                                a.rejectionReason
-                                    ? `reason ${a.rejectionReason}`
-                                    : '',
-                                a.rejectionMsg ? `msg ${a.rejectionMsg}` : '',
-                                a.blockhash ? `blockhash ${a.blockhash}` : '',
-                                a.lastValidBlockHeight != null
-                                    ? `lastValidBlockHeight ${a.lastValidBlockHeight}`
-                                    : '',
-                                a.txSignatures && a.txSignatures.length
-                                    ? `sigs ${a.txSignatures.join(',')}`
-                                    : '',
-                                a.sendError ? `error ${a.sendError}` : '',
-                            ].filter((s) => s !== '')
-                            log(`   ${segs.join(', ')}`)
-                        },
-                    })
-                    log(
-                        `TIER 2 RESULT: ${tier2Result.outcome}${tier2Result.bundleId ? ` (bundle ${tier2Result.bundleId})` : ''}${tier2Result.landedSlot != null ? `, landed slot ${tier2Result.landedSlot}` : ''}`
-                    )
-                }
-                // M7a bundle-drop reconciliation: only a LANDED bundle is a
-                // launch. Astralane/bloXroute accepts carry no status API, so
-                // a pending accept is resolved with a bounded on-chain mint
-                // wait (the fresh mint account appears only if the atomic
-                // bundle executed). Anything un-landed throws with an honest
-                // summary and a retry path; the outer catch turns it into the
-                // FAILED toast (no LAUNCHED toast, no trade-panel prefill, no
-                // phantom "launch complete").
-                let tier2Landed = tier2Result?.outcome === 'landed'
-                if (tier2Result?.outcome === 'pending' && !tier2Landed) {
-                    log(
-                        'relay accepted the bundle but exposes no status API — verifying the launch on-chain (mint appearing)...'
-                    )
-                    const mintAppeared = await waitForMintOnChain(
-                        connection,
-                        seq.pda.mint,
-                        25_000
-                    )
-                    if (mintAppeared) {
-                        log(
-                            'mint confirmed on-chain: the relayed bundle LANDED. Proceeding to verification.'
-                        )
-                        tier2Landed = true
-                    } else {
-                        log(
-                            'mint NOT confirmed on-chain within 25s: the accepted bundle did not land (nothing was created).'
-                        )
-                    }
-                }
-                if (!tier2Result || !tier2Landed) {
-                    // M7b observability: a rejected bundle leaves a full trace
-                    // in the log so the culprit class (TransactionFailure /
-                    // ExceedsCostModel / BlockhashNotFound / TipError /
-                    // nothing-landed) is identifiable without re-running. The
-                    // base64 of each attempt's signed txs rides on
-                    // tier2Result.attempts[].base64 for decoding against the
-                    // chain (the rejection reason alone cannot name the tx).
-                    const lastA = tier2Result?.attempts?.length
-                        ? tier2Result.attempts[tier2Result.attempts.length - 1]
-                        : null
-                    const simSummary = sims
-                        .map((s) => `${s.label} ${s.unitsConsumed ?? '?'} CU`)
-                        .join(', ')
-                    log('tier 2 diagnostic (rejected):')
-                    log(`  bundle id            : ${lastA?.bundleId ?? 'none'}`)
-                    log(`  status               : ${lastA?.status ?? 'n/a'}`)
-                    log(
-                        `  rejection reason     : ${lastA?.rejectionReason ?? 'n/a'}`
-                    )
-                    log(
-                        `  rejection msg        : ${lastA?.rejectionMsg ?? 'n/a'}`
-                    )
-                    log(`  blockhash            : ${lastA?.blockhash ?? 'n/a'}`)
-                    log(
-                        `  lastValidBlockHeight : ${lastA?.lastValidBlockHeight ?? 'n/a'}`
-                    )
-                    log(
-                        `  tip (lamports)       : ${lastA?.tipLamports ?? 'n/a'}`
-                    )
-                    log(
-                        `  tx signatures        : ${
-                            lastA?.txSignatures?.length
-                                ? lastA.txSignatures.join(', ')
-                                : 'n/a'
-                        }`
-                    )
-                    log(`  sim/preflight        : ${simSummary || 'n/a'}`)
-                    log(
-                        `  attempts             : ${
-                            tier2Result
-                                ? tier2Result.attempts
-                                      .map(
-                                          (t) =>
-                                              `#${t.attempt} ${t.status ?? ''}${
-                                                  t.rejectionReason
-                                                      ? ` (${t.rejectionReason})`
-                                                      : ''
-                                              }`
-                                      )
-                                      .join('; ')
-                                : 'n/a'
-                        }`
-                    )
-                    // Raw signed bundle(s): decode offline to diff every
-                    // account/PDA against the chain. The active Tier 2 relays
-                    // expose no rejection_reason / status API, so the signed
-                    // base64 is the ONLY artifact that names the culprit tx.
-                    for (const t of tier2Result?.attempts ?? []) {
-                        if (t.base64?.length) {
-                            log(
-                                `  bundle b64 (attempt ${t.attempt}${
-                                    t.bundleId ? `, id ${t.bundleId}` : ''
-                                }): ${JSON.stringify(t.base64)}`
-                            )
-                        }
-                    }
-                    throw new Error(
-                        tier2Result
-                            ? bundleDropMessage(tier2Result)
-                            : 'TIER 2 BUNDLE HAD NO RESULT: nothing was created.'
-                    )
-                }
-            }
+			// ---- post-launch verification -------------------------------
+			const mint = seq.pda.mint.toBase58();
+			const mintPk = seq.pda.mint;
+			log("");
+			log("=== on-chain verification ===");
+			log(`token   : ${EXPLORER}/address/${mint}${EXPLORER_QS}`);
+			log(
+				`curve   : ${EXPLORER}/address/${seq.pda.curveState.toBase58()}${EXPLORER_QS}`,
+			);
 
-            // ---- post-launch verification -------------------------------
-            const mint = seq.pda.mint.toBase58()
-            const mintPk = seq.pda.mint
-            log('')
-            log('=== on-chain verification ===')
-            log(`token   : ${EXPLORER}/address/${mint}${EXPLORER_QS}`)
-            log(
-                `curve   : ${EXPLORER}/address/${seq.pda.curveState.toBase58()}${EXPLORER_QS}`
-            )
+			const balances = [];
+			for (const b of buys) {
+				const bal = await walletTokenBalance(
+					connection,
+					b.wallet.publicKey,
+					mintPk,
+				);
+				balances.push(bal);
+				log(
+					`   ${b.wallet.publicKey.toBase58().slice(0, 12)}...  ${(Number(bal) / 1e6).toFixed(6)} tokens`,
+				);
+			}
+			const rosterHolders = balances.filter((b) => b > BigInt(0)).length;
+			log(`holders (selected dev roster, non-zero): ${rosterHolders}`);
+			try {
+				const holders = await holderCount(connection, mintPk);
+				log(`holders (getTokenLargestAccounts): ${holders}`);
+			} catch {
+				log(
+					"holders (getTokenLargestAccounts): rate-limited on the public devnet RPC;",
+				);
+				log(
+					"   the selected-wallet roster above is the authoritative count.",
+				);
+			}
+			try {
+				// M10: pump.fun curve state (bonding-curve PDA parsed in
+				// lib/pump.ts; virtual reserves + the complete flag).
+				const curveRead = await readPumpCurveState(connection, mintPk);
+				if (curveRead.kind === "ok") {
+					const c = curveRead.curve;
+					log(
+						`curve state: virtualSol=${c.virtualSolReserves} virtualToken=${c.virtualTokenReserves} complete=${c.complete ? 1 : 0}`,
+					);
+					log(
+						`price      : ${(Number(c.virtualSolReserves) / Number(c.virtualTokenReserves)).toFixed(6)} lamports/token`,
+					);
+				} else {
+					log("curve state: not found (create tx did not land?)");
+				}
+			} catch (e) {
+				log(`curve state read failed: ${errMsg(e)}`);
+			}
+			const meta = await readToken2022Metadata(connection, seq.pda.mint);
+			if (meta) {
+				log(
+					`metadata  : name="${meta.name}" symbol="${meta.symbol}" uri=${meta.uri}`,
+				);
+			} else {
+				log(
+					"metadata  : could not decode the Token-2022 in-mint metadata",
+				);
+			}
+			log("=== launch complete ===");
 
-            const balances = []
-            for (const b of buys) {
-                const bal = await walletTokenBalance(
-                    connection,
-                    b.wallet.publicKey,
-                    mintPk
-                )
-                balances.push(bal)
-                log(
-                    `   ${b.wallet.publicKey.toBase58().slice(0, 12)}...  ${(Number(bal) / 1e6).toFixed(6)} tokens`
-                )
-            }
-            const rosterHolders = balances.filter((b) => b > BigInt(0)).length
-            log(`holders (selected dev roster, non-zero): ${rosterHolders}`)
-            try {
-                const holders = await holderCount(connection, mintPk)
-                log(`holders (getTokenLargestAccounts): ${holders}`)
-            } catch {
-                log(
-                    'holders (getTokenLargestAccounts): rate-limited on the public devnet RPC;'
-                )
-                log(
-                    '   the selected-wallet roster above is the authoritative count.'
-                )
-            }
-            try {
-                // M10: pump.fun curve state (bonding-curve PDA parsed in
-                // lib/pump.ts; virtual reserves + the complete flag).
-                const curveRead = await readPumpCurveState(connection, mintPk)
-                if (curveRead.kind === 'ok') {
-                    const c = curveRead.curve
-                    log(
-                        `curve state: virtualSol=${c.virtualSolReserves} virtualToken=${c.virtualTokenReserves} complete=${c.complete ? 1 : 0}`
-                    )
-                    log(
-                        `price      : ${(Number(c.virtualSolReserves) / Number(c.virtualTokenReserves)).toFixed(6)} lamports/token`
-                    )
-                } else {
-                    log('curve state: not found (create tx did not land?)')
-                }
-            } catch (e) {
-                log(`curve state read failed: ${errMsg(e)}`)
-            }
-            const meta = await readToken2022Metadata(connection, seq.pda.mint)
-            if (meta) {
-                log(
-                    `metadata  : name="${meta.name}" symbol="${meta.symbol}" uri=${meta.uri}`
-                )
-            } else {
-                log(
-                    'metadata  : could not decode the Token-2022 in-mint metadata'
-                )
-            }
-            log('=== launch complete ===')
+			roster.setTrackedMint(mint);
+			setLastMint(mint);
+			onLaunched?.(mint);
+			// Toast: LAUNCHED, amount = symbol, txHash = the first signature.
+			if (tier === "1" && sentSigs.length > 0) {
+				pushToast({
+					action: "LAUNCHED",
+					amount: `$${symbol}`,
+					txHash: sentSigs[0],
+				});
+			}
+		} catch (e) {
+			const rawMsg = errMsg(e);
+			log(`LAUNCH FAILED: ${rawMsg}`);
+			if (rawMsg.includes("METADATA BACKEND NOT CONFIGURED")) {
+				log(
+					'NOTE: metadata backend not configured. Enable "manual metadata',
+				);
+				log(
+					'      uri" in Advanced (devnet) or set METADATA_BACKEND +',
+				);
+				log(
+					"      METADATA_VPS_* / PINATA_JWT in the server env (mainnet).",
+				);
+			}
+			if (e instanceof Error && e.stack) {
+				log(e.stack.split("\n").slice(0, 5).join("\n"));
+			}
+			// M7a error surfacing: rate-limit / expired blockhash / insufficient
+			// funds / rent map to actionable text; the raw message stays in the log
+			// above for debugging.
+			const msg = friendlyTxError(rawMsg);
+			log(`LAUNCH FAILED (friendly): ${msg}`);
+			setLaunchError(msg);
+			// Toast: LAUNCH FAILED. A bundle that did not land is NOT "TX
+			// REVERTED": the amount line says BUNDLE DID NOT LAND so the operator
+			// knows nothing was created and the retry path from the status log
+			// applies. txHash = first signature seen (none when nothing sent).
+			const bundleDrop =
+				/BUNDLE DID NOT LAND|BUNDLE COULD NOT BE SUBMITTED|TIER 2 NOT CONFIGURED|JITO BUNDLE|TIER 2 BUNDLE/i.test(
+					rawMsg,
+				);
+			pushToast({
+				action: "LAUNCH FAILED",
+				amount: bundleDrop ? "BUNDLE DID NOT LAND" : "TX REVERTED",
+				txHash: sentSigs.length > 0 ? sentSigs[0] : undefined,
+				tone: "error",
+			});
+		} finally {
+			setBusy(false);
+		}
+	};
 
-            roster.setTrackedMint(mint)
-            setLastMint(mint)
-            onLaunched?.(mint)
-            // Toast: LAUNCHED, amount = symbol, txHash = the first signature.
-            if (tier === '1' && sentSigs.length > 0) {
-                pushToast({
-                    action: 'LAUNCHED',
-                    amount: `$${symbol}`,
-                    txHash: sentSigs[0],
-                })
-            }
-        } catch (e) {
-            const rawMsg = errMsg(e)
-            log(`LAUNCH FAILED: ${rawMsg}`)
-            if (rawMsg.includes('METADATA BACKEND NOT CONFIGURED')) {
-                log(
-                    'NOTE: metadata backend not configured. Enable "manual metadata'
-                )
-                log('      uri" in Advanced (devnet) or set METADATA_BACKEND +')
-                log(
-                    '      METADATA_VPS_* / PINATA_JWT in the server env (mainnet).'
-                )
-            }
-            if (e instanceof Error && e.stack) {
-                log(e.stack.split('\n').slice(0, 5).join('\n'))
-            }
-            // M7a error surfacing: rate-limit / expired blockhash / insufficient
-            // funds / rent map to actionable text; the raw message stays in the log
-            // above for debugging.
-            const msg = friendlyTxError(rawMsg)
-            log(`LAUNCH FAILED (friendly): ${msg}`)
-            setLaunchError(msg)
-            // Toast: LAUNCH FAILED. A bundle that did not land is NOT "TX
-            // REVERTED": the amount line says BUNDLE DID NOT LAND so the operator
-            // knows nothing was created and the retry path from the status log
-            // applies. txHash = first signature seen (none when nothing sent).
-            const bundleDrop =
-                /BUNDLE DID NOT LAND|BUNDLE COULD NOT BE SUBMITTED|TIER 2 NOT CONFIGURED|JITO BUNDLE|TIER 2 BUNDLE/i.test(
-                    rawMsg
-                )
-            pushToast({
-                action: 'LAUNCH FAILED',
-                amount: bundleDrop ? 'BUNDLE DID NOT LAND' : 'TX REVERTED',
-                txHash: sentSigs.length > 0 ? sentSigs[0] : undefined,
-                tone: 'error',
-            })
-        } finally {
-            setBusy(false)
-        }
-    }
+	// M6 SELL ALL (moved here from the trade card's tab strip 2026-09-04):
+	// one button below Launch sells EVERY keyed managed wallet's full token
+	// balance of the mint the Trade panel tracks (a launch pre-fills that
+	// field). Route on curve state: curve sell while open, PumpSwap pool
+	// sell after graduation (lib/sell-all.ts). Ignores the roster checkbox
+	// selection like the old tab did.
+	const [sellBusy, setSellBusy] = useState(false);
+	const [sellError, setSellError] = useState<string | null>(null);
+	const [sellReport, setSellReport] = useState<SellAllReport | null>(null);
+	const keyedCount = roster.wallets.filter((w) => w.key).length;
 
-    // M6 SELL ALL (moved here from the trade card's tab strip 2026-09-04):
-    // one button below Launch sells EVERY keyed managed wallet's full token
-    // balance of the mint the Trade panel tracks (a launch pre-fills that
-    // field). Route on curve state: curve sell while open, PumpSwap pool
-    // sell after graduation (lib/sell-all.ts). Ignores the roster checkbox
-    // selection like the old tab did.
-    const [sellBusy, setSellBusy] = useState(false)
-    const [sellError, setSellError] = useState<string | null>(null)
-    const [sellReport, setSellReport] = useState<SellAllReport | null>(null)
-    const keyedCount = roster.wallets.filter((w) => w.key).length
+	const handleSellAll = async () => {
+		if (sellBusy) return;
+		if (!mint) {
+			setSellError(
+				"ENTER THE TOKEN MINT IN THE TRADE PANEL TO SELL ALL (A LAUNCH PRE-FILLS IT)",
+			);
+			return;
+		}
+		if (keyedCount === 0) {
+			setSellError(
+				"NO KEYED MANAGED WALLETS TO SELL (IMPORT BASE58 SECRETS IN THE ROSTER FIRST)",
+			);
+			return;
+		}
+		setSellBusy(true);
+		setSellError(null);
+		setSellReport(null);
+		const sigs: string[] = [];
+		try {
+			const connection = makeAppConnection();
+			// M10: sellAllManagedWallets signs every sell with the roster
+			// Keypairs and hand-builds the pump.fun sell ixs itself (no anchor
+			// Program, no IDL) — only the connection + mint + roster are needed.
+			const report = await sellAllManagedWallets({
+				connection,
+				mint: new PublicKey(mint),
+				wallets: roster.wallets,
+				slippagePct: 5,
+			});
+			setSellReport(report);
+			roster.refreshBalances();
+			for (const o of report.outcomes) {
+				if (o.signature) sigs.push(o.signature);
+			}
+			if (report.sold > 0) {
+				pushToast({
+					action: "SELL ALL",
+					amount: `${report.sold} WALLETS SOLD`,
+					txHash: sigs[0],
+				});
+			} else if (report.failed > 0) {
+				pushToast({
+					action: "SELL ALL",
+					amount: "0 SOLD",
+					tone: "error",
+				});
+			} else {
+				pushToast({
+					action: "SELL ALL",
+					amount: "0 SOLD (ALL SKIPPED)",
+				});
+			}
+		} catch (e) {
+			const raw = e instanceof Error ? e.message : String(e);
+			// M7a: rate-limit / expired blockhash / insufficient-funds / rent
+			// map to actionable text instead of a raw RPC dump.
+			const msg = friendlyTxError(raw);
+			setSellError(msg);
+			pushToast({
+				action: "SELL ALL FAILED",
+				amount: "TX REVERTED",
+				tone: "error",
+			});
+		} finally {
+			setSellBusy(false);
+		}
+	};
 
-    const handleSellAll = async () => {
-        if (sellBusy) return
-        if (!mint) {
-            setSellError(
-                'ENTER THE TOKEN MINT IN THE TRADE PANEL TO SELL ALL (A LAUNCH PRE-FILLS IT)'
-            )
-            return
-        }
-        if (keyedCount === 0) {
-            setSellError(
-                'NO KEYED MANAGED WALLETS TO SELL (IMPORT BASE58 SECRETS IN THE ROSTER FIRST)'
-            )
-            return
-        }
-        setSellBusy(true)
-        setSellError(null)
-        setSellReport(null)
-        const sigs: string[] = []
-        try {
-            const connection = makeAppConnection()
-            // M10: sellAllManagedWallets signs every sell with the roster
-            // Keypairs and hand-builds the pump.fun sell ixs itself (no anchor
-            // Program, no IDL) — only the connection + mint + roster are needed.
-            const report = await sellAllManagedWallets({
-                connection,
-                mint: new PublicKey(mint),
-                wallets: roster.wallets,
-                slippagePct: 5,
-            })
-            setSellReport(report)
-            roster.refreshBalances()
-            for (const o of report.outcomes) {
-                if (o.signature) sigs.push(o.signature)
-            }
-            if (report.sold > 0) {
-                pushToast({
-                    action: 'SELL ALL',
-                    amount: `${report.sold} WALLETS SOLD`,
-                    txHash: sigs[0],
-                })
-            } else if (report.failed > 0) {
-                pushToast({
-                    action: 'SELL ALL',
-                    amount: '0 SOLD',
-                    tone: 'error',
-                })
-            } else {
-                pushToast({
-                    action: 'SELL ALL',
-                    amount: '0 SOLD (ALL SKIPPED)',
-                })
-            }
-        } catch (e) {
-            const raw = e instanceof Error ? e.message : String(e)
-            // M7a: rate-limit / expired blockhash / insufficient-funds / rent
-            // map to actionable text instead of a raw RPC dump.
-            const msg = friendlyTxError(raw)
-            setSellError(msg)
-            pushToast({
-                action: 'SELL ALL FAILED',
-                amount: 'TX REVERTED',
-                tone: 'error',
-            })
-        } finally {
-            setSellBusy(false)
-        }
-    }
+	// M11 CLAIM FEES: track the curve state of the mint the Trade panel
+	// tracks so the Claim Fees button can disable up front when the mint has
+	// no pump.fun curve or the connected wallet is not the recorded creator
+	// (the claim handler re-reads the curve anyway before signing).
+	const [trackedCurve, setTrackedCurve] = useState<PumpCurveState | null>(
+		null,
+	);
+	const [curvePending, setCurvePending] = useState(false);
+	useEffect(() => {
+		if (!mint) return;
+		let alive = true;
+		void (async () => {
+			setCurvePending(true);
+			try {
+				const connection = makeAppConnection();
+				const curveRead = await readPumpCurveState(
+					connection,
+					new PublicKey(mint),
+				);
+				if (alive) {
+					setTrackedCurve(
+						curveRead.kind === "ok" ? curveRead.curve : null,
+					);
+				}
+			} catch {
+				if (alive) setTrackedCurve(null);
+			} finally {
+				if (alive) setCurvePending(false);
+			}
+		})();
+		return () => {
+			alive = false;
+		};
+	}, [mint]);
 
-    // M11 CLAIM FEES: track the curve state of the mint the Trade panel
-    // tracks so the Claim Fees button can disable up front when the mint has
-    // no pump.fun curve or the connected wallet is not the recorded creator
-    // (the claim handler re-reads the curve anyway before signing).
-    const [trackedCurve, setTrackedCurve] = useState<PumpCurveState | null>(null)
-    const [curvePending, setCurvePending] = useState(false)
-    useEffect(() => {
-        if (!mint) return
-        let alive = true
-        void (async () => {
-            setCurvePending(true)
-            try {
-                const connection = makeAppConnection()
-                const curveRead = await readPumpCurveState(
-                    connection,
-                    new PublicKey(mint)
-                )
-                if (alive) {
-                    setTrackedCurve(
-                        curveRead.kind === 'ok' ? curveRead.curve : null
-                    )
-                }
-            } catch {
-                if (alive) setTrackedCurve(null)
-            } finally {
-                if (alive) setCurvePending(false)
-            }
-        })()
-        return () => {
-            alive = false
-        }
-    }, [mint])
+	// M11 CLAIM FEES: sweep the connected creator's accrued pump.fun creator
+	// fees for the mint the Trade panel tracks (bonding-curve vault via
+	// collect_creator_fee_v2, PumpSwap AMM vault via the pump-swap-sdk when
+	// the coin graduated). lib/claim-creator-fee.ts packs both legs into one
+	// tx when both apply, signs with the creator key, and returns a report
+	// with the claimed lamports per leg plus the explorer signature.
+	const [claimBusy, setClaimBusy] = useState(false);
+	const [claimError, setClaimError] = useState<string | null>(null);
+	const [claimReport, setClaimReport] = useState<CreatorClaimReport | null>(
+		null,
+	);
 
-    // M11 CLAIM FEES: sweep the connected creator's accrued pump.fun creator
-    // fees for the mint the Trade panel tracks (bonding-curve vault via
-    // collect_creator_fee_v2, PumpSwap AMM vault via the pump-swap-sdk when
-    // the coin graduated). lib/claim-creator-fee.ts packs both legs into one
-    // tx when both apply, signs with the creator key, and returns a report
-    // with the claimed lamports per leg plus the explorer signature.
-    const [claimBusy, setClaimBusy] = useState(false)
-    const [claimError, setClaimError] = useState<string | null>(null)
-    const [claimReport, setClaimReport] = useState<CreatorClaimReport | null>(null)
+	// Disabled when: not connected (no creator key to sign with), the Trade
+	// panel tracks no mint, the mint has no pump.fun curve, or the connected
+	// wallet is not the mint's recorded creator.
+	const claimDisabled =
+		!connected ||
+		!creatorKey ||
+		!mint ||
+		claimBusy ||
+		curvePending ||
+		!trackedCurve ||
+		(creatorPubkey !== null &&
+			trackedCurve.creator.toBase58() !== creatorPubkey);
 
-    // Disabled when: not connected (no creator key to sign with), the Trade
-    // panel tracks no mint, the mint has no pump.fun curve, or the connected
-    // wallet is not the mint's recorded creator.
-    const claimDisabled =
-        !connected ||
-        !creatorKey ||
-        !mint ||
-        claimBusy ||
-        curvePending ||
-        !trackedCurve ||
-        (creatorPubkey !== null &&
-            trackedCurve.creator.toBase58() !== creatorPubkey)
+	const handleClaimFees = async () => {
+		if (claimBusy) return;
+		if (!mint) {
+			setClaimError(
+				"CLAIM FAILED: ENTER THE TOKEN MINT IN THE TRADE PANEL TO CLAIM CREATOR FEES",
+			);
+			return;
+		}
+		setClaimBusy(true);
+		setClaimError(null);
+		setClaimReport(null);
+		try {
+			const creator = parseCreator();
+			const connection = makeAppConnection();
+			const report = await claimCreatorFees({
+				connection,
+				mint: new PublicKey(mint),
+				creator,
+			});
+			setClaimReport(report);
+			if (report.signature) {
+				pushToast({
+					action: "CLAIM FEES",
+					amount: `${formatSolLamports(report.totalClaimedLamports)} CLAIMED`,
+					txHash: report.signature,
+				});
+			} else {
+				pushToast({
+					action: "CLAIM FEES",
+					amount: "NOTHING TO CLAIM",
+				});
+			}
+		} catch (e) {
+			const raw = e instanceof Error ? e.message : String(e);
+			// A sharing-config guard revert is its own status (both claim
+			// instructions fail once the vault migrated to fee sharing); it
+			// cannot be fixed by retrying.
+			if (isFeeSharingRevert(raw)) {
+				setClaimError("CLAIM REVERTED (VAULT MIGRATED TO FEE SHARING)");
+			} else {
+				setClaimError(`CLAIM FAILED: ${friendlyTxError(raw)}`);
+			}
+			pushToast({
+				action: "CLAIM FEES FAILED",
+				amount: "TX REVERTED",
+				tone: "error",
+			});
+		} finally {
+			setClaimBusy(false);
+		}
+	};
 
-    const handleClaimFees = async () => {
-        if (claimBusy) return
-        if (!mint) {
-            setClaimError(
-                'CLAIM FAILED: ENTER THE TOKEN MINT IN THE TRADE PANEL TO CLAIM CREATOR FEES'
-            )
-            return
-        }
-        setClaimBusy(true)
-        setClaimError(null)
-        setClaimReport(null)
-        try {
-            const creator = parseCreator()
-            const connection = makeAppConnection()
-            const report = await claimCreatorFees({
-                connection,
-                mint: new PublicKey(mint),
-                creator,
-            })
-            setClaimReport(report)
-            if (report.signature) {
-                pushToast({
-                    action: 'CLAIM FEES',
-                    amount: `${formatSolLamports(report.totalClaimedLamports)} CLAIMED`,
-                    txHash: report.signature,
-                })
-            } else {
-                pushToast({
-                    action: 'CLAIM FEES',
-                    amount: 'NOTHING TO CLAIM',
-                })
-            }
-        } catch (e) {
-            const raw = e instanceof Error ? e.message : String(e)
-            // A sharing-config guard revert is its own status (both claim
-            // instructions fail once the vault migrated to fee sharing); it
-            // cannot be fixed by retrying.
-            if (isFeeSharingRevert(raw)) {
-                setClaimError('CLAIM REVERTED (VAULT MIGRATED TO FEE SHARING)')
-            } else {
-                setClaimError(`CLAIM FAILED: ${friendlyTxError(raw)}`)
-            }
-            pushToast({
-                action: 'CLAIM FEES FAILED',
-                amount: 'TX REVERTED',
-                tone: 'error',
-            })
-        } finally {
-            setClaimBusy(false)
-        }
-    }
+	return (
+		<Card
+			head={
+				<div className="flex items-center justify-between">
+					<span className="label-mono !text-[13px]">Launch</span>
+				</div>
+			}
+			className="flex-1 lg:flex-0 lg:min-w-1/3 lg:sticky lg:top-0 lg:self-start lg:z-30">
+			<div className="flex flex-col gap-4">
+				<Field label="Token Name">
+					<Input
+						value={name}
+						onChange={(e) => setName(e.target.value)}
+						placeholder="Coin name"
+						spellCheck={false}
+					/>
+				</Field>
+				<Field label="Token Symbol">
+					<Input
+						value={symbol}
+						onChange={(e) => setSymbol(e.target.value)}
+						placeholder="Coin ticker"
+						spellCheck={false}
+					/>
+				</Field>
 
-    return (
-        <Card
-            head={
-                <div className="flex items-center justify-between">
-                    <span className="label-mono !text-[13px]">Launch</span>
-                </div>
-            }
-            className="flex-1 lg:flex-0 lg:min-w-1/3 lg:sticky lg:top-0 lg:self-start lg:z-30">
-            <div className="flex flex-col gap-4">
-                <Field label="Token Name">
-                    <Input
-                        value={name}
-                        onChange={(e) => setName(e.target.value)}
-                        placeholder="Sample Coin"
-                        spellCheck={false}
-                    />
-                </Field>
-                <Field label="Token Symbol">
-                    <Input
-                        value={symbol}
-                        onChange={(e) => setSymbol(e.target.value)}
-                        placeholder="SMPL"
-                        spellCheck={false}
-                    />
-                </Field>
-
-                <Collapse
-                    open={advancedOpen}
-                    onToggle={() => setAdvancedOpen((v) => !v)}
-                    label="Advanced">
-                    <div className="lg:col-span-4">
-                        <div className="flex items-center justify-between gap-2">
-                            <span className="label-mono opacity-70">
-                                token metadata · auto-published on launch
-                            </span>
-                        </div>
-                        {manualMetadata ? (
-                            <div className="reveal-up mt-3">
-                                <Field label="Metadata URI">
-                                    <Input
-                                        value={uri}
-                                        onChange={(e) => setUri(e.target.value)}
-                                        placeholder="https://.../metadata.json"
-                                        spellCheck={false}
-                                    />
-                                </Field>
-                            </div>
-                        ) : (
-                            <div className="reveal-up mt-3 grid gap-3 md:grid-cols-2">
-                                <div className="md:col-span-2">
-                                    <Field label="Description">
-                                        <textarea
-                                            className="input-brutal min-h-[72px] resize-y font-sans"
-                                            value={description}
-                                            onChange={(e) =>
-                                                setDescription(e.target.value)
-                                            }
-                                            placeholder="What the token is for (stored in the metadata JSON)."
-                                            spellCheck={false}
-                                        />
-                                    </Field>
-                                </div>
-                                {/* Token image + socials section: spans the
+				<Collapse
+					open={advancedOpen}
+					onToggle={() => setAdvancedOpen((v) => !v)}
+					label="Advanced">
+					<div className="lg:col-span-4">
+						<div className="flex items-center justify-between gap-2">
+							<span className="label-mono opacity-70">
+								token metadata · auto-published on launch
+							</span>
+						</div>
+						{manualMetadata ? (
+							<div className="reveal-up mt-3">
+								<Field label="Metadata URI">
+									<Input
+										value={uri}
+										onChange={(e) => setUri(e.target.value)}
+										placeholder="https://.../metadata.json"
+										spellCheck={false}
+									/>
+								</Field>
+							</div>
+						) : (
+							<div className="reveal-up mt-3 grid gap-3 md:grid-cols-2">
+								<div className="md:col-span-2">
+									<Field label="Description">
+										<textarea
+											className="input-brutal min-h-[72px] resize-y font-sans"
+											value={description}
+											onChange={(e) =>
+												setDescription(e.target.value)
+											}
+											placeholder="What the token is for (stored in the metadata JSON)."
+											spellCheck={false}
+										/>
+									</Field>
+								</div>
+								{/* Token image + socials section: spans the
                                 launch container's full width (both grid
                                 columns), below the description textarea. */}
-                                <div className="flex flex-col gap-4 md:col-span-2">
-                                    <Field
-                                        label="Token Image"
-                                        aside={
-                                            imageFile
-                                                ? imageFile.name
-                                                : 'OPTIONAL - png/jpg/gif/webp/svg'
-                                        }>
-                                        <input
-                                            type="file"
-                                            accept="image/png,image/jpeg,image/gif,image/webp,image/svg+xml"
-                                            className="input-brutal cursor-pointer file:mr-2 file:border-0 file:bg-ink file:px-2 file:py-1 file:font-mono file:text-[10px] file:text-paper file:uppercase"
-                                            onChange={(e) => {
-                                                const f = e.target.files
-                                                setImageFile(
-                                                    f && f.length > 0
-                                                        ? f[0]
-                                                        : null
-                                                )
-                                            }}
-                                        />
-                                    </Field>
-                                    <div className="grid md:grid-cols-2 lg:grid-cols-3 gap-4">
-                                        <Field label="Website">
-                                            <Input
-                                                value={website}
-                                                onChange={(e) =>
-                                                    setWebsite(e.target.value)
-                                                }
-                                                placeholder="https://yoursite.com"
-                                                spellCheck={false}
-                                            />
-                                        </Field>
-                                        <Field label="X / Twitter">
-                                            <Input
-                                                value={twitter}
-                                                onChange={(e) =>
-                                                    setTwitter(e.target.value)
-                                                }
-                                                placeholder="@handle or https://x.com/handle"
-                                                spellCheck={false}
-                                            />
-                                        </Field>
-                                        <Field label="Telegram">
-                                            <Input
-                                                value={telegram}
-                                                onChange={(e) =>
-                                                    setTelegram(e.target.value)
-                                                }
-                                                placeholder="@handle or https://t.me/group"
-                                                spellCheck={false}
-                                            />
-                                        </Field>
-                                    </div>
-                                </div>
-                            </div>
-                        )}
-                    </div>
+								<div className="flex flex-col gap-4 md:col-span-2">
+									<Field
+										label="Token Image"
+										aside={
+											imageFile
+												? imageFile.name
+												: "OPTIONAL - png/jpg/gif/webp/svg"
+										}>
+										<input
+											type="file"
+											accept="image/png,image/jpeg,image/gif,image/webp,image/svg+xml"
+											className="input-brutal cursor-pointer file:mr-2 file:border-0 file:bg-ink file:px-2 file:py-1 file:font-mono file:text-[10px] file:text-paper file:uppercase"
+											onChange={(e) => {
+												const f = e.target.files;
+												setImageFile(
+													f && f.length > 0
+														? f[0]
+														: null,
+												);
+											}}
+										/>
+									</Field>
+									<div className="grid md:grid-cols-2 lg:grid-cols-3 gap-4">
+										<Field label="Website">
+											<Input
+												value={website}
+												onChange={(e) =>
+													setWebsite(e.target.value)
+												}
+												placeholder="https://yoursite.com"
+												spellCheck={false}
+											/>
+										</Field>
+										<Field label="X / Twitter">
+											<Input
+												value={twitter}
+												onChange={(e) =>
+													setTwitter(e.target.value)
+												}
+												placeholder="@handle or https://x.com/handle"
+												spellCheck={false}
+											/>
+										</Field>
+										<Field label="Telegram">
+											<Input
+												value={telegram}
+												onChange={(e) =>
+													setTelegram(e.target.value)
+												}
+												placeholder="@handle or https://t.me/group"
+												spellCheck={false}
+											/>
+										</Field>
+									</div>
+								</div>
+							</div>
+						)}
+					</div>
 
-                    {/* Buy sizing for the selected dev wallets: ONE buyPct%
-                    applies to every wallet's OWN spendable SOL balance (see
-                    the launch handler). The creator does NOT fund dev
-                    wallets anymore — fund/disperse them first. */}
-                    <div className="lg:col-span-4">
-                        <div className="flex items-center gap-3">
-                            <span className="label-mono opacity-70">
-                                dev wallets (selected in the roster)
-                            </span>
-                            <span className="label-mono ml-auto opacity-60">
-                                {selectedWallets.length} selected
-                            </span>
-                        </div>
-                        <div className="reveal-up mt-3 flex flex-wrap items-end gap-x-6 gap-y-3">
-                            <Field
-                                label="Buy % of balance"
-                                aside="per wallet · spendable SOL">
-                                <Input
-                                    type="number"
-                                    min={1}
-                                    max={100}
-                                    step={1}
-                                    value={buyPct}
-                                    onChange={(e) => setBuyPct(e.target.value)}
-                                    className="w-28 font-mono text-[12px]"
-                                    aria-label="Percent of each selected dev wallet's spendable SOL balance to spend on the launch buy"
-                                />
-                            </Field>
-                          
-                        </div>
-                    </div>
-                </Collapse>
+					{/* Buy sizing for the selected dev wallets: MAX. Every
+                    wallet commits its FULL spendable SOL balance under the
+                    10% slippage band (the same sizing as the manual Buy Max;
+                    see the launch handler). The creator does NOT fund dev
+                    wallets, fund/disperse them first. */}
+					<div className="lg:col-span-4">
+						<div className="flex items-center gap-3">
+							<span className="label-mono opacity-70">
+								dev wallets (selected in the roster)
+							</span>
+							<span className="label-mono ml-auto opacity-60">
+								{selectedWallets.length} selected
+							</span>
+						</div>
+						<div className="reveal-up mt-3 flex flex-wrap items-end gap-x-6 gap-y-3">
+							<span className="label-mono opacity-80">
+								buy: MAX (full spendable SOL per wallet, under 10% slippage)
+							</span>
+						</div>
+					</div>
+				</Collapse>
 
-                {launchError ? (
-                    <StatusLine
-                        text={`LAST ERROR: ${launchError}`}
-                        tone="error"
-                    />
-                ) : null}
-                {lastMint ? (
-                    <div className="flex items-center gap-2">
-                        <StatusLine text="LAST MINT:" />
-                        <ExplorerLink hash={lastMint} kind="address" />
-                    </div>
-                ) : null}
+				{launchError ? (
+					<StatusLine
+						text={`LAST ERROR: ${launchError}`}
+						tone="error"
+					/>
+				) : null}
+				{lastMint ? (
+					<div className="flex items-center gap-2">
+						<StatusLine text="LAST MINT:" />
+						<ExplorerLink hash={lastMint} kind="address" />
+					</div>
+				) : null}
 
-                <div className="flex flex-wrap items-center justify-between gap-2 border-t-2 border-white pt-3">
-                    <div className="flex items-center gap-2">
-                        <span
-                            className="label-mono flex items-center gap-1.5 opacity-80"
-                            title="Helius Sender SWQOS-only tip, fixed at 0.000005 SOL (5,000 lamports) — set in lib/bundle/protected-send.ts.">
-                            tip 0.000005 SOL (SWQOS)
-                        </span>
-                        <Btn
-                            onClick={() => void handleLaunch()}
-                            disabled={busy || !connected}>
-                            {busy ? 'LAUNCHING...' : 'Launch'}
-                        </Btn>
-                    </div>
-                    <span className="label-mono opacity-60">
-                        {!connected
-                            ? 'CONNECT CREATOR KEY IN THE MASTHEAD'
-                            : `CREATOR ${creatorPubkey ? shortAddress(creatorPubkey, 6) : ''} · ${balanceSol}`}
-                    </span>
-                </div>
+				<div className="flex flex-wrap items-center justify-between gap-2 border-t-2 border-white pt-3">
+					<div className="flex items-center gap-2">
+						<span
+							className="label-mono flex items-center gap-1.5 opacity-80"
+							title="Helius Sender SWQOS-only tip, fixed at 0.000005 SOL (5,000 lamports) — set in lib/bundle/protected-send.ts.">
+							tip 0.000005 SOL
+						</span>
+						<Btn
+							onClick={() => void handleLaunch()}
+							disabled={busy || !connected}>
+							{busy ? "LAUNCHING..." : "Launch"}
+						</Btn>
+					</div>
+					<span className="label-mono opacity-60">
+						{!connected
+							? "CONNECT CREATOR KEY IN THE MASTHEAD"
+							: `CREATOR ${creatorPubkey ? shortAddress(creatorPubkey, 6) : ""} · ${balanceSol}`}
+					</span>
+				</div>
 
-                {/* Sell All (M6, moved here from the trade card's tab strip
+				{/* Sell All (M6, moved here from the trade card's tab strip
                 2026-09-04) + Claim Fees (M11): the SELL ALL tab became this
                 always-visible button below Launch, with the Claim Fees
                 button on the SAME line. Sell All ignores the roster checkbox
@@ -1329,172 +1313,176 @@ export function LaunchPanel({
                 the CONNECTED CREATOR's accrued pump.fun creator fees for
                 that same mint. Status lines for both stay full-width BELOW
                 the button row. */}
-                <div className="border-t-2 border-white pt-3">
-                    <div className="flex gap-2">
-                        <Btn
-                            invert
-                            onClick={() => void handleSellAll()}
-                            disabled={sellBusy || !mint || keyedCount === 0}
-                            className="flex-1 shadow-none!">
-                            {sellBusy ? 'Selling...' : 'Sell All'}
-                        </Btn>
-                        <Btn
-                            onClick={() => void handleClaimFees()}
-                            disabled={claimDisabled}
-                            className="flex-1">
-                            {claimBusy ? 'Claiming...' : 'Claim Fees'}
-                        </Btn>
-                    </div>
+				<div className="border-t-2 border-white pt-3">
+					<div className="flex gap-2">
+						<Btn
+							invert
+							onClick={() => void handleSellAll()}
+							disabled={sellBusy || !mint || keyedCount === 0}
+							className="flex-1 shadow-none!">
+							{sellBusy ? "Selling..." : "Sell All"}
+						</Btn>
+						<Btn
+							onClick={() => void handleClaimFees()}
+							disabled={claimDisabled}
+							className="flex-1">
+							{claimBusy ? "Claiming..." : "Claim Fees"}
+						</Btn>
+					</div>
 
-                    {mint && keyedCount === 0 ? (
-                        <StatusLine
-                            text="NO KEYED WALLETS. IMPORT BASE58 SECRETS IN THE ROSTER FIRST"
-                            tone="idle"
-                        />
-                    ) : null}
-                    {sellError ? (
-                        <StatusLine
-                            text={`SELL ALL FAILED: ${sellError}`}
-                            tone="error"
-                        />
-                    ) : null}
-                    {sellBusy ? (
-                        <StatusLine
-                            text="SELLING EVERY KEYED WALLET'S FULL BALANCE (CONCURRENT)..."
-                            tone="idle"
-                        />
-                    ) : null}
-                    {mint && !curvePending && !trackedCurve ? (
-                        <StatusLine
-                            text="NO PUMP.FUN CURVE FOR THIS MINT (NOT A LAUNCHED TOKEN)"
-                            tone="idle"
-                        />
-                    ) : null}
-                    {mint &&
-                    !curvePending &&
-                    trackedCurve &&
-                    creatorPubkey &&
-                    trackedCurve.creator.toBase58() !== creatorPubkey ? (
-                        <StatusLine
-                            text="CONNECTED WALLET IS NOT THIS MINT'S CREATOR"
-                            tone="idle"
-                        />
-                    ) : null}
-                    {claimError ? (
-                        <StatusLine text={claimError} tone="error" />
-                    ) : null}
-                    {claimBusy ? (
-                        <StatusLine
-                            text="CLAIMING ACCRUED CREATOR FEES..."
-                            tone="idle"
-                        />
-                    ) : null}
-                    {claimReport ? (
-                        <ClaimFeesStatusView report={claimReport} />
-                    ) : null}
-                </div>
+					{mint && keyedCount === 0 ? (
+						<StatusLine
+							text="NO KEYED WALLETS. IMPORT BASE58 SECRETS IN THE ROSTER FIRST"
+							tone="idle"
+						/>
+					) : null}
+					{sellError ? (
+						<StatusLine
+							text={`SELL ALL FAILED: ${sellError}`}
+							tone="error"
+						/>
+					) : null}
+					{sellBusy ? (
+						<StatusLine
+							text="SELLING EVERY KEYED WALLET'S FULL BALANCE (CONCURRENT)..."
+							tone="idle"
+						/>
+					) : null}
+					{mint && !curvePending && !trackedCurve ? (
+						<StatusLine
+							text="NO PUMP.FUN CURVE FOR THIS MINT (NOT A LAUNCHED TOKEN)"
+							tone="idle"
+						/>
+					) : null}
+					{mint &&
+					!curvePending &&
+					trackedCurve &&
+					creatorPubkey &&
+					trackedCurve.creator.toBase58() !== creatorPubkey ? (
+						<StatusLine
+							text="CONNECTED WALLET IS NOT THIS MINT'S CREATOR"
+							tone="idle"
+						/>
+					) : null}
+					{claimError ? (
+						<StatusLine text={claimError} tone="error" />
+					) : null}
+					{claimBusy ? (
+						<StatusLine
+							text="CLAIMING ACCRUED CREATOR FEES..."
+							tone="idle"
+						/>
+					) : null}
+					{claimReport ? (
+						<ClaimFeesStatusView report={claimReport} />
+					) : null}
+				</div>
 
-                {/* status log (preserved from M4) */}
-                <div>
-                    <div className="mb-1">
-                        <span className="label-mono opacity-50">log</span>
-                    </div>
-                    <pre className="min-h-[120px] max-h-[260px] overflow-auto tab-content bg-transparent! text-paper p-3 font-mono text-[11px] leading-relaxed whitespace-pre-wrap">
-                        {statusLines.length === 0
-                            ? 'ready. fill the form and press launch.'
-                            : statusLines.join('\n')}
-                    </pre>
-                </div>
-            </div>
-        </Card>
-    )
+				{/* status log (preserved from M4) */}
+				<div>
+					<div className="mb-1">
+						<span className="label-mono opacity-50">log</span>
+					</div>
+					<pre className="min-h-[120px] max-h-[260px] overflow-auto tab-content bg-transparent! text-paper p-3 font-mono text-[11px] leading-relaxed whitespace-pre-wrap">
+						{statusLines.length === 0
+							? "ready. fill the form and press launch."
+							: statusLines.join("\n")}
+					</pre>
+				</div>
+			</div>
+		</Card>
+	);
 }
 
 /* ---------- M6 sell-all report (final count, per-wallet SOL, holders) ---------- */
 
 function SellAllReportView({ report }: { report: SellAllReport }) {
-    const routeLabel =
-        report.route === 'curve'
-            ? `ROUTE: CURVE SELL (NOT GRADUATED) · creator ${shortAddress(report.creator, 6)}`
-            : `ROUTE: PUMSWAP SELL (GRADUATED) · pool ${shortAddress(report.poolKey ?? '', 6)}`
-    return (
-        <div className="reveal-up flex flex-col gap-1 border-2 border-ink px-2 py-1.5">
-            <p className="label-mono !text-[10px] font-bold break-all">
-                {routeLabel}
-            </p>
-            <p className="label-mono !text-[11px] font-bold">
-                SOLD {report.sold}/{report.total} · SKIPPED {report.skipped} ·
-                FAILED {report.failed}
-            </p>
-            <div className="flex flex-col gap-0.5">
-                {report.outcomes.map((o) => (
-                    <SellOutcomeRow key={o.address} outcome={o} />
-                ))}
-            </div>
-            <p className="label-mono !text-[10px] border-t border-ink/40 pt-1">
-                HOLDERS AFTER:{' '}
-                {report.holderCountAfter === null
-                    ? 'READ FAILED (RATE-LIMITED); CHECK ROSTER TOKEN COLUMN'
-                    : `${report.holderCountAfter}`}
-            </p>
-        </div>
-    )
+	const routeLabel =
+		report.route === "curve"
+			? `ROUTE: CURVE SELL (NOT GRADUATED) · creator ${shortAddress(report.creator, 6)}`
+			: `ROUTE: PUMSWAP SELL (GRADUATED) · pool ${shortAddress(report.poolKey ?? "", 6)}`;
+	return (
+		<div className="reveal-up flex flex-col gap-1 border-2 border-ink px-2 py-1.5">
+			<p className="label-mono !text-[10px] font-bold break-all">
+				{routeLabel}
+			</p>
+			<p className="label-mono !text-[11px] font-bold">
+				SOLD {report.sold}/{report.total} · SKIPPED {report.skipped} ·
+				FAILED {report.failed}
+			</p>
+			<div className="flex flex-col gap-0.5">
+				{report.outcomes.map((o) => (
+					<SellOutcomeRow key={o.address} outcome={o} />
+				))}
+			</div>
+			<p className="label-mono !text-[10px] border-t border-ink/40 pt-1">
+				HOLDERS AFTER:{" "}
+				{report.holderCountAfter === null
+					? "READ FAILED (RATE-LIMITED); CHECK ROSTER TOKEN COLUMN"
+					: `${report.holderCountAfter}`}
+			</p>
+		</div>
+	);
 }
 
 function SellOutcomeRow({ outcome }: { outcome: SellOutcome }) {
-    const addr = shortAddress(outcome.address, 6)
-    let body
-    if (outcome.status === 'sold') {
-        body = (
-            <span>
-                SOLD {fmtTokens(outcome.tokenSold)} TOK →{' '}
-                {formatSolLamports(outcome.solReceivedLamports)}
-                {outcome.signature ? (
-                    <span className="ml-1">
-                        <ExplorerLink hash={outcome.signature} />
-                    </span>
-                ) : null}
-            </span>
-        )
-    } else if (outcome.status === 'skipped') {
-        body = (
-            <span>SKIPPED ({outcome.reason ?? 'no key / zero balance'})</span>
-        )
-    } else {
-        body = <span>FAILED ({outcome.reason ?? 'error'})</span>
-    }
-    return (
-        <p className="label-mono !text-[10px] break-all opacity-90">
-            {addr} {body}
-        </p>
-    )
+	const addr = shortAddress(outcome.address, 6);
+	let body;
+	if (outcome.status === "sold") {
+		body = (
+			<span>
+				SOLD {fmtTokens(outcome.tokenSold)} TOK →{" "}
+				{formatSolLamports(outcome.solReceivedLamports)}
+				{outcome.signature ? (
+					<span className="ml-1">
+						<ExplorerLink hash={outcome.signature} />
+					</span>
+				) : null}
+			</span>
+		);
+	} else if (outcome.status === "skipped") {
+		body = (
+			<span>SKIPPED ({outcome.reason ?? "no key / zero balance"})</span>
+		);
+	} else {
+		body = <span>FAILED ({outcome.reason ?? "error"})</span>;
+	}
+	return (
+		<p className="label-mono !text-[10px] break-all opacity-90">
+			{addr} {body}
+		</p>
+	);
 }
 
 /* ---------- M11 claim-fees report (bonding-curve + PumpSwap legs) ---------- */
 
 function ClaimFeesStatusView({ report }: { report: CreatorClaimReport }) {
-    const bondLine =
-        'claimedLamports' in report.bond
-            ? `BONDING CURVE: CLAIMED ${formatSolLamports(report.bond.claimedLamports)}`
-            : `BONDING CURVE: ${report.bond.skipped}`
-    const ammLine = report.amm
-        ? 'claimedLamports' in report.amm
-            ? `PUMP SWAP: CLAIMED ${formatSolLamports(report.amm.claimedLamports)}`
-            : `PUMP SWAP: ${report.amm.skipped}`
-        : 'PUMP SWAP: NOT GRADUATED (NO AMM FEES YET)'
-    return (
-        <div className="reveal-up flex flex-col gap-1 border-2 border-ink px-2 py-1.5">
-            <p className="label-mono !text-[11px] font-bold">
-                CLAIMED {formatSolLamports(report.totalClaimedLamports)} ·{' '}
-                {report.graduated ? 'GRADUATED' : 'ON BONDING CURVE'}
-            </p>
-            <p className="label-mono !text-[10px] break-all opacity-90">{bondLine}</p>
-            <p className="label-mono !text-[10px] break-all opacity-90">{ammLine}</p>
-            {report.signature ? (
-                <p className="label-mono !text-[10px] border-t border-ink/40 pt-1">
-                    <ExplorerLink hash={report.signature} />
-                </p>
-            ) : null}
-        </div>
-    )
+	const bondLine =
+		"claimedLamports" in report.bond
+			? `BONDING CURVE: CLAIMED ${formatSolLamports(report.bond.claimedLamports)}`
+			: `BONDING CURVE: ${report.bond.skipped}`;
+	const ammLine = report.amm
+		? "claimedLamports" in report.amm
+			? `PUMP SWAP: CLAIMED ${formatSolLamports(report.amm.claimedLamports)}`
+			: `PUMP SWAP: ${report.amm.skipped}`
+		: "PUMP SWAP: NOT GRADUATED (NO AMM FEES YET)";
+	return (
+		<div className="reveal-up flex flex-col gap-1 border-2 border-ink px-2 py-1.5">
+			<p className="label-mono !text-[11px] font-bold">
+				CLAIMED {formatSolLamports(report.totalClaimedLamports)} ·{" "}
+				{report.graduated ? "GRADUATED" : "ON BONDING CURVE"}
+			</p>
+			<p className="label-mono !text-[10px] break-all opacity-90">
+				{bondLine}
+			</p>
+			<p className="label-mono !text-[10px] break-all opacity-90">
+				{ammLine}
+			</p>
+			{report.signature ? (
+				<p className="label-mono !text-[10px] border-t border-ink/40 pt-1">
+					<ExplorerLink hash={report.signature} />
+				</p>
+			) : null}
+		</div>
+	);
 }

@@ -38,10 +38,10 @@ export function Masthead() {
     <header className="masthead">
       {/* title block */}
       <div className="px-[14px] py-[18px]">
-        <div className="flex flex-wrap items-start justify-between gap-4">
-          <div>
+        <div className="flex flex-wrap items-center justify-between gap-4">
+          <div className="flex items-center">
             <h1 className="text-[30px] font-bold leading-[1.05] tracking-[1px] uppercase max-sm:text-[22px]">
-              Pumpfun Launchpad
+              Super Yandex
             </h1>
           </div>
 
@@ -84,7 +84,7 @@ export function Masthead() {
               </>
             ) : (
               <>
-                <span className="label-mono text-[11px] border-2 border-ink px-2 py-2">
+                <span className="label-mono text-[11px] border-2 border-[#23323c] rounded-full p-3">
                   {pubkey ? shortAddress(pubkey, 6) : ""} · {balanceSol}
                 </span>
                 <Btn invert onClick={() => disconnect()}>
