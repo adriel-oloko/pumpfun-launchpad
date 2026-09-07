@@ -1,15 +1,18 @@
 // Milestone M8A (2026-09-03): the MANUAL Buy/Sell engine (Feature 1), now on
 // pump.fun's NATIVE program (M10).
 //
-// One click trades every SELECTED keyed managed wallet at a % of that
-// wallet's own balance, mirroring the exact semantics of v4-launchpad's
-// "Buy / Sell" tab but on the pump.fun Solana client:
+// One click trades every SELECTED keyed managed wallet, mirroring the exact
+// semantics of v4-launchpad's "Buy / Sell" tab but on the pump.fun Solana
+// client:
 //
-//   - Buy: for every selected keyed wallet, buy buyPct% of the wallet's
-//     SPENDABLE SOL balance (the fireAutoBuy spendable formula: live SOL
-//     minus the rent-exempt floor, the tx fee reserve, and the legacy-SPL
-//     ATA rent when the ATA does not exist yet). Skipped when there is
-//     nothing tradeable after those reserves.
+//   - Buy (MAX, 2026-09-07): for every selected keyed wallet, spend its FULL
+//     spendable SOL on the curve — everything above the rent-exempt floor,
+//     the (first-buy) Token-2022 ATA rent, and the base tx fee. The budget
+//     IS the buy's max_sol_cost ceiling, so the program can never pull the
+//     wallet below its rent floor: a price tick up between quote and
+//     execution reverts the tx cleanly (no fill, no loss). The wallet ends
+//     at its 0.00089 rent floor. Skipped when there is nothing above those
+//     reserves.
 //   - Sell: for every selected keyed wallet, sell sellPct% of the wallet's
 //     current token balance of the tracked mint (walletTokenBalance).
 //     Skipped when the balance is zero.
@@ -18,9 +21,11 @@
 // trade is its OWN signed tx (the wallet is the fee payer), fired
 // concurrently with Promise.allSettled, and only the final completed count
 // plus the confirmed signatures are reported. Instructions come from
-// lib/auto.ts's buildAutoBuyIx / buildAutoSellIx (lib/pump.ts hand-built
-// pump.fun ixs: buy/sell take tokens_out/tokens_in quoted client-side with
-// slippage; the curve's creator feeds the creator_vault fee leg) and sends
+// lib/pump.ts's buildPumpBuyIx (max buy, quoted client-side with quotePumpBuy)
+// / lib/auto.ts's buildAutoSellIx (pump.fun ixs: buy takes tokens_out +
+// max_sol_cost, sell takes tokens_in + min_sol_output quoted client-side
+// against the VIRTUAL reserves; the curve's creator feeds the creator_vault
+// fee leg) and sends
 //     go through sendAndConfirmWithRetry (a NORMAL raw-RPC tx, never Helius).
 //     BUYS now send exactly like SELLS: a plain raw-RPC tx with no SWQOS tip
 //     and no priority fee. (The old Helius Sender SWQOS path for buys was
@@ -40,8 +45,6 @@ import bs58 from "bs58";
 import { Connection, Keypair, PublicKey, Transaction } from "@solana/web3.js";
 import {
   AUTO_CONFIRM_TIMEOUT_MS,
-  AUTO_TX_FEE_RESERVE_LAMPORTS,
-  buildAutoBuyIx,
   buildAutoSellIx,
   type AutoCurveInfo,
   type AutoWallet,
@@ -52,7 +55,16 @@ import {
   walletTokenBalance,
 } from "./bundle/launch";
 import type { SendTx } from "./bundle/protected-send";
-import { capBuySolForSlippage, resolvePumpFeeRecipient } from "./pump";
+import {
+  buildPumpBuyIx,
+  quotePumpBuy,
+  resolvePumpFeeRecipient,
+} from "./pump";
+
+/** Single-signature legacy tx base fee (lamports). A manual buy is one signer
+ *  (the wallet) on a plain raw-RPC tx, so the base fee is exactly 5,000 — the
+ *  max-buy budget reserves it precisely so the wallet drains to the floor. */
+const MANUAL_TX_BASE_FEE_LAMPORTS: bigint = BigInt(5_000);
 
 /** Final outcome of one manual batch trade (the v4 batch pattern). */
 export interface ManualBatchResult {
@@ -68,16 +80,13 @@ export interface ManualBatchResult {
 
 export interface BuySelectedOptions {
   connection: Connection;
-  /** The curve mint being bought (legacy SPL). */
+  /** The curve mint being bought. */
   mint: PublicKey;
   /** Fetched curve state; the creator feeds the buy instruction's
    *  creator_vault leg and the VIRTUAL reserves feed the tokens_out quote. */
   curve: AutoCurveInfo;
   /** Selected keyed managed wallets to buy for. */
   wallets: AutoWallet[];
-  /** % of each wallet's spendable SOL balance to buy, clamped to (0, 100].
-   *  Blank/invalid input is resolved by the caller's parse (default 95). */
-  buyPct?: number;
 }
 
 export interface SellSelectedOptions {
@@ -110,16 +119,19 @@ function pctNum(pct: number): number {
   return Math.round(clampPct(pct, 0) * 100);
 }
 
-/** One buy worker: buys buyPct% of the wallet's spendable SOL balance.
- *  Resolves the confirmed signature, or null when skipped (nothing
- *  tradeable). Throws on build/send/confirm errors so the settled count
- *  reports the wallet as failed. */
+/** One MAX-buy worker: spends the wallet's FULL budget on the curve, leaving
+ *  only the rent-exempt floor plus the base fee. The budget IS the
+ *  max_sol_cost ceiling, so the program can never pull the wallet below its
+ *  rent floor: if the curve drifts up between quote and execution the tx
+ *  reverts cleanly (no fill, no loss) instead of overdrafting. Resolves the
+ *  confirmed signature, or null when skipped (budget <= 0 after the floor +
+ *  ATA rent + base fee). Throws on build/send/confirm errors so the settled
+ *  count reports the wallet as failed. */
 async function buyOne(
   connection: Connection,
   mint: PublicKey,
   curve: AutoCurveInfo,
   wallet: AutoWallet,
-  pct: number,
   ataRent: number,
   latest: { blockhash: string; lastValidBlockHeight: number },
   /** Live protocol fee recipient (resolvePumpFeeRecipient), resolved once
@@ -138,29 +150,29 @@ async function buyOne(
   );
   const ataInfo = await connection.getAccountInfo(ata, "confirmed");
   const reserveAta = ataInfo ? BigInt(0) : BigInt(ataRent);
-  const spendable =
-    live -
-    BigInt(RENT_EXEMPT_FLOOR) -
-    AUTO_TX_FEE_RESERVE_LAMPORTS -
-    reserveAta;
-  if (spendable <= BigInt(0)) return null;
-  const solInRaw = (spendable * BigInt(pctNum(pct))) / BigInt(10_000);
-  // Slippage ceiling: the buy ix commits max_sol_cost = solIn * 1.10 (10%
-  // default slippage), which the spendable base does NOT reserve — at a high
-  // % (the 95 default) a full-slippage fill can overdraw a tiny wallet below
-  // its rent floor. Cap the commit at spendable / 1.10.
-  const maxCommit = capBuySolForSlippage(spendable);
-  const solIn = solInRaw > maxCommit ? maxCommit : solInRaw;
-  if (solIn <= BigInt(0)) return null;
+  // MAX budget: everything above the wallet's 890,880-lamport rent-exempt
+  // floor, the (first-buy) Token-2022 ATA rent, and the 5,000-lamport base
+  // fee. Passed as max_sol_cost, it doubles as the ceiling: the program's
+  // own cost check makes a price tick up revert the whole tx instead of
+  // ever pulling the wallet below the floor.
+  const budget =
+    live - BigInt(RENT_EXEMPT_FLOOR) - reserveAta - MANUAL_TX_BASE_FEE_LAMPORTS;
+  if (budget <= BigInt(0)) return null;
   const creator = new PublicKey(curve.creator);
-  const ixs = buildAutoBuyIx({
-    buyer: kp.publicKey,
+  const quote = quotePumpBuy({
+    solInLamports: budget,
+    virtualSolReserves: curve.solReserve,
+    virtualTokenReserves: curve.tokenReserve,
+  });
+  const ixs = buildPumpBuyIx({
     mint,
+    buyer: kp.publicKey,
     creator,
     feeRecipient,
-    solInLamports: solIn,
-    solReserve: curve.solReserve,
-    tokenReserve: curve.tokenReserve,
+    tokensOut: quote.tokensOut,
+    // The budget is the ceiling — the wallet physically holds nothing more
+    // above the floor, so slippage headroom above it would overdraw.
+    maxSolCost: budget,
   });
   const tx = new Transaction({
     feePayer: kp.publicKey,
@@ -171,7 +183,7 @@ async function buyOne(
   const { signature } = await send(connection, tx, [kp], {
     attempts: 2,
     confirmTimeoutMs: AUTO_CONFIRM_TIMEOUT_MS,
-    label: "manual buy",
+    label: "manual buy max",
   });
   return signature;
 }
@@ -245,17 +257,17 @@ function tally(
 }
 
 /**
- * Buys buyPct% of every selected keyed wallet's spendable SOL balance from
- * the curve, one signed tx per wallet, concurrently. Skipped = no spendable
- * SOL after the rent/fee/ATA reserves; failed = build/send/confirm error;
- * completed = confirmed on-chain (signatures collected). The shared
- * blockhash is fetched ONCE for the whole batch (the v4 batch pattern).
+ * Max-buys every selected keyed wallet: each spends its FULL budget on the
+ * curve — everything above the rent-exempt floor, the (first-buy) ATA rent,
+ * and the base fee — draining the wallet to its 0.00089 rent floor. Skipped =
+ * nothing above those reserves; failed = build/send/confirm error; completed
+ * = confirmed on-chain (signatures collected). The shared blockhash is
+ * fetched ONCE for the whole batch (the v4 batch pattern).
  */
 export async function buySelectedWallets(
   opts: BuySelectedOptions
 ): Promise<ManualBatchResult> {
   const { connection, mint, curve, wallets } = opts;
-  const buyPct = clampPct(opts.buyPct ?? 95, 95);
   if (wallets.length === 0) {
     return { completed: 0, failed: 0, skipped: 0, signatures: [] };
   }
@@ -271,17 +283,7 @@ export async function buySelectedWallets(
   const send = sendAndConfirmWithRetry;
   const settled = await Promise.allSettled(
     wallets.map((w) =>
-      buyOne(
-        connection,
-        mint,
-        curve,
-        w,
-        buyPct,
-        ataRent,
-        latest,
-        feeRecipient,
-        send
-      )
+      buyOne(connection, mint, curve, w, ataRent, latest, feeRecipient, send)
     )
   );
   return tally(settled);

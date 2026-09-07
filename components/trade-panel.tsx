@@ -9,13 +9,15 @@
 //     tracks (any valid base58 Solana mint; a launch pre-fills it).
 //   - Managed-wallet tabs (radio `tabs-lift`, name="managed-tabs"):
 //       * BUY / SELL tab (M8A, 2026-09-03): FIRST tab + defaultChecked.
-//         Manual batch trade over the CHECKED keyed wallets: buy buyPct% of
-//         each wallet's spendable SOL / sell sellPct% of each wallet's own
-//         token balance (lib/batch-trade.ts, concurrent per-wallet signed
-//         txs). Global keyboard shortcuts b/B = buy, s/S = sell (only while
-//         this tab is active, the FIRST managed-tabs radio), d/D = deselect
-//         (any tab). Reverses the M4 "manual Buy/Sell omitted by spec"
-//         decision (the v4 gap closure; see M8A-MANUAL-BUYSELL-PROMPT.md).
+//         Manual batch trade over the CHECKED keyed wallets: Buy MAX drains
+//         each wallet's full spendable SOL (down to the 0.00089 rent floor)
+//         on the curve / sell sellPct% of each wallet's own token balance
+//         (lib/batch-trade.ts, concurrent per-wallet signed
+//         txs). Global keyboard shortcuts b/B = buy max, s/S = sell (only
+//         while this tab is active, the FIRST managed-tabs radio), d/D =
+//         deselect (any tab). Reverses the M4 "manual Buy/Sell omitted by
+//         spec" decision (the v4 gap closure; see
+//         M8A-MANUAL-BUYSELL-PROMPT.md).
 //       * AUTO tab: auto buy / auto sell bot (Milestone M5): the v4 engine
 //         ported to Solana (recursive round timers, shared round lock,
 //         balance-gated random picks, MIN SOL / SELL % gate, roster flash,
@@ -272,12 +274,13 @@ export function TradePanel({
 	// M8A manual BUY / SELL over the CHECKED keyed wallets (lib/batch-trade)
 	// ------------------------------------------------------------------
 	// The "Buy / Sell" tab (FIRST managed-tabs radio, defaultChecked) runs a
-	// one-click batch trade over the wallets CHECKED in the roster: Buy buys
-	// buyPct% of each wallet's SPENDABLE SOL on the curve; Sell sells sellPct%
-	// of each wallet's OWN token balance of the mint above. One signed tx per
+	// one-click batch trade over the wallets CHECKED in the roster: Buy MAX
+	// drains each checked wallet's full spendable SOL (down to the 0.00089
+	// rent floor) on the curve; Sell sells sellPct% of each wallet's OWN
+	// token balance of the mint above. One signed tx per
 	// wallet, fired concurrently (the v4 batch pattern); the report shows the
 	// final counts + the confirmed signatures. Global keyboard shortcuts:
-	// b/B = buy, s/S = sell (only while this tab is active: the FIRST
+	// b/B = buy max, s/S = sell (only while this tab is active: the FIRST
 	// managed-tabs radio is checked), d/D = deselect (any tab). Manual trades
 	// only READ the shared checked set (the auto engine flashes it too); they
 	// never mutate it (only d does).
@@ -288,7 +291,6 @@ export function TradePanel({
 	// whether or not the triggered round has been approved/confirmed yet.
 	const MANUAL_CLICK_LOCK_MS = 3000;
 
-	const [buyPct, setBuyPct] = useState("95");
 	const [sellPct, setSellPct] = useState("100");
 	const [manualBusy, setManualBusy] = useState(false);
 	const [manualError, setManualError] = useState<string | null>(null);
@@ -339,10 +341,8 @@ export function TradePanel({
 			);
 			return;
 		}
-		const pct = parseManualPct(
-			side === "buy" ? buyPct : sellPct,
-			side === "buy" ? 95 : 100,
-		);
+		// Buy is always MAX (no percentage); only Sell keeps a % input.
+		const pct = side === "sell" ? parseManualPct(sellPct, 100) : null;
 		setManualBusy(true);
 		manualBusyRef.current = true;
 		// Buttons unlock at exactly +3s from THIS click, NOT when the round
@@ -376,14 +376,13 @@ export function TradePanel({
 							mint: mintPk,
 							curve: read.curve,
 							wallets,
-							buyPct: pct,
 						})
 					: await sellSelectedWallets({
 							connection,
 							mint: mintPk,
 							curve: read.curve,
 							wallets,
-							sellPct: pct,
+							sellPct: pct ?? 100,
 						});
 			setManualReport({ side, pct, result });
 			// The batch moved real balances; refresh the roster columns so the SOL /
@@ -1214,18 +1213,20 @@ export function TradePanel({
 							</label>
 							<div role="tabpanel" className="tab-content">
 								{/* Manual batch trade (M8A): the v4 Buy/Sell grid - one row,
-                five cells, no labels or borders. Cell 1 is the roster batch
-                size; Buy spends buyPct% of each CHECKED keyed wallet's
-                spendable SOL on the curve, Sell sells sellPct% of each
-                wallet's own token balance (lib/batch-trade.ts, one signed
-                tx per wallet, concurrent). The buttons disable while the
-                M5 auto bot runs, nothing is selected, or inside the fixed
-                +3s click lock (manualBusy): a Buy/Sell click locks BOTH
-                buttons for exactly 3s from the click, then they unlock
-                whether or not the triggered round has settled on-chain yet
-                (a click after the lock queues behind a still-settling
-                round, it is never dropped). */}
-								<div className="mt-2 grid gap-2 md:grid-cols-5 [auto_1fr_1fr]">
+								four cells, no labels or borders. Cell 1 is the roster batch
+								size; Buy MAX drains each CHECKED keyed wallet's full
+								spendable SOL (down to its 0.00089 rent floor) on the curve —
+								the buy's max_sol_cost IS the budget, so a price tick up
+								reverts cleanly, never an overdraw; Sell sells sellPct% of
+								each wallet's own token balance (lib/batch-trade.ts, one
+								signed tx per wallet, concurrent). The buttons disable while
+								the M5 auto bot runs, nothing is selected, or inside the
+								fixed +3s click lock (manualBusy): a Buy/Sell click locks
+								BOTH buttons for exactly 3s from the click, then they unlock
+								whether or not the triggered round has settled on-chain yet
+								(a click after the lock queues behind a still-settling
+								round, it is never dropped). */}
+								<div className="mt-2 grid gap-2 md:grid-cols-4 [auto_1fr_1fr]">
 									<div className="flex items-center gap-2">
 										<Input
 											type="number"
@@ -1238,36 +1239,20 @@ export function TradePanel({
 											className="w-8 text-center font-mono text-[12px] border-none"
 										/>
 									</div>
-									<div className="flex items-center gap-1">
-										<Input
-											type="number"
-											step="1"
-											min="1"
-											max="100"
-											value={buyPct}
-											onChange={(e) =>
-												setBuyPct(e.target.value)
-											}
-											aria-label="Buy percentage"
-											className="w-14 text-center font-mono text-[12px] border-none"
-										/>
-										<span className="label-mono text-[10px] opacity-60">
-											%
-										</span>
-									</div>
 									<button
 										type="button"
 										className="btn-brutal h-full shadow-none!"
 										onClick={() =>
 											void runManualTrade("buy")
 										}
+										title="Drains each selected wallet's spendable SOL (down to the 0.00089 rent floor) on the curve"
 										disabled={
 											manualBusy ||
 											autoRunning ||
 											!mint ||
 											selectedKeyedWallets.length === 0
 										}>
-										Buy {buyPct || 95}%
+										BUY MAX
 									</button>
 									<div className="flex items-center gap-1">
 										<Input
@@ -1777,7 +1762,8 @@ export function TradePanel({
 /** A finished manual batch trade, ready for the report view. */
 interface ManualBatchReport {
 	side: "buy" | "sell";
-	pct: number;
+	/** Sell % used; null = Buy MAX (the buy side drains to the rent floor). */
+	pct: number | null;
 	result: ManualBatchResult;
 }
 
@@ -1793,8 +1779,8 @@ function parseManualPct(raw: string, fallback: number): number {
 	return Math.min(100, n);
 }
 
-/** Compact per-batch report: side + pct headline, then each confirmed
- *  signature as an ExplorerLink (the v4 batch pattern wording). */
+/** Compact per-batch report: side + pct headline (Buy is MAX), then each
+ *  confirmed signature as an ExplorerLink (the v4 batch pattern wording). */
 function ManualReportView({ report }: { report: ManualBatchReport }) {
 	const { side, pct, result } = report;
 	const verb = side === "buy" ? "BOUGHT" : "SOLD";
@@ -1802,7 +1788,7 @@ function ManualReportView({ report }: { report: ManualBatchReport }) {
 	return (
 		<div className="reveal-up flex flex-col gap-1 border-2 border-ink px-2 py-1.5">
 			<p className="label-mono !text-[11px] font-bold">
-				{side === "buy" ? "BUY" : "SELL"} {pct}%: {verb}{" "}
+				{side === "buy" ? "BUY MAX" : `SELL ${pct}%`}: {verb}{" "}
 				{result.completed}/{total} · SKIPPED {result.skipped} · FAILED{" "}
 				{result.failed}
 			</p>

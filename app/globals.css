@@ -80,7 +80,7 @@ body {
 @media (hover: hover) and (pointer: fine) {
   .btn-brutal:hover:not(:disabled) {
     background: transparent !important;
-    color: #ff0000;
+    color: #fff;
   }
 }
 .btn-brutal:active:not(:disabled) {
@@ -109,8 +109,8 @@ body {
 }
 /* pressed variant for toggle groups */
 .btn-brutal-pressed {
-  background: #00000000;
-  color: var(--color-ink);
+  background: transparent;
+  color: white;
   box-shadow: 0 1px 0 var(--color-ink);
   transform: translate(2px, 2px);
 }
@@ -129,8 +129,8 @@ body {
 }
 .input-brutal:focus {
   outline: none;
-  background: #fffdf6; /* one-step lighter paper, still a paper tone */
-  color: var(--color-ink);
+  background: transparent; /* one-step lighter paper, still a paper tone */
+  color: white;
 }
 .input-brutal::placeholder {
   font-family: var(--font-mono);

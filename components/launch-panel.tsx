@@ -1300,7 +1300,7 @@ export function LaunchPanel({
                     </div>
                 ) : null}
 
-                <div className="flex flex-wrap items-center justify-between gap-2 border-t-2 border-ink pt-3">
+                <div className="flex flex-wrap items-center justify-between gap-2 border-t-2 border-white pt-3">
                     <div className="flex items-center gap-2">
                         <span
                             className="label-mono flex items-center gap-1.5 opacity-80"
@@ -1329,7 +1329,7 @@ export function LaunchPanel({
                 the CONNECTED CREATOR's accrued pump.fun creator fees for
                 that same mint. Status lines for both stay full-width BELOW
                 the button row. */}
-                <div className="border-t-2 border-ink pt-3">
+                <div className="border-t-2 border-white pt-3">
                     <div className="flex gap-2">
                         <Btn
                             invert
