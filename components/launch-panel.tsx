@@ -1169,12 +1169,7 @@ export function LaunchPanel({
                                     aria-label="Percent of each selected dev wallet's spendable SOL balance to spend on the launch buy"
                                 />
                             </Field>
-                            <p className="label-mono !text-[10px] opacity-50 max-w-[300px] leading-relaxed">
-                                each wallet buys this % of its OWN balance
-                                (balance − rent floor − fee margin − ATA rent).
-                                creator covers only the create tx. fund or
-                                disperse the wallets first.
-                            </p>
+                          
                         </div>
                     </div>
                 </Collapse>
