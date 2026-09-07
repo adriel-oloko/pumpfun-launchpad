@@ -203,7 +203,7 @@ export function LaunchPanel({
     const [telegram, setTelegram] = useState('')
     const [manualMetadata, setManualMetadata] = useState(false)
     const [advancedOpen, setAdvancedOpen] = useState(false)
-    const [tier, setTier] = useState<'1' | '2'>('2')
+    const [tier, setTier] = useState<'1' | '2'>('1')
     const [tipSol, setTipSol] = useState(DEFAULT_TIP_SOL)
     /** One % applied to every selected dev wallet's OWN spendable SOL
      *  balance: the wallet spends this much on its launch buy. The creator
@@ -1194,22 +1194,11 @@ export function LaunchPanel({
 
                 <div className="flex flex-wrap items-center justify-between gap-2 border-t-2 border-ink pt-3">
                     <div className="flex items-center gap-2">
-                        <label
+                        <span
                             className="label-mono flex items-center gap-1.5 opacity-80"
-                            title="Tier 2 relay tip in SOL (NextBlock primary / Astralane + bloXroute fallback; minimum 0.001 SOL). Empty uses the default.">
-                            tip
-                            <Input
-                                type="number"
-                                min={0}
-                                step={0.0001}
-                                value={tipSol}
-                                onChange={(e) => setTipSol(e.target.value)}
-                                placeholder={DEFAULT_TIP_SOL}
-                                className="w-24 font-mono text-[12px]"
-                                aria-label="Tier 2 relay tip in SOL"
-                            />
-                            SOL
-                        </label>
+                            title="Helius Sender SWQOS-only tip, fixed at 0.000005 SOL (5,000 lamports) — set in lib/bundle/protected-send.ts.">
+                            tip 0.000005 SOL (SWQOS)
+                        </span>
                         <Btn
                             onClick={() => void handleLaunch()}
                             disabled={busy || !connected}>
