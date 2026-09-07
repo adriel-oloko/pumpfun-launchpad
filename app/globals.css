@@ -28,8 +28,8 @@
 
 html,
 body {
-  background: var(--color-paper);
-  color: var(--color-ink);
+  background: rgb(11, 18, 23);
+  color: white;
   font-family: var(--font-sans);
 }
 
@@ -56,10 +56,10 @@ body {
   font-weight: 700;
   font-size: 12px;
   line-height: 1.2;
-  background: var(--color-ink);
-  color: var(--color-paper);
-  border: 2px solid var(--color-ink);
-  border-radius: 0;
+  background: rgb(204, 255, 0);
+  color: black;
+  border: 2px solid rgb(204, 255, 0);
+  border-radius: 24px;
   padding: 8px 12px;
   box-shadow: 0 3px 0 var(--color-ink);
   cursor: pointer;
@@ -73,7 +73,7 @@ body {
   white-space: nowrap;
 }
 .btn-brutal:focus-visible {
-  outline: 2px dashed var(--color-ink);
+  outline: 2px dashed rgb(204, 255, 0);
   outline-offset: 2px;
 }
 /* hover only applies where a real pointer can hover (no sticky hover on touch) */
@@ -98,7 +98,7 @@ body {
 }
 /* inverted face variant (secondary / collapse toggles) */
 .btn-brutal-invert {
-  background: var(--color-paper);
+  background: rgb(204, 255, 0);
   color: var(--color-ink);
 }
 @media (hover: hover) and (pointer: fine) {
@@ -118,13 +118,13 @@ body {
 /* ---- inputs: paper wells, 2px ink frame ---- */
 .input-brutal {
   width: 100%;
-  background: var(--color-paper);
-  border: 2px solid var(--color-ink);
-  border-radius: 0;
+  background: rgb(35, 50, 60);
+  border: 2px solid rgb(58, 73, 86);
+  border-radius: 6px;
   padding: 8px 10px;
   font-size: 14px;
   font-family: var(--font-sans);
-  color: var(--color-ink);
+  color: white;
   transition: background-color 120ms ease-out;
 }
 .input-brutal:focus {
@@ -145,10 +145,11 @@ body {
 
 /* ---- cards: paper plates, 2px frame, 4px shadow ---- */
 .card-brutal {
-  background: var(--color-paper);
-  border: 2px solid var(--color-ink);
+  background: rgb(20, 32, 40);
+  border: 2px solid #3a4956;
   border-radius: 0;
   box-shadow: 0 4px 0 var(--color-ink);
+  border-radius: 6px;
 }
 /* the one card allowed to differ: full inversion */
 .card-brutal-inverted {
@@ -178,10 +179,10 @@ body {
 
 /* ---- masthead: the largest plate, 3px frame, 6px shadow ---- */
 .masthead {
-  border: 3px solid var(--color-ink);
-  border-radius: 0;
+  border: 2px solid #3a4956;
+  border-radius: 6px;
   box-shadow: 0 6px 0 var(--color-ink);
-  background: var(--color-paper);
+  background: rgb(20, 32, 40);
 }
 .statusbar {
   background: var(--color-ink);
@@ -214,7 +215,7 @@ body {
   flex-shrink: 0;
 }
 .checkbox-brutal:checked {
-  background: var(--color-ink);
+  background: rgb(204, 255, 0);
 }
 .checkbox-brutal:checked::after {
   content: "";
@@ -297,11 +298,12 @@ body {
   font-weight: 700;
   font-size: 11px;
   line-height: 1.2;
-  color: var(--color-ink);
+  color: white;
   background: transparent;
-  border: 2px solid var(--color-ink);
+  border: 2px solid #3a4956;
   border-bottom: none;
   padding: 6px 12px 8px;
+  border-radius: 6px 6px 0px 0px;
 }
 .tabs-lift > .tab:not(:first-child) {
   margin-left: -2px; /* collapse adjacent 2px borders to a single line */
@@ -313,8 +315,8 @@ body {
   }
 }
 .tabs-lift > .tab:has(input:checked) {
-  background: var(--color-ink);
-  color: var(--color-paper);
+  background: rgb(204, 255, 0);
+  color: var(--color-ink);
   z-index: 1;
   margin-bottom: -2px; /* ink face overlaps the panel's top border */
 }
@@ -322,13 +324,17 @@ body {
   outline: 2px dashed var(--color-ink);
   outline-offset: 2px;
 }
+.tab-content {
+    background-color: #23323c;
+    border: 2px solid #3a4956 !important;
+    border-radius: 0px 6px 6px 6px;
+}
 .tabs-lift > .tab-content {
   order: 2;
   display: none;
   width: 100%;
   border: 2px solid var(--color-ink);
   padding: 10px;
-  background: var(--color-paper);
 }
 .tabs-lift > .tab:has(input:checked) + .tab-content {
   display: block;

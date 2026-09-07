@@ -21,15 +21,11 @@
 // lib/auto.ts's buildAutoBuyIx / buildAutoSellIx (lib/pump.ts hand-built
 // pump.fun ixs: buy/sell take tokens_out/tokens_in quoted client-side with
 // slippage; the curve's creator feeds the creator_vault fee leg) and sends
-//     go through lib/bundle/protected-send.ts's makeProtectedSender for BUYS:
-//     on MAINNET each buy is submitted to Helius Sender SWQOS-only
-//     (sender.helius-rpc.com/fast?swqos_only=true&mev-protect=true, priority fee
-//     + flat 5,000-lamport tip) so the batch is front-running-protected; on
-//     devnet buys fall back to sendAndConfirmWithRetry (expiry-safe re-sends
-//     only, never a blind double-fire). SELLS always send via
-//     sendAndConfirmWithRetry (a NORMAL raw-RPC tx, never Helius: the SWQOS tip
-//     + priority fee would exceed a seller wallet's SOL headroom and reject the
-//     sell before it lands).
+//     go through sendAndConfirmWithRetry (a NORMAL raw-RPC tx, never Helius).
+//     BUYS now send exactly like SELLS: a plain raw-RPC tx with no SWQOS tip
+//     and no priority fee. (The old Helius Sender SWQOS path for buys was
+//     removed — its tip + priority fee exceed a small wallet's SOL headroom
+//     and can reject the buy before it lands.)
 //
 // The curve state (creator + VIRTUAL reserves) is read by the CALLER before
 // this module runs (the trade panel's round gate) and passed in, so both
@@ -55,11 +51,7 @@ import {
   sendAndConfirmWithRetry,
   walletTokenBalance,
 } from "./bundle/launch";
-import {
-  makeProtectedSender,
-  protectedReserveLamports,
-  type SendTx,
-} from "./bundle/protected-send";
+import type { SendTx } from "./bundle/protected-send";
 import { resolvePumpFeeRecipient } from "./pump";
 
 /** Final outcome of one manual batch trade (the v4 batch pattern). */
@@ -133,8 +125,7 @@ async function buyOne(
   /** Live protocol fee recipient (resolvePumpFeeRecipient), resolved once
    *  per batch. */
   feeRecipient: PublicKey,
-  /** Send + confirm fn (Jito-protected on mainnet, plain RPC on devnet),
-   *  resolved once per batch by makeProtectedSender. */
+  /** Send + confirm fn (normal raw-RPC, same as sells). */
   send: SendTx
 ): Promise<string | null> {
   const kp = Keypair.fromSecretKey(bs58.decode(wallet.key));
@@ -151,7 +142,6 @@ async function buyOne(
     live -
     BigInt(RENT_EXEMPT_FLOOR) -
     AUTO_TX_FEE_RESERVE_LAMPORTS -
-    BigInt(protectedReserveLamports()) -
     reserveAta;
   if (spendable <= BigInt(0)) return null;
   const solIn = (spendable * BigInt(pctNum(pct))) / BigInt(10_000);
@@ -270,9 +260,9 @@ export async function buySelectedWallets(
   const latest = await connection.getLatestBlockhash("confirmed");
   // Live protocol fee recipient (pump.fun rotates it; stale -> Custom 6000).
   const feeRecipient = await resolvePumpFeeRecipient(connection);
-  // Helius Sender SWQOS-only sender on mainnet (plain RPC on devnet), one per
-  // batch.
-  const send = await makeProtectedSender();
+  // Normal raw-RPC send (sendAndConfirmWithRetry): buys send exactly like
+  // sells, no Helius Sender / SWQOS tip / priority fee.
+  const send = sendAndConfirmWithRetry;
   const settled = await Promise.allSettled(
     wallets.map((w) =>
       buyOne(

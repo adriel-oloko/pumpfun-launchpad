@@ -70,7 +70,7 @@ import {
     type Connection,
 } from '@solana/web3.js'
 import bs58 from 'bs58'
-import { useCallback, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
 import {
     ataRentLamports,
     buildLaunchSequence,
@@ -102,7 +102,12 @@ import { solanaNetwork } from '../lib/network'
 import { useCreatorWallet } from '../lib/creator-wallet'
 import { pubkeyFromSecretKey } from '../lib/managed-wallets'
 import { DECIMALS } from '../lib/params'
-import { readPumpCurveState } from '../lib/pump'
+import {
+    claimCreatorFees,
+    isFeeSharingRevert,
+    type CreatorClaimReport,
+} from '../lib/claim-creator-fee'
+import { readPumpCurveState, type PumpCurveState } from '../lib/pump'
 import {
     formatSolLamports,
     sellAllManagedWallets,
@@ -1017,6 +1022,119 @@ export function LaunchPanel({
         }
     }
 
+    // M11 CLAIM FEES: track the curve state of the mint the Trade panel
+    // tracks so the Claim Fees button can disable up front when the mint has
+    // no pump.fun curve or the connected wallet is not the recorded creator
+    // (the claim handler re-reads the curve anyway before signing).
+    const [trackedCurve, setTrackedCurve] = useState<PumpCurveState | null>(null)
+    const [curvePending, setCurvePending] = useState(false)
+    useEffect(() => {
+        if (!mint) {
+            setTrackedCurve(null)
+            setCurvePending(false)
+            return
+        }
+        let alive = true
+        setCurvePending(true)
+        const run = async () => {
+            try {
+                const connection = makeAppConnection()
+                const curveRead = await readPumpCurveState(
+                    connection,
+                    new PublicKey(mint)
+                )
+                if (alive) {
+                    setTrackedCurve(
+                        curveRead.kind === 'ok' ? curveRead.curve : null
+                    )
+                }
+            } catch {
+                if (alive) setTrackedCurve(null)
+            } finally {
+                if (alive) setCurvePending(false)
+            }
+        }
+        void run()
+        return () => {
+            alive = false
+        }
+    }, [mint])
+
+    // M11 CLAIM FEES: sweep the connected creator's accrued pump.fun creator
+    // fees for the mint the Trade panel tracks (bonding-curve vault via
+    // collect_creator_fee_v2, PumpSwap AMM vault via the pump-swap-sdk when
+    // the coin graduated). lib/claim-creator-fee.ts packs both legs into one
+    // tx when both apply, signs with the creator key, and returns a report
+    // with the claimed lamports per leg plus the explorer signature.
+    const [claimBusy, setClaimBusy] = useState(false)
+    const [claimError, setClaimError] = useState<string | null>(null)
+    const [claimReport, setClaimReport] = useState<CreatorClaimReport | null>(null)
+
+    // Disabled when: not connected (no creator key to sign with), the Trade
+    // panel tracks no mint, the mint has no pump.fun curve, or the connected
+    // wallet is not the mint's recorded creator.
+    const claimDisabled =
+        !connected ||
+        !creatorKey ||
+        !mint ||
+        claimBusy ||
+        curvePending ||
+        !trackedCurve ||
+        (creatorPubkey !== null &&
+            trackedCurve.creator.toBase58() !== creatorPubkey)
+
+    const handleClaimFees = async () => {
+        if (claimBusy) return
+        if (!mint) {
+            setClaimError(
+                'CLAIM FAILED: ENTER THE TOKEN MINT IN THE TRADE PANEL TO CLAIM CREATOR FEES'
+            )
+            return
+        }
+        setClaimBusy(true)
+        setClaimError(null)
+        setClaimReport(null)
+        try {
+            const creator = parseCreator()
+            const connection = makeAppConnection()
+            const report = await claimCreatorFees({
+                connection,
+                mint: new PublicKey(mint),
+                creator,
+            })
+            setClaimReport(report)
+            if (report.signature) {
+                pushToast({
+                    action: 'CLAIM FEES',
+                    amount: `${formatSolLamports(report.totalClaimedLamports)} CLAIMED`,
+                    txHash: report.signature,
+                })
+            } else {
+                pushToast({
+                    action: 'CLAIM FEES',
+                    amount: 'NOTHING TO CLAIM',
+                })
+            }
+        } catch (e) {
+            const raw = e instanceof Error ? e.message : String(e)
+            // A sharing-config guard revert is its own status (both claim
+            // instructions fail once the vault migrated to fee sharing); it
+            // cannot be fixed by retrying.
+            if (isFeeSharingRevert(raw)) {
+                setClaimError('CLAIM REVERTED (VAULT MIGRATED TO FEE SHARING)')
+            } else {
+                setClaimError(`CLAIM FAILED: ${friendlyTxError(raw)}`)
+            }
+            pushToast({
+                action: 'CLAIM FEES FAILED',
+                amount: 'TX REVERTED',
+                tone: 'error',
+            })
+        } finally {
+            setClaimBusy(false)
+        }
+    }
+
     return (
         <Card
             head={
@@ -1208,18 +1326,30 @@ export function LaunchPanel({
                 </div>
 
                 {/* Sell All (M6, moved here from the trade card's tab strip
-                2026-09-04): the SELL ALL tab became this single
-                always-visible button below Launch. It ignores the roster
-                checkbox selection and sweeps every keyed managed wallet's
-                full balance of the mint the Trade panel tracks. */}
-                <div className="flex flex-col gap-2 border-t-2 border-ink pt-3">
-                    <Btn
-                        invert
-                        onClick={() => void handleSellAll()}
-                        disabled={sellBusy || !mint || keyedCount === 0}
-                        className="w-full shadow-none!">
-                        {sellBusy ? 'Selling...' : 'Sell All'}
-                    </Btn>
+                2026-09-04) + Claim Fees (M11): the SELL ALL tab became this
+                always-visible button below Launch, with the Claim Fees
+                button on the SAME line. Sell All ignores the roster checkbox
+                selection and sweeps every keyed managed wallet's full
+                balance of the mint the Trade panel tracks; Claim Fees sweeps
+                the CONNECTED CREATOR's accrued pump.fun creator fees for
+                that same mint. Status lines for both stay full-width BELOW
+                the button row. */}
+                <div className="border-t-2 border-ink pt-3">
+                    <div className="flex gap-2">
+                        <Btn
+                            invert
+                            onClick={() => void handleSellAll()}
+                            disabled={sellBusy || !mint || keyedCount === 0}
+                            className="flex-1 shadow-none!">
+                            {sellBusy ? 'Selling...' : 'Sell All'}
+                        </Btn>
+                        <Btn
+                            onClick={() => void handleClaimFees()}
+                            disabled={claimDisabled}
+                            className="flex-1">
+                            {claimBusy ? 'Claiming...' : 'Claim Fees'}
+                        </Btn>
+                    </div>
 
                     {mint && keyedCount === 0 ? (
                         <StatusLine
@@ -1239,7 +1369,34 @@ export function LaunchPanel({
                             tone="idle"
                         />
                     ) : null}
-                    
+                    {mint && !curvePending && !trackedCurve ? (
+                        <StatusLine
+                            text="NO PUMP.FUN CURVE FOR THIS MINT (NOT A LAUNCHED TOKEN)"
+                            tone="idle"
+                        />
+                    ) : null}
+                    {mint &&
+                    !curvePending &&
+                    trackedCurve &&
+                    creatorPubkey &&
+                    trackedCurve.creator.toBase58() !== creatorPubkey ? (
+                        <StatusLine
+                            text="CONNECTED WALLET IS NOT THIS MINT'S CREATOR"
+                            tone="idle"
+                        />
+                    ) : null}
+                    {claimError ? (
+                        <StatusLine text={claimError} tone="error" />
+                    ) : null}
+                    {claimBusy ? (
+                        <StatusLine
+                            text="CLAIMING ACCRUED CREATOR FEES..."
+                            tone="idle"
+                        />
+                    ) : null}
+                    {claimReport ? (
+                        <ClaimFeesStatusView report={claimReport} />
+                    ) : null}
                 </div>
 
                 {/* status log (preserved from M4) */}

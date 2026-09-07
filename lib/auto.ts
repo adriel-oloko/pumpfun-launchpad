@@ -12,13 +12,12 @@
 //     rent-exempt floor, the tx fee margin, and (on a wallet's very first buy
 //     of this mint) the legacy-SPL ATA rent, so a buy tx can never leave the
 //     wallet below rent or fail for lack of ATA rent.
-//   - Auto SELL: on/off, wallet count, duration, MIN %. Each round picks
-//     `count` RANDOM keyed wallets with token balance > 0 and sells a % of
-//     their OWN holdings (v4 default 100) via pump.fun's sell instruction.
-//     MIN % is a per-wallet dust gate measured against the token's TOTAL
-//     SUPPLY: a wallet holding below (MIN % of total supply) is SKIPPED, so
-//     the bot never burns rounds/txs dumping dust. MIN % = 0 or blank
-//     disables the gate (v4 behavior: sell any wallet with a bag).
+//   - Auto SELL: on/off, wallet count, duration, SELL %. Each round picks
+//     `count` RANDOM keyed wallets with token balance > 0 and sells SELL %
+//     of their OWN holdings (default 100) via pump.fun's sell instruction.
+//     A wallet with no token balance is SKIPPED. The % input sets the sell
+//     fraction of each wallet's OWN bag directly (there is no MIN % dust
+//     gate against total supply).
 //   - Trade execution: each picked wallet's trade is its own signed tx (the
 //     wallet is the fee payer), fired concurrently with Promise.allSettled,
 //     reporting only the final completed count (the v4 batch pattern).
@@ -63,7 +62,6 @@ import {
   sendAndConfirmWithRetry,
   walletTokenBalance,
 } from "./bundle/launch";
-import { makeProtectedSender, protectedReserveLamports } from "./bundle/protected-send";
 import {
   buildPumpBuyIx,
   buildPumpSellIx,
@@ -73,7 +71,6 @@ import {
   resolvePumpFeeRecipient,
   type PumpCurveState,
 } from "./pump";
-import { TOTAL_SUPPLY } from "./params";
 
 /** % of a wallet's spendable SOL balance bought per auto-buy round (v4's
  *  buyPct default). Configurable knob; no UI field exists for it in the AUTO
@@ -177,20 +174,13 @@ export function parseAutoMinSol(raw: string): bigint {
   return BigInt(Math.round(n * LAMPORTS_PER_SOL));
 }
 
-/** MIN % input (0-100, blank/invalid/<=0 -> 0 = gate disabled). */
-export function parseAutoMinPct(raw: string): number {
+/** SELL % input (0-100, blank/invalid/<=0 -> 100 = sell the whole bag). */
+export function parseAutoSellPct(raw: string): number {
   const trimmed = raw.trim();
-  if (!trimmed) return 0;
+  if (!trimmed) return AUTO_SELL_PCT;
   const n = Number(trimmed);
-  if (!Number.isFinite(n) || n <= 0) return 0;
+  if (!Number.isFinite(n) || n <= 0) return AUTO_SELL_PCT;
   return Math.min(100, n);
-}
-
-/** Raw token floor for the sell MIN % gate: MIN % of TOTAL_SUPPLY. A wallet
- *  holding below this is dust and is skipped. 0 when the gate is disabled. */
-export function autoSellMinRaw(pct: number): bigint {
-  if (!(pct > 0)) return BigInt(0);
-  return (TOTAL_SUPPLY * BigInt(Math.round(pct * 100))) / BigInt(10_000);
 }
 
 /* ------------------------------------------------------------------ */
@@ -200,8 +190,7 @@ export function autoSellMinRaw(pct: number): bigint {
 /**
  * Randomly picks `count` keyed wallets that clear the side's balance gate:
  *   - 'sol'   (buy): known SOL balance > 0 and >= minSolLamports.
- *   - 'token' (sell): known token balance > 0 and >= minSellRaw (MIN % gate;
- *             minSellRaw = 0 disables it).
+ *   - 'token' (sell): known token balance > 0.
  * Wallets with no known balance (read failed / never polled) are treated as
  * unfunded and skipped, exactly like v4. A fresh draw every tick. There is
  * NO hub wallet in this launchpad (every roster wallet is a dev wallet), so
@@ -212,8 +201,7 @@ export function pickRandomKeyedWallets(
   side: "sol" | "token",
   wallets: { address: string; key?: string }[],
   balances: Map<string, AutoWalletBalance>,
-  minSolLamports: bigint,
-  minSellRaw: bigint
+  minSolLamports: bigint
 ): AutoWallet[] {
   const pool: AutoWallet[] = [];
   for (const w of wallets) {
@@ -227,7 +215,6 @@ export function pickRandomKeyedWallets(
     } else {
       const tok = bal.token;
       if (tok === null || tok <= BigInt(0)) continue;
-      if (tok < minSellRaw) continue;
     }
     pool.push({ address: w.address, key: w.key });
   }
@@ -392,9 +379,9 @@ export async function fireAutoBuy(
   // Live protocol fee recipient (pump.fun rotates it; a stale value reverts
   // every buy with Custom 6000). One read for the whole round.
   const feeRecipient = await resolvePumpFeeRecipient(connection);
-  // Helius Sender SWQOS-only sender on mainnet (plain RPC on devnet), one per
-  // round.
-  const send = await makeProtectedSender();
+  // Normal raw-RPC send (sendAndConfirmWithRetry): buys send exactly like
+  // sells, no Helius Sender / SWQOS tip / priority fee.
+  const send = sendAndConfirmWithRetry;
 
   // Chain the round's quotes across the simulated reserves: wallet i quotes
   // the state wallets 0..i-1 leave behind (their fills land within the
@@ -424,7 +411,6 @@ export async function fireAutoBuy(
         live -
         BigInt(RENT_EXEMPT_FLOOR) -
         AUTO_TX_FEE_RESERVE_LAMPORTS -
-        BigInt(protectedReserveLamports()) -
         reserveAta;
       if (spendable <= BigInt(0)) return "skipped";
       const solIn = (spendable * BigInt(pctNum)) / BigInt(10_000);
@@ -483,20 +469,17 @@ export interface FireAutoSellOptions {
   wallets: AutoWallet[];
   /** % of each wallet's OWN holdings to sell (default 100). */
   sellPct?: number;
-  /** MIN % dust gate (raw floor = pct of TOTAL_SUPPLY), re-checked on the
-   *  live balance at fire time; 0 disables. */
-  minSellRaw: bigint;
 }
 
 /**
  * Fires one auto-sell round: every picked wallet sells `sellPct`% of its OWN
  * token holdings as its own signed tx, concurrently. Skipped = live token
- * balance <= 0 or below the MIN % floor; failed = build/send/confirm error.
+ * balance <= 0; failed = build/send/confirm error.
  */
 export async function fireAutoSell(
   opts: FireAutoSellOptions
 ): Promise<AutoRoundResult> {
-  const { connection, mint, curve, wallets, minSellRaw } = opts;
+  const { connection, mint, curve, wallets } = opts;
   const sellPct = opts.sellPct ?? AUTO_SELL_PCT;
   if (wallets.length === 0) {
     return { completed: 0, failed: 0, skipped: 0 };
@@ -525,7 +508,6 @@ export async function fireAutoSell(
         mint
       );
       if (balance <= BigInt(0)) return "skipped";
-      if (balance < minSellRaw) return "skipped";
       const tokenIn = (balance * BigInt(pctNum)) / BigInt(10_000);
       if (tokenIn <= BigInt(0)) return "skipped";
       const quote = quotePumpSell({
