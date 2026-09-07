@@ -33,8 +33,7 @@ if (
 /** Builds a Connection over one RPC pool with the rotating pool transport. */
 function makePooledConnection(pool: string[]): Connection {
     return new Connection(
-        pool[0] ??
-            'https://mainnet.helius-rpc.com/?api-key=6fd05d57-a073-4cc6-8b5b-4314a652e487',
+        pool[0] ?? 'https://jemima-hw0ue1-fast-mainnet.helius-rpc.com',
         {
             commitment: 'confirmed',
             fetch: (input: RequestInfo | URL, init?: RequestInit) =>

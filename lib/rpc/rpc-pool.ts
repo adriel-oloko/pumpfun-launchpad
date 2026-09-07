@@ -66,9 +66,7 @@ function buildPool(envName: string, defaults: string[]): string[] {
  */
 export const MAINNET_RPC_POOL: string[] = buildPool(
     'NEXT_PUBLIC_SOLANA_RPC_MAINNET',
-    [
-        'https://mainnet.helius-rpc.com/?api-key=6fd05d57-a073-4cc6-8b5b-4314a652e487',
-    ]
+    ['https://jemima-hw0ue1-fast-mainnet.helius-rpc.com']
 )
 
 /**
