@@ -1029,14 +1029,10 @@ export function LaunchPanel({
     const [trackedCurve, setTrackedCurve] = useState<PumpCurveState | null>(null)
     const [curvePending, setCurvePending] = useState(false)
     useEffect(() => {
-        if (!mint) {
-            setTrackedCurve(null)
-            setCurvePending(false)
-            return
-        }
+        if (!mint) return
         let alive = true
-        setCurvePending(true)
-        const run = async () => {
+        void (async () => {
+            setCurvePending(true)
             try {
                 const connection = makeAppConnection()
                 const curveRead = await readPumpCurveState(
@@ -1053,8 +1049,7 @@ export function LaunchPanel({
             } finally {
                 if (alive) setCurvePending(false)
             }
-        }
-        void run()
+        })()
         return () => {
             alive = false
         }
@@ -1472,5 +1467,34 @@ function SellOutcomeRow({ outcome }: { outcome: SellOutcome }) {
         <p className="label-mono !text-[10px] break-all opacity-90">
             {addr} {body}
         </p>
+    )
+}
+
+/* ---------- M11 claim-fees report (bonding-curve + PumpSwap legs) ---------- */
+
+function ClaimFeesStatusView({ report }: { report: CreatorClaimReport }) {
+    const bondLine =
+        'claimedLamports' in report.bond
+            ? `BONDING CURVE: CLAIMED ${formatSolLamports(report.bond.claimedLamports)}`
+            : `BONDING CURVE: ${report.bond.skipped}`
+    const ammLine = report.amm
+        ? 'claimedLamports' in report.amm
+            ? `PUMP SWAP: CLAIMED ${formatSolLamports(report.amm.claimedLamports)}`
+            : `PUMP SWAP: ${report.amm.skipped}`
+        : 'PUMP SWAP: NOT GRADUATED (NO AMM FEES YET)'
+    return (
+        <div className="reveal-up flex flex-col gap-1 border-2 border-ink px-2 py-1.5">
+            <p className="label-mono !text-[11px] font-bold">
+                CLAIMED {formatSolLamports(report.totalClaimedLamports)} ·{' '}
+                {report.graduated ? 'GRADUATED' : 'ON BONDING CURVE'}
+            </p>
+            <p className="label-mono !text-[10px] break-all opacity-90">{bondLine}</p>
+            <p className="label-mono !text-[10px] break-all opacity-90">{ammLine}</p>
+            {report.signature ? (
+                <p className="label-mono !text-[10px] border-t border-ink/40 pt-1">
+                    <ExplorerLink hash={report.signature} />
+                </p>
+            ) : null}
+        </div>
     )
 }
