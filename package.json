@@ -11,14 +11,15 @@
   "dependencies": {
     "@coral-xyz/anchor": "^0.31.1",
     "@metaplex-foundation/mpl-token-metadata": "^3.4.0",
+    "@pump-fun/pump-swap-sdk": "^1.19.0",
     "@solana/spl-token": "^0.4.15",
     "@solana/web3.js": "^1.98.4",
     "bs58": "^6.0.0",
     "jito-js-rpc": "^0.2.2",
+    "libsodium-wrappers": "^0.7.15",
     "next": "16.3.1",
     "react": "19.2.8",
-    "react-dom": "19.2.8",
-    "@pump-fun/pump-swap-sdk": "^1.19.0"
+    "react-dom": "19.2.8"
   },
   "devDependencies": {
     "@tailwindcss/postcss": "^4",

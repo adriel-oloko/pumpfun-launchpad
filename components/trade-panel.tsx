@@ -27,9 +27,9 @@
 //       * DISTRIBUTE tab (M8C, 2026-09-03): SOL ops over the CHECKED
 //         wallets. Disperse funds them from the HUB (the FIRST roster
 //         wallet) in one tx; Withdraw sweeps the checked KEYED wallets to
-//         a destination (each keeps the rent floor); Delete batch-removes
-//         the checked wallets whose SOL is below the dust floor
-//         (lib/disperse.ts, DUST_SOL_LAMPORTS in lib/params.ts).
+//         a destination (each drained to 0 and CLOSED, rent recovered);
+//         Delete batch-removes the checked wallets whose SOL is below the
+//         dust floor (lib/disperse.ts, DUST_SOL_LAMPORTS in lib/params.ts).
 //   - The roster (import, batch selection, balances) sits inside this card
 //     under the tabs exactly like v4.
 
@@ -58,7 +58,6 @@ import {
 } from '../lib/batch-trade'
 import { readToken2022Metadata } from '../lib/bundle'
 import {
-    WITHDRAW_FEE_RESERVE_LAMPORTS,
     deleteEmptyWallets,
     disperseSol,
     withdrawSol,
@@ -457,10 +456,11 @@ export function TradePanel({
     // needed on the receiver) from the hub in ONE hub-signed tx with a random
     // per-recipient amount in [MIN, MAX]. Withdraw sweeps every CHECKED KEYED
     // wallet (the destination excluded) to a destination the user picks in the
-    // modal; each wallet signs its own tx and keeps the rent floor. Delete
-    // batch-removes the CHECKED wallets whose SOL balance is below the dust
-    // floor (DUST_SOL_LAMPORTS), never the hub. Per-action busy flags keep the
-    // three actions independently clickable (the v4 pattern). The hub stays
+    // modal; each wallet signs its own tx and is drained to 0 (account CLOSED,
+    // rent floor recovered). Delete batch-removes the CHECKED wallets whose
+    // SOL balance is below the dust floor (DUST_SOL_LAMPORTS), never the hub.
+    // Per-action busy flags keep the three actions independently clickable
+    // (the v4 pattern). The hub stays
     // out of every selection set defensively until the M8D roster lands its
     // unselectable-hub semantics.
 
@@ -581,7 +581,6 @@ export function TradePanel({
                 connection,
                 wallets: sources,
                 dest,
-                feeReserveLamports: WITHDRAW_FEE_RESERVE_LAMPORTS,
             })
             setDistributeReport({ kind: 'withdraw', dest, outcomes })
             // Every sent tx moved SOL; refresh the roster columns immediately.
@@ -608,7 +607,7 @@ export function TradePanel({
             } else {
                 pushToast({
                     action: 'WITHDRAW',
-                    amount: `0 SENT (${skipped} SKIPPED: AT RENT FLOOR)`,
+                    amount: `0 SENT (${skipped} SKIPPED: BELOW TX FEE)`,
                 })
             }
         } catch (e) {
@@ -1421,9 +1420,9 @@ export function TradePanel({
                 wallet) in ONE hub-signed tx, a random lamport amount in
                 [MIN, MAX] per wallet. Withdraw sweeps every CHECKED KEYED
                 wallet to the modal destination (default hub); each wallet
-                signs its own tx and keeps the rent floor. Delete
-                batch-removes the CHECKED wallets whose SOL is below
-                DUST_SOL_LAMPORTS; the hub is never deletable. */}
+                signs its own tx and is drained to 0 (account CLOSED, rent
+                recovered). Delete batch-removes the CHECKED wallets whose
+                SOL is below DUST_SOL_LAMPORTS; the hub is never deletable. */}
                                 <div className="flex w-full gap-2">
                                     <Input
                                         type="text"
@@ -1796,7 +1795,7 @@ function WithdrawOutcomeRow({ outcome }: { outcome: WithdrawOutcome }) {
             </span>
         )
     } else if (outcome.status === 'skipped') {
-        body = <span>SKIPPED ({outcome.reason ?? 'at rent floor'})</span>
+        body = <span>SKIPPED ({outcome.reason ?? 'below tx fee'})</span>
     } else {
         body = <span>FAILED ({outcome.reason ?? 'error'})</span>
     }

@@ -391,7 +391,8 @@ export async function fireAutoBuy(
   // Live protocol fee recipient (pump.fun rotates it; a stale value reverts
   // every buy with Custom 6000). One read for the whole round.
   const feeRecipient = await resolvePumpFeeRecipient(connection);
-  // Jito-protected sender on mainnet (plain RPC on devnet), one per round.
+  // Helius Sender SWQOS-only sender on mainnet (plain RPC on devnet), one per
+  // round.
   const send = await makeProtectedSender();
 
   // Chain the round's quotes across the simulated reserves: wallet i quotes
@@ -505,7 +506,8 @@ export async function fireAutoSell(
   // Live protocol fee recipient (pump.fun rotates it; a stale value reverts
   // every sell with Custom 6000). One read for the whole round.
   const feeRecipient = await resolvePumpFeeRecipient(connection);
-  // Jito-protected sender on mainnet (plain RPC on devnet), one per round.
+  // Helius Sender SWQOS-only sender on mainnet (plain RPC on devnet), one per
+  // round.
   const send = await makeProtectedSender();
 
   // Chain the round's min_sol_output quotes across the simulated reserves.

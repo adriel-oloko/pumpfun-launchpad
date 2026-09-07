@@ -12,7 +12,11 @@
 // drives lib/bundle:
 //
 //   Tier 1 (default): buildLaunchSequence + preflightLaunch +
-//                     sendSequentially as normal devnet txs.
+//                     sendSequentially, which submits every launch tx
+//                     (fund -> create -> buys) through the shared Helius
+//                     Sender SWQOS-only sender on MAINNET (each tx with its
+//                     own 0.000005 SOL tip + priority fee, mev-protect) and
+//                     through plain RPC on devnet (unchanged).
 //   Tier 2:           the same sequence as an ATOMIC relay bundle submitted
 //                     through the same-origin proxy (/api/bundle-relay):
 //                     NextBlock PRIMARY, Astralane + bloXroute optional
@@ -37,7 +41,8 @@
 // auto-migrates its curves to PumpSwap on graduation, so the launch panel
 // no longer carries migration toggles and no anchor Program/IDL exists
 // anymore (every instruction is hand-built in lib/pump.ts; the mint is a
-// fresh Keypair generated at sequence build time).
+// vanity keypair whose base58 ADDRESS ends in "pump" — ground client-side
+// with a libsodium Web Worker pool before the sequence is built).
 //
 // METADATA (M9: structured + publish-on-launch):
 // The single URI input is replaced by discrete description / image /
@@ -80,6 +85,7 @@ import {
     type BuyAllocation,
 } from '../lib/bundle'
 import { publishTokenMetadata } from '../lib/metadata'
+import { grindVanityMintKeypair } from '../lib/vanity-client'
 import {
     fetchRelayPlan,
     defaultTipAccountForRelay,
@@ -459,6 +465,40 @@ export function LaunchPanel({
                 )
             }
 
+            // Vanity mint: real pump.fun tokens have base58 mint ADDRESSES
+            // ending in the literal string "pump" (pump.fun grinds them
+            // client-side). Grind ours with a libsodium Web Worker pool
+            // (lib/vanity-client.ts; lib/vanity.ts single-threaded core is the
+            // fallback) so the create tx signs with a genuinely "...pump" mint
+            // keypair. Cosmetic, zero on-chain effect: name/symbol/uri are
+            // untouched — the .pump TICKER suffix is still indexer-applied.
+            // The mint secret key is never logged.
+            //
+            // One status-log slot ('vanity :' lines): the seed line is
+            // replaced in place by each throttled progress tick and finally by
+            // the found line, so the log does not flood during a ~1-2 min
+            // grind.
+            const logVanity = (line: string): void => {
+                setStatusLines((prev) => {
+                    const last = prev[prev.length - 1] ?? ''
+                    return last.startsWith('vanity :')
+                        ? [...prev.slice(0, -1), line]
+                        : [...prev, line]
+                })
+            }
+            logVanity(
+                'vanity : grinding a mint keypair whose ADDRESS ends in "pump" (Web Workers, ~1-2 min)...'
+            )
+            const mintKeypair = await grindVanityMintKeypair({
+                onProgress: (p) =>
+                    logVanity(
+                        `vanity : grinding "...pump" mint — ${p.attempts.toLocaleString()} keypairs @ ${p.attemptsPerSecond.toLocaleString()}/s`
+                    ),
+            })
+            logVanity(
+                `vanity : mint ${mintKeypair.publicKey.toBase58()} — ADDRESS ends in "pump"`
+            )
+
             const seq = await buildLaunchSequence({
                 connection,
                 creator,
@@ -466,18 +506,19 @@ export function LaunchPanel({
                 symbol,
                 uri: finalUri,
                 buys,
+                mintKeypair,
                 // No creator -> wallet funding txs: every dev wallet buys from
                 // its OWN pre-funded balance (the buildLaunchSequence default
                 // fundLamportsPerWallet = null emits no fund tx).
-                // Tier 1 has no bundle tip, so the full 1222-byte budget is
-                // available. Tier 2 keeps the default 1150 + 90 tip reserve.
-                // Measured (M10): pump.fun buy ixs pack 2 wallets per tx max.
-                ...(tier === '1'
-                    ? { maxBuyTxBytes: 1222, tipReserveBytes: 0 }
-                    : {}),
+                // Byte budget: every mainnet-launch buy tx now carries its OWN
+                // Helius Sender tip transfer (~90 bytes) — sendSequentially
+                // submits through the SWQOS-only sender on mainnet — so buy
+                // txs keep the default 1150-byte budget with the 90-byte tip
+                // reserve on BOTH tiers (the old tier-1 1222/0 override is
+                // gone). Measured (M10): pump.fun buy ixs pack 2 wallets/tx.
             })
             log(
-                `mint    : ${EXPLORER}/address/${seq.pda.mint.toBase58()}${EXPLORER_QS} (fresh pump.fun mint keypair; the .pump suffix is indexer-applied)`
+                `mint    : ${EXPLORER}/address/${seq.pda.mint.toBase58()}${EXPLORER_QS} (vanity keypair: the mint ADDRESS ends in "pump"; the .pump TICKER suffix is still indexer-applied)`
             )
             log(
                 `curve   : ${EXPLORER}/address/${seq.pda.curveState.toBase58()}${EXPLORER_QS}`
@@ -507,6 +548,10 @@ export function LaunchPanel({
                 log(
                     'sending launch txs sequentially (fund -> create -> buys)...'
                 )
+                // sendSequentially routes each launch tx through Helius Sender
+                // SWQOS-only on mainnet (flat 5,000-lamport tip, LAST
+                // instruction, + the tx's own priority fee) and through plain
+                // RPC on devnet.
                 const sent = await sendSequentially(connection, seq, {
                     onSignature: (label, sig) => {
                         sentSigs.push(sig)

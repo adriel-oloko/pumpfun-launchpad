@@ -24,8 +24,15 @@
 //   (1060 signed bytes under the default 1150 - 90 tip budget); 3 overflow.
 //   Every selected dev wallet signs its own buy; the creator signs each buy
 //   tx as fee payer only. The tip-carrying last bundle tx holds <= 2.
-// - The sequence can be sent as normal transactions (Tier 1, no Jito) or
-//   assembled into a Jito bundle (Tier 2, see jito.ts).
+// - The sequence can be sent as normal transactions (Tier 1) or assembled
+//   into an atomic relay bundle (Tier 2, see relays.ts + fanout-submit.ts).
+//   Tier 1 sends through the shared Helius Sender SWQOS-only submission
+//   layer (sendProtectedTx in lib/bundle/protected-send.ts, the same sender
+//   the buy/sell/auto paths use): on MAINNET every launch tx (fund/create/
+//   each packed buy) carries its own flat 5,000-lamport (0.000005 SOL) Sender
+//   tip as its LAST instruction plus its own setComputeUnitPrice priority fee
+//   (already baked in below — no second fee ix is added); on DEVNET it falls
+//   back to the plain raw-RPC send (sendAndConfirmWithRetry), unchanged.
 //
 // The curve economics are identical to the old custom program (30 SOL
 // virtual reserve, 1.073B virtual token reserve, 1% fee, 85 SOL graduation,
@@ -63,6 +70,8 @@ import {
 import { VIRTUAL_SOL_RESERVE, VIRTUAL_TOKEN_RESERVE } from "../params";
 import { DEFAULT_PRIORITY_FEE_MICRO_LAMPORTS } from "../fees";
 import { isBlockhashExpiredError } from "../tx-errors";
+import { grindVanityMintKeypair } from "../vanity";
+import { sendProtectedTx } from "./protected-send";
 
 /** Metaplex token metadata program id (pump.fun's create metadata PDA is
  *  derived under it). */
@@ -79,9 +88,11 @@ export const MAX_COMPUTE_UNITS = 1_400_000;
 export const CREATE_CU_LIMIT = 150_000;
 export const BUY_CU_LIMIT = 250_000;
 
-/** Default serialized-byte budget for a buy tx. The tip transfer added to the
- *  last bundle tx costs ~80 bytes, so the last tx is packed to
- *  maxBuyTxBytes - tipReserveBytes and holds one wallet fewer. */
+/** Default serialized-byte budget for a buy tx. Every mainnet-launch buy tx
+ *  now carries its OWN Sender tip transfer (~90 bytes) — Tier 1 sequential
+ *  sends go through sendProtectedTx (lib/bundle/protected-send.ts) and Tier
+ *  2 puts a relay tip in its final tx — so each packed buy tx reserves
+ *  tipReserveBytes of its budget: packed to maxBuyTxBytes - tipReserveBytes. */
 export const DEFAULT_MAX_BUY_TX_BYTES = 1150;
 export const DEFAULT_TIP_RESERVE_BYTES = 90;
 
@@ -172,6 +183,14 @@ export interface BuildLaunchOptions {
   /** Slippage headroom (basis points) on every pre-fill buy's max_sol_cost
    *  quote (default 10%: covers reserve drift + the fee-program split). */
   slippageBps?: bigint;
+  /** Optional pre-generated mint keypair (e.g. a vanity keypair whose base58
+   *  ADDRESS ends in "pump", ground with Web Workers by the launch panel).
+   *  When omitted, a fresh vanity mint keypair is grinded here with the
+   *  CJS-safe single-threaded libsodium core (lib/vanity.ts) — the Node CLI
+   *  scripts' path. Every mint this launchpad creates therefore ends in
+   *  "pump", exactly like real pump.fun tokens. Cosmetic only: the ticker's
+   *  `.pump` SUFFIX is still indexer-applied; name/symbol/uri are untouched. */
+  mintKeypair?: Keypair;
 }
 
 /** Derives every pump.fun address for one launch from the fresh mint
@@ -434,8 +453,13 @@ export async function buildLaunchSequence(
   };
 
   // M10: the mint is a FRESH Keypair generated client-side (never a PDA, and
-  // never lost: it signs the create tx in signersByTx[create]).
-  const mintKeypair = Keypair.generate();
+  // never lost: it signs the create tx in signersByTx[create]). Vanity:
+  // unless the caller supplies a pre-ground keypair (the launch panel grinds
+  // with a Web Worker pool, lib/vanity-client.ts), grind one here with the
+  // CJS-safe single-threaded libsodium core so EVERY mint this launchpad
+  // creates has a base58 ADDRESS ending in "pump" — including the Node CLI
+  // scripts that compile this file to CommonJS.
+  const mintKeypair = opts.mintKeypair ?? (await grindVanityMintKeypair());
   const pda = deriveLaunchPdas(mintKeypair.publicKey);
   const latest = await connection.getLatestBlockhash("confirmed");
   const blockhash = { blockhash: latest.blockhash, lastValidBlockHeight: latest.lastValidBlockHeight };
@@ -767,11 +791,17 @@ export async function sendAndConfirmWithRetry(
 }
 
 /** Sends the sequence as normal transactions, confirming each (Tier 1).
- *  Each tx is sent with sendAndConfirmWithRetry: a stale/expired blockhash is
- *  retried with a fresh one (up to 3 attempts), never a bare failure or a
- *  hang. A mid-sequence failure throws with the partial-state context: the
- *  txs that already confirmed are named so the caller never mistakes a
- *  partial launch for a no-op. */
+ *  Each tx goes through the shared Helius Sender SWQOS-only sender
+ *  (sendProtectedTx): on MAINNET it is re-signed per attempt with the tx's
+ *  own existing setComputeUnitPrice ix (skipPriorityFeeIx — no second fee
+ *  ix), a flat 5,000-lamport Sender tip as the LAST instruction, submitted
+ *  to the mev-protect SWQOS endpoint and confirmed by signature; on DEVNET
+ *  sendProtectedTx falls back to sendAndConfirmWithRetry (plain raw RPC,
+ *  unchanged). Either way a stale/expired blockhash is retried with a fresh
+ *  one (up to 3 attempts), never a bare failure or a hang. A mid-sequence
+ *  failure throws with the partial-state context: the txs that already
+ *  confirmed are named so the caller never mistakes a partial launch for a
+ *  no-op. */
 export async function sendSequentially(
   connection: Connection,
   seq: LaunchSequence,
@@ -788,11 +818,19 @@ export async function sendSequentially(
   for (let i = 0; i < txs.length; i++) {
     const label = labels[i];
     try {
-      const { signature } = await sendAndConfirmWithRetry(connection, txs[i], seq.signersByTx[i], {
-        attempts: 3,
-        confirmTimeoutMs,
-        label: `tx ${label}`,
-      });
+      const { signature } = await sendProtectedTx(
+        connection,
+        txs[i],
+        seq.signersByTx[i],
+        {
+          attempts: 3,
+          confirmTimeoutMs,
+          label: `tx ${label}`,
+          // The launch txs carry their own setComputeUnitPrice ix (added in
+          // buildLaunchSequence); sendProtectedTx must NOT prepend a second.
+          skipPriorityFeeIx: true,
+        }
+      );
       if (opts.onSignature) opts.onSignature(label, signature);
       sent.push({ label, signature });
     } catch (e) {

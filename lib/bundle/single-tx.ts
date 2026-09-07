@@ -38,6 +38,7 @@ import {
 import { VIRTUAL_SOL_RESERVE, VIRTUAL_TOKEN_RESERVE } from "../params";
 import { DEFAULT_PRIORITY_FEE_MICRO_LAMPORTS } from "../fees";
 import { MAX_TX_BYTES, deriveLaunchPdas } from "./launch";
+import { grindVanityMintKeypair } from "../vanity";
 
 /** Combined compute-unit budget: create ~111k + buy (incl. ATA create + tip)
  *  ~205k, rounded up with headroom. One tx, so no Jito cost-model concern. */
@@ -62,6 +63,12 @@ export interface SingleTxLaunchOptions {
    *  a synthetic one (syntheticPumpLookupTable) for a dry-run size check. */
   alt: AddressLookupTableAccount;
   priorityFeeMicroLamports?: number;
+  /** Optional pre-generated mint keypair (a vanity keypair whose base58
+   *  ADDRESS ends in "pump"). When omitted, one is grinded here with the
+   *  CJS-safe single-threaded libsodium core (lib/vanity.ts) so every mint
+   *  this single-tx launch creates ends in "pump" too. Cosmetic only; the
+   *  ticker's `.pump` SUFFIX is still indexer-applied. */
+  mintKeypair?: Keypair;
 }
 
 export interface SingleTxLaunch {
@@ -77,7 +84,9 @@ export interface SingleTxLaunch {
 /** Builds the signed single-tx launch (create + one buy + tip). Throws if the
  *  serialized tx exceeds the 1232-byte limit (name/uri too long or buy amount
  *  too large). The input keypairs are never mutated; the mint keypair is
- *  freshly generated and returned so the caller can retain it. */
+ *  freshly generated (or caller-supplied) and returned so the caller can
+ *  retain it. The mint's base58 ADDRESS ends in "pump" (vanity grind via
+ *  lib/vanity.ts unless a mintKeypair is passed). */
 export async function buildSingleTxLaunch(
   opts: SingleTxLaunchOptions
 ): Promise<SingleTxLaunch> {
@@ -102,7 +111,10 @@ export async function buildSingleTxLaunch(
     );
   }
 
-  const mintKeypair = Keypair.generate();
+  // Vanity mint: a caller-supplied keypair (already ends in "pump") is used
+  // verbatim; otherwise grind one via the CJS-safe single-threaded core so
+  // Node CLI scripts mint vanity addresses exactly like the browser UI.
+  const mintKeypair = opts.mintKeypair ?? (await grindVanityMintKeypair());
   const mint = mintKeypair.publicKey;
   const pda = deriveLaunchPdas(mint);
   const latest = await connection.getLatestBlockhash("confirmed");

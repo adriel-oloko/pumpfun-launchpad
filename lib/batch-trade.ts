@@ -22,8 +22,9 @@
 // pump.fun ixs: buy/sell take tokens_out/tokens_in quoted client-side with
 // slippage; the curve's creator feeds the creator_vault fee leg) and sends
 // go through lib/bundle/protected-send.ts's makeProtectedSender: on MAINNET
-// each trade is submitted to Helius Sender Max (sender.helius-rpc.com/fast,
-// priority fee + tip, mev-protect) so the whole batch is front-running-
+// each trade is submitted to Helius Sender SWQOS-only
+// (sender.helius-rpc.com/fast?swqos_only=true&mev-protect=true, priority fee
+// + flat 5,000-lamport tip) so the whole batch is front-running-
 // protected; on devnet it falls back to sendAndConfirmWithRetry (expiry-safe
 // re-sends only, never a blind double-fire).
 //
@@ -265,7 +266,8 @@ export async function buySelectedWallets(
   const latest = await connection.getLatestBlockhash("confirmed");
   // Live protocol fee recipient (pump.fun rotates it; stale -> Custom 6000).
   const feeRecipient = await resolvePumpFeeRecipient(connection);
-  // Jito-protected sender on mainnet (plain RPC on devnet), one per batch.
+  // Helius Sender SWQOS-only sender on mainnet (plain RPC on devnet), one per
+  // batch.
   const send = await makeProtectedSender();
   const settled = await Promise.allSettled(
     wallets.map((w) =>
@@ -303,7 +305,8 @@ export async function sellSelectedWallets(
   const latest = await connection.getLatestBlockhash("confirmed");
   // Live protocol fee recipient (pump.fun rotates it; stale -> Custom 6000).
   const feeRecipient = await resolvePumpFeeRecipient(connection);
-  // Jito-protected sender on mainnet (plain RPC on devnet), one per batch.
+  // Helius Sender SWQOS-only sender on mainnet (plain RPC on devnet), one per
+  // batch.
   const send = await makeProtectedSender();
   const settled = await Promise.allSettled(
     wallets.map((w) =>

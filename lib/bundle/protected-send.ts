@@ -1,23 +1,32 @@
 // Front-running-protected single-tx send for the MANUAL + AUTO buy/sell
-// engines (lib/batch-trade.ts and lib/auto.ts), via Helius Sender Max
-// (sender.helius-rpc.com/fast).
+// engines (lib/batch-trade.ts and lib/auto.ts) AND the sequential LAUNCH
+// path (sendSequentially in lib/bundle/launch.ts), via Helius Sender's
+// SWQOS-ONLY tier (sender.helius-rpc.com/fast?swqos_only=true). One sender
+// for all four trade paths and the launch: the launch txs go through
+// sendProtectedTx with skipPriorityFeeIx (their own setComputeUnitPrice ix
+// is already in the tx) so the submission layer stays in one place.
 //
 // WHY HELIUS SENDER (not Jito): the earlier Jito single-tx bundle path
 // (client.sendBundle to the block engine) kept coming back "accepted then
 // Invalid" — the same drop the repo already documented for the launch flow,
 // which is why Jito was demoted there. Helius Sender is a plain sendTransaction
-// to a low-latency endpoint that routes across all high-speed pathways
-// (Helius/Jito/Harmonic/Rakurai) and returns the TX SIGNATURE directly, so
-// there is no bundle id and no status polling to mis-handle.
+// to a low-latency endpoint that returns the TX SIGNATURE directly, so
+// there is no bundle id and no status polling to mis-handle. SWQOS-only is
+// the cost-optimized tier: one fast pathway at the lowest tip.
 //
-// On MAINNET each wallet's buy/sell is submitted to Helius Sender with:
-//   1. a priority fee (setComputeUnitPrice) — REQUIRED, and the buy/sell txs
-//      otherwise carry none, which was also hurting landing on the Jito path;
-//   2. the trade instructions;
-//   3. a >= 0.001 SOL tip transfer to a Helius Sender tip account (LAST).
-// ?mev-protect=true on the endpoint routes around validators statistically
-// linked to sandwich attacks — this is the front-running protection that
-// replaces the old Jito bundle. Drop the query param to maximize inclusion
+// On MAINNET each submitted tx carries:
+//   1. a priority fee (setComputeUnitPrice) — REQUIRED by Sender on EVERY
+//      tx. The buy/sell txs carry none, so sendProtectedTx prepends one;
+//      the launch txs (lib/bundle/launch.ts) already carry one, so a second
+//      must NOT be added (skipPriorityFeeIx: true);
+//   2. the trade/launch instructions;
+//   3. a flat 5,000-lamport (0.000005 SOL) tip transfer to a Helius Sender
+//      tip account, LAST (the tip transfer must be the final instruction).
+// ?swqos_only=true selects the single SWQOS pathway whose minimum tip is
+// 0.000005 SOL (tips below the 0.001 SOL Sender-Max floor do not enter the
+// priority tip buffer). ?mev-protect=true routes around validators
+// statistically linked to sandwich attacks — the front-running protection
+// that replaces the old Jito bundle. Drop mev-protect to maximize inclusion
 // pathways instead.
 //
 // On DEVNET the Helius Sender endpoint is mainnet-only in practice, so it
@@ -37,22 +46,22 @@ import {
   SystemProgram,
   Transaction,
 } from "@solana/web3.js";
-import {
-  DEFAULT_JITO_TIP_LAMPORTS,
-  DEFAULT_PRIORITY_FEE_MICRO_LAMPORTS,
-} from "../fees";
+import { DEFAULT_PRIORITY_FEE_MICRO_LAMPORTS } from "../fees";
 import { solanaNetwork } from "../network";
 import { isBlockhashExpiredError } from "../tx-errors";
 import { sendAndConfirmWithRetry, withTimeout } from "./launch";
 
-/** Helius Sender Max endpoint. ?mev-protect=true routes around validators
- *  statistically linked to sandwich attacks (front-running protection). */
+/** Helius Sender SWQOS-only endpoint. ?swqos_only=true selects the single
+ *  SWQOS pathway (minimum tip 0.000005 SOL); ?mev-protect=true routes
+ *  around validators statistically linked to sandwich attacks
+ *  (front-running protection). */
 export const HELIUS_SENDER_URL =
-  "https://sender.helius-rpc.com/fast?mev-protect=true";
+  "https://sender.helius-rpc.com/fast?swqos_only=true&mev-protect=true";
 
 /** Helius Sender tip accounts: the SOL transfer that pays for priority
- *  landing. Sender Max requires >= 0.001 SOL. Source:
- *  helius.dev/docs/sending-transactions/sender-max (the documented list). */
+ *  landing. SWQOS-only requires >= 0.000005 SOL (5,000 lamports). Source:
+ *  helius.dev/docs/sending-transactions/sender-swqos-only (the documented
+ *  list). */
 export const HELIUS_SENDER_TIP_ACCOUNTS: string[] = [
   "4ACfpUFoaSD9bfPdeu6DBt89gB6ENTeHBXCAi87NhDEE",
   "D2L6yPZ2FmmmTKPgzaMKdhu6EWZcTpLy1Vhx8uvZe7NZ",
@@ -66,8 +75,12 @@ export const HELIUS_SENDER_TIP_ACCOUNTS: string[] = [
   "4TQLFNWK8AovT1gFvda5jfw2oJeRMKEmw7aH6MGBJ3or",
 ];
 
-/** Sender Max minimum tip (0.001 SOL), lamports. */
-const HELIUS_SENDER_MIN_TIP_LAMPORTS = 1_000_000;
+/** SWQOS-only tip, lamports: a FLAT 5,000 (0.000005 SOL, the tier minimum).
+ *  Deliberately NOT clamped up to DEFAULT_JITO_TIP_LAMPORTS (1_000_000 =
+ *  0.001 SOL, the Sender-Max / relay floor): that clamp silently kept every
+ *  trade at 0.001 SOL; the whole point of the SWQOS-only tier is the
+ *  lowest-tip path. */
+const HELIUS_SENDER_SWQOS_TIP_LAMPORTS = 5_000;
 
 /** A send + confirm function with the same shape as sendAndConfirmWithRetry:
  *  (connection, tx, signers, opts) -> { signature }. Swapped into the buy/sell
@@ -91,17 +104,24 @@ export interface ProtectedSendOptions {
   attempts?: number;
   confirmTimeoutMs?: number;
   label?: string;
-  /** Tip in lamports; default DEFAULT_JITO_TIP_LAMPORTS clamped to the Sender
-   *  Max floor (0.001 SOL). */
+  /** Tip in lamports; default the SWQOS-only flat 5,000 (0.000005 SOL). */
   tipLamports?: number;
   /** Pre-resolved tip account; defaults to a random Helius Sender account. */
   tipAccount?: PublicKey;
+  /** True when the tx's instructions ALREADY carry a setComputeUnitPrice ix
+   *  (the launch txs built by lib/bundle/launch.ts always do). sendProtectedTx
+   *  prepends its own priority-fee ix by default because the buy/sell txs
+   *  carry none; with this flag it skips that so a tx never ends up with TWO
+   *  compute-unit-price instructions. */
+  skipPriorityFeeIx?: boolean;
 }
 
-/** The Sender tip (lamports) actually paid on mainnet, 0 on devnet. */
+/** The Sender tip (lamports) actually paid on mainnet, 0 on devnet. A flat
+ *  5,000 (0.000005 SOL): the SWQOS-only minimum. No DEFAULT_JITO_TIP_LAMPORTS
+ *  clamp — that would silently keep the tip at 0.001 SOL. */
 export function protectedTipLamports(): number {
   if (solanaNetwork() !== "mainnet") return 0;
-  return Math.max(HELIUS_SENDER_MIN_TIP_LAMPORTS, DEFAULT_JITO_TIP_LAMPORTS);
+  return HELIUS_SENDER_SWQOS_TIP_LAMPORTS;
 }
 
 /** The priority fee (lamports) a mainnet buy/sell pays, 0 on devnet. Estimated
@@ -113,8 +133,9 @@ export function protectedPriorityFeeReserve(): number {
 }
 
 /** Total extra lamports a MAINNET buy must reserve above the fee/rent floor:
- *  the Sender tip + the priority fee. 0 on devnet. The buy's spendable-SOL
- *  formulas subtract this so a buy never quotes an amount it cannot cover. */
+ *  the Sender tip (flat 5,000) + the priority fee. 0 on devnet. The buy's
+ *  spendable-SOL formulas subtract this so a buy never quotes an amount it
+ *  cannot cover. */
 export function protectedReserveLamports(): number {
   return protectedTipLamports() + protectedPriorityFeeReserve();
 }
@@ -154,8 +175,9 @@ async function senderSend(base64: string): Promise<string> {
 
 /**
  * Sends ONE signed tx with front-running protection. Mainnet: Helius Sender
- * Max (priority fee + tip, mev-protect) confirmed on-chain by signature.
- * Devnet: plain sendAndConfirmWithRetry (no block engine).
+ * SWQOS-only (priority fee + flat 5,000-lamport tip, mev-protect) confirmed
+ * on-chain by signature. Devnet: plain sendAndConfirmWithRetry (no block
+ * engine).
  */
 export async function sendProtectedTx(
   connection: Connection,
@@ -174,10 +196,9 @@ export async function sendProtectedTx(
   const attempts = opts.attempts ?? 3;
   const confirmTimeoutMs = opts.confirmTimeoutMs ?? 45_000;
   const label = opts.label ?? "tx";
-  const tipLamports = Math.max(
-    HELIUS_SENDER_MIN_TIP_LAMPORTS,
-    opts.tipLamports ?? DEFAULT_JITO_TIP_LAMPORTS
-  );
+  // Flat 5,000-lamport SWQOS-only tip (no DEFAULT_JITO_TIP_LAMPORTS clamp:
+  // that floor is 0.001 SOL and would silently defeat the low-tip tier).
+  const tipLamports = opts.tipLamports ?? HELIUS_SENDER_SWQOS_TIP_LAMPORTS;
   const tipPayer = signers[0];
   if (!tipPayer) throw new Error(`${label}: no signer to pay the tip`);
   const tipAccount = opts.tipAccount ?? pickSenderTipAccount();
@@ -187,18 +208,22 @@ export async function sendProtectedTx(
     const latest = await connection.getLatestBlockhash("confirmed");
 
     // Build a fresh signed tx per attempt (the caller's tx is never mutated):
-    // priority fee FIRST, then the trade instructions, then the Sender tip
-    // LAST (the tip transfer must be the final instruction).
+    // priority fee FIRST (unless the tx already carries one — the launch txs
+    // built by lib/bundle/launch.ts do, and a second compute-unit-price ix
+    // would be rejected), then the trade/launch instructions, then the Sender
+    // tip LAST (the tip transfer must be the final instruction).
     const signed = new Transaction({
       feePayer: tx.feePayer as PublicKey,
       blockhash: latest.blockhash,
       lastValidBlockHeight: latest.lastValidBlockHeight,
     });
-    signed.add(
-      ComputeBudgetProgram.setComputeUnitPrice({
-        microLamports: DEFAULT_PRIORITY_FEE_MICRO_LAMPORTS,
-      })
-    );
+    if (!opts.skipPriorityFeeIx) {
+      signed.add(
+        ComputeBudgetProgram.setComputeUnitPrice({
+          microLamports: DEFAULT_PRIORITY_FEE_MICRO_LAMPORTS,
+        })
+      );
+    }
     signed.add(...tx.instructions);
     signed.add(
       SystemProgram.transfer({

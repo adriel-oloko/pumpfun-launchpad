@@ -14,12 +14,13 @@
 //   - Withdraw: every selected KEYED wallet (the destination itself is
 //     never a source) sends its spendable SOL to the destination in its
 //     OWN signed transfer tx, fired concurrently with Promise.allSettled
-//     (a public-mempool sweep, NOT one atomic bundle). SOLANA-CORRECT
-//     DRAIN: a writable system account cannot end a tx with a non-zero
-//     balance below the 890,880-lamport rent floor (the runtime rejects
-//     InsufficientFundsForRent). v4 sweeps to ~0 because ETH has no rent;
-//     the Solana sweep sends balance - RENT_EXEMPT_FLOOR - fee reserve and
-//     each wallet keeps the rent floor (~0.00089 SOL) plus the reserve.
+//     (a public-mempool sweep, NOT one atomic bundle). FULL DRAIN + CLOSE:
+//     each wallet transfers balance - WITHDRAW_TX_FEE_LAMPORTS so it lands
+//     on exactly 0 lamports, which deallocates the system account and
+//     recovers the 890,880-lamport rent floor too. (A non-zero balance
+//     below the floor is rejected as InsufficientFundsForRent; landing on
+//     exactly 0 is legal and closes the account.) The address and keypair
+//     survive: re-funding the address re-allocates the account.
 //   - Delete: a pure selection helper over the roster balance map. Token
 //     balance does NOT gate deletion (user spec): a wallet with tokens but
 //     no SOL is still removable. Unknown balances are never deleted.
@@ -37,15 +38,13 @@ import {
   SystemProgram,
   Transaction,
 } from "@solana/web3.js";
-import {
-  RENT_EXEMPT_FLOOR,
-  sendAndConfirmWithRetry,
-} from "./bundle/launch";
+import { sendAndConfirmWithRetry } from "./bundle/launch";
 
-/** Lamports a swept wallet keeps beyond the rent floor to pay its
- *  transfer's ~5000-lamport base fee with a small margin. Module constant
- *  (M8C spec). Unit: lamports. Value: 10_000. */
-export const WITHDRAW_FEE_RESERVE_LAMPORTS: bigint = BigInt(10_000);
+/** Base transaction fee (lamports) of one single-signature legacy transfer:
+ *  5,000 lamports. The withdraw sweep transfers balance - this fee so each
+ *  wallet lands on exactly 0 lamports (account closed, rent recovered).
+ *  Module constant (M8C spec). Unit: lamports. Value: 5_000. */
+export const WITHDRAW_TX_FEE_LAMPORTS: bigint = BigInt(5_000);
 
 /** Uniform random integer in [min, max] INCLUSIVE. 256 bits of entropy via
  *  crypto.getRandomValues, folded onto the range with a modulo (returns min
@@ -165,8 +164,6 @@ export interface WithdrawOptions {
   wallets: WithdrawWallet[];
   /** Base58 destination; never a sweep source itself. */
   dest: string;
-  /** Kept behind the rent floor to pay the tx fee (module default 10_000). */
-  feeReserveLamports?: bigint;
 }
 
 /** Per-wallet sweep outcome. */
@@ -187,15 +184,13 @@ function errText(e: unknown): string {
 }
 
 /** One sweep worker: reads the wallet's LIVE balance, sends
- *  balance - rent floor - fee reserve to the destination in the wallet's
- *  own signed tx. Never transfers below the rent floor (see the drain note
- *  in the file header). */
+ *  balance - WITHDRAW_TX_FEE_LAMPORTS to the destination in the wallet's
+ *  own signed tx, leaving exactly 0 lamports so the account is closed and
+ *  its rent floor recovered (see the drain note in the file header). */
 async function sweepOne(
   connection: Connection,
   wallet: WithdrawWallet,
-  destPk: PublicKey,
-  feeReserve: bigint,
-  rentFloor: bigint
+  destPk: PublicKey
 ): Promise<WithdrawOutcome> {
   let kp: Keypair;
   try {
@@ -221,14 +216,14 @@ async function sweepOne(
       reason: errText(e),
     };
   }
-  const value = BigInt(live) - rentFloor - feeReserve;
+  const value = BigInt(live) - WITHDRAW_TX_FEE_LAMPORTS;
   if (value <= BigInt(0)) {
     return {
       address: wallet.address,
       solWithdrawn: BigInt(0),
       signature: null,
       status: "skipped",
-      reason: "BALANCE AT RENT FLOOR",
+      reason: "BALANCE BELOW TX FEE",
     };
   }
   const tx = new Transaction({ feePayer: kp.publicKey });
@@ -268,16 +263,16 @@ async function sweepOne(
 }
 
 /** Sweeps every selected keyed wallet's spendable SOL to `dest`, one signed
- *  transfer tx per wallet, fired CONCURRENTLY (Promise.allSettled). The
- *  destination address is excluded from the sources (base58 comparison,
+ *  transfer tx per wallet, fired CONCURRENTLY (Promise.allSettled). Each
+ *  wallet is drained to 0 lamports (account closed, rent floor recovered).
+ *  The destination address is excluded from the sources (base58 comparison,
  *  case-sensitive). Throws a descriptive error for an invalid destination;
  *  per-wallet build/send failures are reported as failed outcomes, wallets
- *  with nothing above the rent floor + reserve as skipped. */
+ *  with nothing above the tx fee as skipped. */
 export async function withdrawSol(
   opts: WithdrawOptions
 ): Promise<WithdrawOutcome[]> {
   const { connection, dest } = opts;
-  const feeReserve = opts.feeReserveLamports ?? WITHDRAW_FEE_RESERVE_LAMPORTS;
   let destPk: PublicKey;
   try {
     destPk = new PublicKey(dest);
@@ -287,9 +282,8 @@ export async function withdrawSol(
   // The destination is never a sweep source.
   const sources = opts.wallets.filter((w) => w.address !== dest);
   if (sources.length === 0) return [];
-  const rentFloor = BigInt(RENT_EXEMPT_FLOOR);
   const settled = await Promise.allSettled(
-    sources.map((w) => sweepOne(connection, w, destPk, feeReserve, rentFloor))
+    sources.map((w) => sweepOne(connection, w, destPk))
   );
   return settled.map((r, i) => {
     if (r.status === "fulfilled") return r.value;
