@@ -678,7 +678,7 @@ export function Roster({ api }: { api: RosterApi }) {
             ) : null}
 
             {/* column header (ink strip) */}
-            <div className="label-mono flex items-center gap-2 border-2 border-ink bg-[#ccff00] px-3 py-1.5 text-ink">
+            <div className="label-mono flex items-center gap-2 border-2 border-ink bg-[#52d593] px-3 py-1.5 text-ink">
                 <div className="flex w-6 shrink-0 items-center">
                     <input
                         type="checkbox"

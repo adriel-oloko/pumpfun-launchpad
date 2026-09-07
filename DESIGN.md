@@ -3,10 +3,10 @@ version: alpha
 name: HopeX-PONS-Pad-design
 source: local codebase /mnt/d/web3-engineer/PonsLaunchpad (src/)
 capture_date: 2026-09-04
-description: A dark-only, near-monochrome trading console for the Pons v2 launchpad on Robinhood Chain. Deep navy-black canvas (#0B1217) carries a two-step panel ladder (#142028 surfaces, #23323C wells) separated by thin 1px slate rules (#25343F, #3A4956); a single electric lime (#CCFF00) is reserved for transactional commands, live readouts, and the wallet surface. Everything is a pill or a 12px-radius control, elevation is flat (one whisper shadow per panel), and the whole register is the system UI sans stack, weight-driven. Color-coded per-account funding states and a pulsing auto-trading marker are the only signals beyond ink, white, and lime.
+description: A dark-only, near-monochrome trading console for the Pons v2 launchpad on Robinhood Chain. Deep navy-black canvas (#0B1217) carries a two-step panel ladder (#142028 surfaces, #23323C wells) separated by thin 1px slate rules (#25343F, #3A4956); a single electric lime (#52d593) is reserved for transactional commands, live readouts, and the wallet surface. Everything is a pill or a 12px-radius control, elevation is flat (one whisper shadow per panel), and the whole register is the system UI sans stack, weight-driven. Color-coded per-account funding states and a pulsing auto-trading marker are the only signals beyond ink, white, and lime.
 
 colors:
-  accent: "#CCFF00"
+  accent: "#52d593"
   accent-ink: "#1B170D"
   canvas: "#0B1217"
   surface: "#142028"

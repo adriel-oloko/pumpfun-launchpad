@@ -56,9 +56,9 @@ body {
   font-weight: 700;
   font-size: 12px;
   line-height: 1.2;
-  background: rgb(204, 255, 0);
+  background: #52d593;
   color: black;
-  border: 2px solid rgb(204, 255, 0);
+  border: 2px solid #52d593;
   border-radius: 24px;
   padding: 8px 12px;
   box-shadow: 0 3px 0 var(--color-ink);
@@ -73,7 +73,7 @@ body {
   white-space: nowrap;
 }
 .btn-brutal:focus-visible {
-  outline: 2px dashed rgb(204, 255, 0);
+  outline: 2px dashed #52d593;
   outline-offset: 2px;
 }
 /* hover only applies where a real pointer can hover (no sticky hover on touch) */
@@ -98,7 +98,7 @@ body {
 }
 /* inverted face variant (secondary / collapse toggles) */
 .btn-brutal-invert {
-  background: rgb(204, 255, 0);
+  background: #52d593;
   color: var(--color-ink);
 }
 @media (hover: hover) and (pointer: fine) {
@@ -216,7 +216,7 @@ body {
   flex-shrink: 0;
 }
 .checkbox-brutal:checked {
-  background: oklab(93.071% -0.12483 0.19143);
+  background: #52d593;
 }
 .checkbox-brutal:checked::after {
   content: "";
@@ -325,7 +325,7 @@ body {
   }
 }
 .tabs-lift > .tab:has(input:checked) {
-  background: rgb(204, 255, 0);
+  background: #52d593;
   color: var(--color-ink);
   z-index: 1;
   margin-bottom: -2px; /* ink face overlaps the panel's top border */
