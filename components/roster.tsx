@@ -64,7 +64,9 @@ import { useToasts } from './toast-stack'
 export { shortAddress }
 
 export interface WalletBalance {
-    /** Lamports, null when the read failed (rate limit / transport). */
+    /** Lamports. 0 when the account does not exist on-chain (fully
+     *  withdrawn/closed, or never funded); null when the read has never
+     *  succeeded (transport failure / not-yet-polled) and is thus unknown. */
     sol: bigint | null
     /** Raw token units for the tracked mint, null when unknown. */
     token: bigint | null
@@ -298,7 +300,13 @@ export function useRoster(): RosterApi {
             )
             if (seq !== tickSeqRef.current) return
             addresses.forEach((a, i) => {
-                solMap.set(a, infos[i] ? BigInt(infos[i]!.lamports) : null)
+                // A null AccountInfo means the account does not exist on-chain
+                // (fully withdrawn/closed, or never funded): report a KNOWN
+                // 0-lamport balance so the row shows 0 SOL and passes the dust
+                // gate for removal. `null` stays reserved for a read that never
+                // succeeded (transport failure / not-yet-polled), which the
+                // delete and per-row remove gates still refuse.
+                solMap.set(a, infos[i] ? BigInt(infos[i]!.lamports) : BigInt(0))
             })
         } catch {
             // transport/RPC failure: keep previous SOL balances, flag stale

@@ -24,12 +24,15 @@
 //         now a single button below the Launch button in the Launch card —
 //         it sells every keyed managed wallet's full balance of THIS mint,
 //         lib/sell-all.ts.)
-//       * DISTRIBUTE tab (M8C, 2026-09-03): SOL ops over the CHECKED
-//         wallets. Disperse funds them from the HUB (the FIRST roster
-//         wallet) in one tx; Withdraw sweeps the checked KEYED wallets to
-//         a destination (each drained to 0 and CLOSED, rent recovered);
-//         Delete batch-removes the checked wallets whose SOL is below the
-//         dust floor (lib/disperse.ts, DUST_SOL_LAMPORTS in lib/params.ts).
+//       * DISTRIBUTE tab (M8C, 2026-09-03): SOL ops over the roster.
+//         Disperse funds the CHECKED wallets from the HUB (the FIRST
+//         roster wallet) in one tx; Withdraw sweeps the checked KEYED
+//         wallets to a destination (each keeps the rent floor, account
+//         stays open); Withdraw All (right of Delete) sweeps EVERY keyed
+//         wallet to the destination, each drained to 0 and CLOSED (rent
+//         recovered); Delete batch-removes the checked wallets whose SOL
+//         is below the dust floor (lib/disperse.ts, DUST_SOL_LAMPORTS in
+//         lib/params.ts).
 //   - The roster (import, batch selection, balances) sits inside this card
 //     under the tabs exactly like v4.
 
@@ -58,8 +61,10 @@ import {
 } from '../lib/batch-trade'
 import { readToken2022Metadata } from '../lib/bundle'
 import {
+    WITHDRAW_FEE_RESERVE_LAMPORTS,
     deleteEmptyWallets,
     disperseSol,
+    withdrawAllSol,
     withdrawSol,
     type DisperseResult,
     type WithdrawOutcome,
@@ -277,6 +282,12 @@ export function TradePanel({
     // only READ the shared checked set (the auto engine flashes it too); they
     // never mutate it (only d does).
 
+    // Manual Buy/Sell button lock: a click locks BOTH grid buttons for
+    // exactly this long from the click (a fixed cadence, decoupled from the
+    // round's on-chain settlement), then they become clickable again —
+    // whether or not the triggered round has been approved/confirmed yet.
+    const MANUAL_CLICK_LOCK_MS = 3000
+
     const [buyPct, setBuyPct] = useState('95')
     const [sellPct, setSellPct] = useState('100')
     const [manualBusy, setManualBusy] = useState(false)
@@ -293,6 +304,14 @@ export function TradePanel({
         .map((w) => ({ address: w.address, key: w.key as string }))
     const selectedKeyedRef = useRef<AutoWallet[]>([])
     const manualBusyRef = useRef(false)
+    // Timer owning the fixed +3s button lock (manualBusy). Runs from the
+    // click, never from the round's settlement.
+    const manualLockTimerRef = useRef<number | null>(null)
+    // A click that lands while the previous round is still settling past
+    // the lock is QUEUED (the latest side wins) and fires when that round
+    // settles: never silently dropped, never two rounds overlapping on the
+    // same wallets (the queue is the single-flight guarantee now).
+    const queuedManualSideRef = useRef<'buy' | 'sell' | null>(null)
     useEffect(() => {
         selectedKeyedRef.current = selectedKeyedWallets
     })
@@ -302,7 +321,13 @@ export function TradePanel({
     // revert after graduation; post-graduation PumpSwap trading is the Sell
     // All button's job in the Launch card, not the manual tab's).
     const runManualTrade = async (side: 'buy' | 'sell') => {
-        if (manualBusyRef.current) return
+        // A click while the previous round is STILL settling is queued
+        // (never dropped, never run concurrently): the finally fires it the
+        // moment that round settles. This is the single-flight guarantee.
+        if (manualBusyRef.current) {
+            queuedManualSideRef.current = side
+            return
+        }
         if (!mint) {
             setManualError('ENTER A VALID TOKEN MINT ABOVE TO BUY/SELL')
             return
@@ -320,6 +345,16 @@ export function TradePanel({
         )
         setManualBusy(true)
         manualBusyRef.current = true
+        // Buttons unlock at exactly +3s from THIS click, NOT when the round
+        // settles: a slow or still-unapproved round must not keep Buy/Sell
+        // dead past the fixed cadence (a click after the lock then queues).
+        if (manualLockTimerRef.current !== null) {
+            window.clearTimeout(manualLockTimerRef.current)
+        }
+        manualLockTimerRef.current = window.setTimeout(() => {
+            manualLockTimerRef.current = null
+            setManualBusy(false)
+        }, MANUAL_CLICK_LOCK_MS)
         setManualError(null)
         setManualReport(null)
         try {
@@ -381,7 +416,14 @@ export function TradePanel({
             })
         } finally {
             manualBusyRef.current = false
-            setManualBusy(false)
+            // manualBusy is owned by the fixed +3s click timer above: the
+            // round's settlement never unlocks the buttons early. Fire any
+            // click queued while this round was still settling.
+            const queued = queuedManualSideRef.current
+            queuedManualSideRef.current = null
+            if (queued) {
+                void runManualTrade(queued)
+            }
         }
     }
 
@@ -437,7 +479,9 @@ export function TradePanel({
             if (radios.length === 0 || !radios[0].checked) return
             const wallets = selectedKeyedRef.current
             if (wallets.length === 0) return
-            if (manualBusyRef.current || autoRunningRef.current) return
+            // Only the auto bot blocks the shortcut; a settling manual round
+            // QUEUES the keypress exactly like a button click (latest wins).
+            if (autoRunningRef.current) return
             if (key === 'b' || key === 'B') {
                 runManualBuyRef.current()
             } else {
@@ -449,26 +493,34 @@ export function TradePanel({
     }, [])
 
     // ------------------------------------------------------------------
-    // M8C DISTRIBUTE tab: Disperse + Withdraw + Delete (lib/disperse.ts)
+    // M8C DISTRIBUTE tab: Disperse + Withdraw + Withdraw All + Delete
     // ------------------------------------------------------------------
     // The HUB is the FIRST roster wallet: disperse source + withdraw default
     // destination. Disperse funds every CHECKED wallet (address only, no key
     // needed on the receiver) from the hub in ONE hub-signed tx with a random
     // per-recipient amount in [MIN, MAX]. Withdraw sweeps every CHECKED KEYED
     // wallet (the destination excluded) to a destination the user picks in the
-    // modal; each wallet signs its own tx and is drained to 0 (account CLOSED,
-    // rent floor recovered). Delete batch-removes the CHECKED wallets whose
-    // SOL balance is below the dust floor (DUST_SOL_LAMPORTS), never the hub.
-    // Per-action busy flags keep the three actions independently clickable
-    // (the v4 pattern). The hub stays
-    // out of every selection set defensively until the M8D roster lands its
-    // unselectable-hub semantics.
+    // modal; each wallet signs its own tx and keeps the rent floor (account
+    // stays open, lib/disperse.ts withdrawSol). Withdraw All (the button
+    // right of Delete) runs the same destination modal over EVERY keyed
+    // wallet instead of the checked ones, draining each to exactly 0
+    // (account CLOSED, rent recovered, lib/disperse.ts withdrawAllSol).
+    // Delete batch-removes the CHECKED wallets whose SOL balance is below
+    // the dust floor (DUST_SOL_LAMPORTS), never the hub. Per-action busy
+    // flags keep the actions independently clickable (the v4 pattern). The
+    // hub stays out of every selection set defensively (M8D makes it
+    // unselectable); Withdraw All excludes it only when it is the
+    // destination.
 
     const [disperseMin, setDisperseMin] = useState('0.05')
     const [disperseMax, setDisperseMax] = useState('0.14')
     const [disperseBusy, setDisperseBusy] = useState(false)
     const [withdrawDest, setWithdrawDest] = useState('')
     const [withdrawOpen, setWithdrawOpen] = useState(false)
+    // Scope of the open Withdraw modal: false = the CHECKED keyed wallets
+    // (rent-keep sweep, withdrawSol); true = EVERY keyed wallet (drained to
+    // 0 and closed, withdrawAllSol). Set by openWithdrawModal on open.
+    const [withdrawAllMode, setWithdrawAllMode] = useState(false)
     const [withdrawBusy, setWithdrawBusy] = useState(false)
     const [deleteBusy, setDeleteBusy] = useState(false)
     const [distributeError, setDistributeError] = useState<string | null>(null)
@@ -481,11 +533,28 @@ export function TradePanel({
     const selectedNonHub = api.wallets.filter(
         (w) => api.checked.has(w.address) && w.address !== hubAddr
     )
+    // EVERY keyed roster wallet: the Withdraw All sweep sources. Unlike the
+    // checked Withdraw it ignores the checkboxes; the modal destination,
+    // defaulted to the hub, is excluded from the sources by address.
+    const allKeyedWallets: AutoWallet[] = api.wallets
+        .filter((w) => Boolean(w.key))
+        .map((w) => ({ address: w.address, key: w.key as string }))
 
-    /** Opens the Withdraw destination modal, defaulting the destination to
-     *  the hub (first roster wallet) the first time it is opened. */
-    const openWithdrawModal = () => {
-        setWithdrawDest((prev) => (prev.trim() ? prev : (hub?.address ?? prev)))
+    /** Opens the Withdraw destination modal. The destination defaults to the
+     *  hub (first roster wallet) the first time it is opened; Withdraw All
+     *  (all = true) ALWAYS resets it to the hub so a sweep that closes every
+     *  wallet collects into the roster's own anchor unless the user
+     *  explicitly retypes it. all = false keeps the plain Withdraw scope
+     *  (CHECKED keyed wallets, rent-keep sweep). */
+    const openWithdrawModal = (all = false) => {
+        setWithdrawAllMode(all)
+        if (all) {
+            setWithdrawDest(hub?.address ?? '')
+        } else {
+            setWithdrawDest((prev) =>
+                prev.trim() ? prev : (hub?.address ?? prev)
+            )
+        }
         setWithdrawOpen(true)
     }
 
@@ -556,18 +625,28 @@ export function TradePanel({
     const handleWithdraw = async () => {
         if (withdrawBusy) return
         const dest = withdrawDest.trim()
+        const label = withdrawAllMode ? 'WITHDRAW ALL' : 'WITHDRAW'
         if (!isValidPubkey(dest)) {
-            setDistributeError('WITHDRAW FAILED: INVALID DESTINATION ADDRESS')
+            setDistributeError(`${label} FAILED: INVALID DESTINATION ADDRESS`)
             return
         }
-        const keyedSelected = selectedKeyedWallets
-        // Sources = every CHECKED KEYED wallet EXCEPT the destination itself.
-        const sources = keyedSelected.filter((w) => w.address !== dest)
+        // Sources: Withdraw All = EVERY keyed wallet EXCEPT the destination
+        // itself (the checkbox state is ignored; the hub, the default
+        // destination, is excluded by address). Withdraw = the CHECKED keyed
+        // wallets except the destination.
+        const candidates = withdrawAllMode
+            ? allKeyedWallets
+            : selectedKeyedWallets
+        const sources = candidates.filter((w) => w.address !== dest)
         if (sources.length === 0) {
             setDistributeError(
-                keyedSelected.length > 0
-                    ? 'WITHDRAW FAILED: ALL CHECKED KEYED WALLETS ARE THE DESTINATION'
-                    : 'WITHDRAW FAILED: NO KEYED WALLETS SELECTED (CHECK ROWS IN THE ROSTER)'
+                candidates.length > 0
+                    ? `${label} FAILED: ALL KEYED WALLETS ARE THE DESTINATION`
+                    : `${label} FAILED: ${
+                          withdrawAllMode
+                              ? 'NO KEYED WALLETS IN ROSTER'
+                              : 'NO KEYED WALLETS SELECTED (CHECK ROWS IN THE ROSTER)'
+                      }`
             )
             return
         }
@@ -577,12 +656,20 @@ export function TradePanel({
         setDistributeReport(null)
         try {
             const connection = makeAppConnection()
-            const outcomes = await withdrawSol({
-                connection,
-                wallets: sources,
+            const outcomes = withdrawAllMode
+                ? await withdrawAllSol({ connection, wallets: sources, dest })
+                : await withdrawSol({
+                      connection,
+                      wallets: sources,
+                      dest,
+                      feeReserveLamports: WITHDRAW_FEE_RESERVE_LAMPORTS,
+                  })
+            setDistributeReport({
+                kind: 'withdraw',
                 dest,
+                outcomes,
+                all: withdrawAllMode,
             })
-            setDistributeReport({ kind: 'withdraw', dest, outcomes })
             // Every sent tx moved SOL; refresh the roster columns immediately.
             api.refreshBalances()
             const sent = outcomes.filter((o) => o.status === 'sent').length
@@ -594,27 +681,29 @@ export function TradePanel({
                 outcomes.find((o) => o.signature)?.signature ?? null
             if (sent > 0) {
                 pushToast({
-                    action: 'WITHDREW',
+                    action: withdrawAllMode ? 'WITHDREW ALL' : 'WITHDREW',
                     amount: `${sent} WALLET${sent === 1 ? '' : 'S'} TO ${shortAddress(dest, 4)}`,
                     txHash: firstSig ?? undefined,
                 })
             } else if (failed > 0) {
                 pushToast({
-                    action: 'WITHDRAW FAILED',
+                    action: `${label} FAILED`,
                     amount: '0 SENT',
                     tone: 'error',
                 })
             } else {
                 pushToast({
-                    action: 'WITHDRAW',
-                    amount: `0 SENT (${skipped} SKIPPED: BELOW TX FEE)`,
+                    action: label,
+                    amount: `0 SENT (${skipped} SKIPPED: ${
+                        withdrawAllMode ? 'BELOW TX FEE' : 'AT RENT FLOOR'
+                    })`,
                 })
             }
         } catch (e) {
             const raw = e instanceof Error ? e.message : String(e)
-            setDistributeError(`WITHDRAW FAILED: ${friendlyTxError(raw)}`)
+            setDistributeError(`${label} FAILED: ${friendlyTxError(raw)}`)
             pushToast({
-                action: 'WITHDRAW FAILED',
+                action: `${label} FAILED`,
                 amount: 'TX REVERTED',
                 tone: 'error',
             })
@@ -1009,6 +1098,9 @@ export function TradePanel({
             if (deselectTimerRef.current !== null) {
                 window.clearTimeout(deselectTimerRef.current)
             }
+            if (manualLockTimerRef.current !== null) {
+                window.clearTimeout(manualLockTimerRef.current)
+            }
         }
     }, [])
 
@@ -1124,7 +1216,12 @@ export function TradePanel({
                 spendable SOL on the curve, Sell sells sellPct% of each
                 wallet's own token balance (lib/batch-trade.ts, one signed
                 tx per wallet, concurrent). The buttons disable while the
-                M5 auto bot runs or nothing is selected. */}
+                M5 auto bot runs, nothing is selected, or inside the fixed
+                +3s click lock (manualBusy): a Buy/Sell click locks BOTH
+                buttons for exactly 3s from the click, then they unlock
+                whether or not the triggered round has settled on-chain yet
+                (a click after the lock queues behind a still-settling
+                round, it is never dropped). */}
                                 <div className="mt-2 grid gap-2 md:grid-cols-5 [auto_1fr_1fr]">
                                     <div className="flex items-center gap-2">
                                         <Input
@@ -1420,9 +1517,12 @@ export function TradePanel({
                 wallet) in ONE hub-signed tx, a random lamport amount in
                 [MIN, MAX] per wallet. Withdraw sweeps every CHECKED KEYED
                 wallet to the modal destination (default hub); each wallet
-                signs its own tx and is drained to 0 (account CLOSED, rent
-                recovered). Delete batch-removes the CHECKED wallets whose
-                SOL is below DUST_SOL_LAMPORTS; the hub is never deletable. */}
+                signs its own tx and keeps the rent floor (account stays
+                open). Withdraw All (right of Delete) sweeps EVERY keyed
+                wallet to the modal destination instead, each drained to
+                exactly 0 (account CLOSED, rent recovered). Delete
+                batch-removes the CHECKED wallets whose SOL is below
+                DUST_SOL_LAMPORTS; the hub is never deletable. */}
                                 <div className="flex w-full gap-2">
                                     <Input
                                         type="text"
@@ -1454,7 +1554,7 @@ export function TradePanel({
                                         }
                                         placeholder="N"
                                         aria-label="Random wallet count"
-                                        className="size-11! text-center font-mono text-[11px] py-1"
+                                        className="w-22! h-11! text-center font-mono text-[11px] py-1"
                                     />
                                     <button
                                         type="button"
@@ -1468,7 +1568,7 @@ export function TradePanel({
                                         {api.importError}
                                     </p>
                                 ) : null}
-                                <div className="mt-2 grid grid-cols-2 gap-2 md:grid-cols-5">
+                                <div className="mt-2 grid grid-cols-2 gap-2 md:grid-cols-6">
                                     <Input
                                         type="number"
                                         min="0"
@@ -1507,7 +1607,7 @@ export function TradePanel({
                                     </Btn>
                                     <Btn
                                         invert
-                                        onClick={openWithdrawModal}
+                                        onClick={() => openWithdrawModal(false)}
                                         disabled={
                                             withdrawBusy ||
                                             autoRunning ||
@@ -1527,6 +1627,16 @@ export function TradePanel({
                                         }
                                         className="h-full shadow-none!">
                                         Delete
+                                    </Btn>
+                                    <Btn
+                                        onClick={() => openWithdrawModal(true)}
+                                        disabled={
+                                            withdrawBusy ||
+                                            autoRunning ||
+                                            allKeyedWallets.length === 0
+                                        }
+                                        className="h-full shadow-none!">
+                                        Withdraw All
                                     </Btn>
                                 </div>
                                 {distributeError ? (
@@ -1571,10 +1681,12 @@ export function TradePanel({
                 <Roster api={api} />
 
                 {/* M8C Withdraw destination modal (v4 mirror): opened from the
-        Distribute tab's Withdraw button with the destination defaulted to
-        the hub (first roster wallet); the user may change it. Withdraw
-        sweeps the CHECKED KEYED wallets (the destination is never a
-        source). Cancel closes without sending. */}
+        Distribute tab's Withdraw or Withdraw All button with the
+        destination defaulted to the hub (first roster wallet); the user may
+        change it. Withdraw sweeps the CHECKED KEYED wallets (the
+        destination is never a source) and keeps each wallet's rent floor;
+        Withdraw All sweeps EVERY keyed wallet and drains each to 0 (closed).
+        Cancel closes without sending. */}
                 {withdrawOpen ? (
                     <div
                         role="dialog"
@@ -1593,7 +1705,7 @@ export function TradePanel({
                                 ×
                             </button>
                             <span className="label-mono block text-center !text-[13px]">
-                                Withdraw
+                                {withdrawAllMode ? 'Withdraw All' : 'Withdraw'}
                             </span>
                             <div className="mt-3">
                                 <label className="label-mono block !text-[11px]">
@@ -1630,15 +1742,25 @@ export function TradePanel({
                                     onClick={() => void handleWithdraw()}
                                     disabled={
                                         withdrawBusy ||
-                                        selectedKeyedWallets.length === 0
+                                        (withdrawAllMode
+                                            ? allKeyedWallets.length === 0
+                                            : selectedKeyedWallets.length === 0)
                                     }>
-                                    {withdrawBusy ? 'Sweeping...' : 'Withdraw'}
+                                    {withdrawBusy
+                                        ? 'Sweeping...'
+                                        : withdrawAllMode
+                                          ? 'Withdraw All'
+                                          : 'Withdraw'}
                                 </Btn>
                             </div>
                             {withdrawBusy ? (
                                 <div className="mt-2">
                                     <StatusLine
-                                        text="SWEEPING CHECKED KEYED WALLETS (CONCURRENT, ONE TX PER WALLET)..."
+                                        text={
+                                            withdrawAllMode
+                                                ? 'SWEEPING ALL KEYED WALLETS TO 0 SOL (CONCURRENT, ONE TX PER WALLET)...'
+                                                : 'SWEEPING CHECKED KEYED WALLETS (CONCURRENT, ONE TX PER WALLET)...'
+                                        }
                                         tone="idle"
                                     />
                                 </div>
@@ -1706,7 +1828,13 @@ function ManualReportView({ report }: { report: ManualBatchReport }) {
  *  All tab's per-wallet report pattern, one report per action kind). */
 type DistributeReport =
     | { kind: 'disperse'; result: DisperseResult; hub: string }
-    | { kind: 'withdraw'; dest: string; outcomes: WithdrawOutcome[] }
+    | {
+          kind: 'withdraw'
+          dest: string
+          outcomes: WithdrawOutcome[]
+          /** true = Withdraw All (every keyed wallet, drained to 0/closed). */
+          all: boolean
+      }
     | { kind: 'delete'; removed: number; skipped: number; deleted: string[] }
 
 /** SOL amount input parse (Disperse MIN/MAX): a blank field is 0; a
@@ -1738,15 +1866,16 @@ function DistributeReportView({ report }: { report: DistributeReport }) {
         )
     }
     if (report.kind === 'withdraw') {
-        const { dest, outcomes } = report
+        const { dest, outcomes, all } = report
         const sent = outcomes.filter((o) => o.status === 'sent').length
         const failed = outcomes.filter((o) => o.status === 'failed').length
         const skipped = outcomes.filter((o) => o.status === 'skipped').length
         return (
             <div className="reveal-up flex flex-col gap-1 border-2 border-ink px-2 py-1.5">
                 <p className="label-mono !text-[11px] font-bold break-all">
-                    WITHDREW {sent}/{outcomes.length} TO {shortAddress(dest, 6)}{' '}
-                    · SKIPPED {skipped} · FAILED {failed}
+                    {all ? 'WITHDREW ALL ' : 'WITHDREW '}
+                    {sent}/{outcomes.length} TO {shortAddress(dest, 6)} · SKIPPED{' '}
+                    {skipped} · FAILED {failed}
                 </p>
                 {outcomes.length > 0 ? (
                     <div className="flex flex-col gap-0.5">

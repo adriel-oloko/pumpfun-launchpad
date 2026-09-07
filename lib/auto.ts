@@ -60,6 +60,7 @@ import {
 } from "@solana/web3.js";
 import {
   RENT_EXEMPT_FLOOR,
+  sendAndConfirmWithRetry,
   walletTokenBalance,
 } from "./bundle/launch";
 import { makeProtectedSender, protectedReserveLamports } from "./bundle/protected-send";
@@ -506,9 +507,10 @@ export async function fireAutoSell(
   // Live protocol fee recipient (pump.fun rotates it; a stale value reverts
   // every sell with Custom 6000). One read for the whole round.
   const feeRecipient = await resolvePumpFeeRecipient(connection);
-  // Helius Sender SWQOS-only sender on mainnet (plain RPC on devnet), one per
-  // round.
-  const send = await makeProtectedSender();
+  // Plain raw-RPC send (sendAndConfirmWithRetry): sells are NORMAL txs, never
+  // routed through Helius Sender SWQOS (its tip + priority fee would exceed a
+  // seller wallet's SOL headroom and reject the tx before it lands).
+  const send = sendAndConfirmWithRetry;
 
   // Chain the round's min_sol_output quotes across the simulated reserves.
   let vsr = curve.solReserve;
