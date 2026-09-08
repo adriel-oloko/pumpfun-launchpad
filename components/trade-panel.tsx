@@ -1159,7 +1159,7 @@ export function TradePanel({
 									spellCheck={false}
 								/>
 							</Field>
-                            <Btn className="w-fit float-right">Whitelist</Btn>
+							<Btn className="w-fit float-right">Whitelist</Btn>
 						</div>
 					</div>
 
@@ -1401,9 +1401,7 @@ export function TradePanel({
 											max="100"
 											value={autoSellPct}
 											onChange={(e) =>
-												setAutoSellPct(
-													e.target.value,
-												)
+												setAutoSellPct(e.target.value)
 											}
 											placeholder="SELL %"
 											aria-label="Auto sell percent of holdings"
@@ -1645,42 +1643,6 @@ export function TradePanel({
 									</p>
 								) : null}
 							</div>
-
-                            {/* ---- Distribute (M8C): disperse / withdraw / delete ---- */}
-							<label
-								role="tab"
-								aria-label="buyers"
-								className="tab">
-								<input
-									type="radio"
-									name="managed-tabs"
-									className="sr-only"
-								/>
-								<svg
-									viewBox="0 0 24 24"
-									fill="none"
-									stroke="currentColor"
-									strokeWidth="2.5"
-									strokeLinecap="square"
-									className="h-3.5 w-3.5"
-									aria-hidden="true">
-									<path d="M12 4v16" />
-									<path d="m12 4-3 3" />
-									<path d="m12 4 3 3" />
-									<path d="m12 20-3-3" />
-									<path d="m12 20 3-3" />
-								</svg>
-								Buyers
-							</label>
-							<div role="tabpanel" className="tab-content">
-                                {/**
-                                 * Place a table here that shows all buy transactions for the token that has been entered in the "Trade for managed wallets section"
-                                 * The table should show address, token amount bought, and the equivalent price in sol
-                                 * Do not list the wallets in the buy/sell section
-                                 * 
-                                 * A whitelist modal
-                                 */}                                
-                            </div>
 						</div>
 					</div>
 				</div>
