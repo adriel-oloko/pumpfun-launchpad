@@ -1128,7 +1128,7 @@ export function TradePanel({
                 metaStatus={metaStatus}
               />
             ) : null*/}
-						<div className="min-w-0 flex-1 flex flex-col align-right gap-4">
+						<div className="min-w-0 flex-1">
 							<Field
 								label="Token Address"
 								aside={
@@ -1159,7 +1159,6 @@ export function TradePanel({
 									spellCheck={false}
 								/>
 							</Field>
-							<Btn className="w-fit float-right">Whitelist</Btn>
 						</div>
 					</div>
 
