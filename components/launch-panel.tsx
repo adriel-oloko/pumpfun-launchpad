@@ -108,7 +108,12 @@ import {
 	isFeeSharingRevert,
 	type CreatorClaimReport,
 } from "../lib/claim-creator-fee";
-import { readPumpCurveState, type PumpCurveState } from "../lib/pump";
+import {
+	pumpCreatorVaultPda,
+	pumpUserVolumeAccumulatorPda,
+	readPumpCurveState,
+	type PumpCurveState,
+} from "../lib/pump";
 import {
 	formatSolLamports,
 	sellAllManagedWallets,
@@ -362,28 +367,27 @@ export function LaunchPanel({
 			log(
 				`migrate : automatic (pump.fun migrates to PumpSwap on graduation; create args = name/symbol/uri only)`,
 			);
-			// Buy sizing: MAX (flat 0.002 SOL keep). Every selected dev wallet
-			// commits its TOTAL balance minus a flat 0.002 SOL keep
-			// (MAX_BUY_KEEP_SOL_LAMPORTS) plus the rents for the accounts the
-			// buy instruction creates and bills the wallet for; the launch
-			// buy quotes with slippageBps = 0 so max_sol_cost = solIn =
-			// spendable exactly and each wallet ends at 0.002 SOL, buying the
-			// maximum possible tokens. The creator does NOT fund dev wallets
-			// (it only covers the create tx + fees). The spendable base =
-			// live balance minus the flat post-buy keep each wallet retains
-			// (0.002 SOL) plus the rents for the accounts the buy
-			// instruction creates and bills the wallet for:
-			//   - Token-2022 ATA (170B): created by the buy ix pair.
-			//   - creator_vault (0B): created by the FIRST buy (PDA keyed by
-			//     creator). The preflight sandbox sims every wallet behind a
-			//     fresh create, so EVERY wallet reserves it (the real flow
-			//     then over-reserves for wallets 2+, which is safe).
-			//   - user_volume_accumulator (106B): created by each wallet's own
-			//     buy (PDA keyed by user).
-			// Missing these rents caused the pre-fill buy to revert with
-			// `Custom 1` (System Program insufficient lamports) even when the
-			// panel's own spendable check passed. (The pre-fill lands right
-			// after create, so the curve is fresh; on-chain fee/curve
+			// Buy sizing: MAX (flat 0.002 SOL keep + account rent ONLY for the
+			// accounts this launch actually creates). Each selected dev wallet
+			// spends its TOTAL balance minus a flat 0.002 SOL keep
+			// (MAX_BUY_KEEP_SOL_LAMPORTS) minus the rent for each account the
+			// launch genuinely creates, quoted with slippageBps = 0 so
+			// max_sol_cost = solIn = spendable exactly and each wallet ends at
+			// 0.002 SOL, buying the maximum possible tokens. The creator does
+			// NOT fund dev wallets (it only covers the create tx + fees), and a
+			// dev wallet pays no tx fee at launch (the creator is the fee
+			// payer). Each rent is reserved ONLY when its account does not
+			// already exist on-chain, so a re-launch / re-buy that already
+			// holds the accounts does not over-reserve and strand SOL:
+			//   - Token-2022 ATA: the mint is fresh, so every wallet reserves it.
+			//   - creator_vault (PDA keyed by creator): reserved ONLY when the
+			//     creator has not launched before.
+			//   - user_volume_accumulator (PDA keyed by wallet): reserved ONLY
+			//     when that wallet has not bought before.
+			// Missing a rent the buy DOES create reverts the pre-fill with
+			// `Custom 1`; reserving a rent the buy does NOT create is what
+			// previously left wallets stranded above 0.002. (The pre-fill lands
+			// right after create, so the curve is fresh; on-chain fee/curve
 			// rounding keeps the real cost a hair UNDER spendable, so
 			// max_sol_cost is never exceeded.)
 			const ataRent = await ataRentLamports(connection);
@@ -391,16 +395,30 @@ export function LaunchPanel({
 				await connection.getMinimumBalanceForRentExemption(0);
 			const userVolumeAccumulatorRent =
 				await connection.getMinimumBalanceForRentExemption(106);
-			const reserveLamports =
-				MAX_BUY_KEEP_SOL_LAMPORTS +
-				BigInt(ataRent) +
-				BigInt(creatorVaultRent) +
-				BigInt(userVolumeAccumulatorRent);
+			const creatorVaultInfo = await connection.getAccountInfo(
+				pumpCreatorVaultPda(creator.publicKey)[0],
+				"confirmed",
+			);
+			const reserveCv = creatorVaultInfo
+				? BigInt(0)
+				: BigInt(creatorVaultRent);
 			const buys: BuyAllocation[] = [];
 			for (const { w, kp } of walletKps) {
 				const live = BigInt(
 					await connection.getBalance(kp.publicKey, "confirmed"),
 				);
+				const userVolumeInfo = await connection.getAccountInfo(
+					pumpUserVolumeAccumulatorPda(kp.publicKey)[0],
+					"confirmed",
+				);
+				const reserveUva = userVolumeInfo
+					? BigInt(0)
+					: BigInt(userVolumeAccumulatorRent);
+				const reserveLamports =
+					MAX_BUY_KEEP_SOL_LAMPORTS +
+					BigInt(ataRent) +
+					reserveCv +
+					reserveUva;
 				const spendable = live - reserveLamports;
 				if (spendable <= BigInt(0)) {
 					throw new Error(
@@ -410,7 +428,7 @@ export function LaunchPanel({
 				const solIn = spendable;
 				buys.push({ wallet: kp, solInLamports: solIn });
 				log(
-					`  dev ${kp.publicKey.toBase58().slice(0, 12)}... balance ${(Number(live) / LAMPORTS_PER_SOL).toFixed(4)} SOL -> buys ${(Number(solIn) / LAMPORTS_PER_SOL).toFixed(4)} SOL (keeps 0.002 SOL post-buy after rents)`,
+					`  dev ${kp.publicKey.toBase58().slice(0, 12)}... balance ${(Number(live) / LAMPORTS_PER_SOL).toFixed(4)} SOL -> buys ${(Number(solIn) / LAMPORTS_PER_SOL).toFixed(4)} SOL (keeps 0.002 SOL post-buy)`,
 				);
 			}
 

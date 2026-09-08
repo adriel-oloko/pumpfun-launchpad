@@ -6,14 +6,14 @@
 // client:
 //
 //   - Buy (MAX, 2026-09-08; flat-keep commit): for every selected keyed
-//     wallet, spend its TOTAL SOL balance minus a flat 0.002 SOL keep (plus
-//     the mechanical Token-2022 ATA rent when the ATA does not exist yet and
-//     the 5,000-lamport base tx fee), quoted at zero slippage so
-//     max_sol_cost = solIn = budget exactly. NO rent-floor reserve, NO fee
-//     margin, NO slippage-band discount (the old budget / 1.10 sizing left
-//     ~10% of the spendable balance unbought; the 2026-09-08 band commit is
-//     gone). A wallet with 0.1 SOL ends at 0.002 SOL after the buy. Skipped
-//     when the balance cannot cover the keep + the mechanical costs.
+//     wallet, spend its TOTAL SOL balance minus a flat 0.002 SOL keep, the
+//     5,000-lamport base tx fee, and the Token-2022 ATA rent ONLY when the
+//     wallet's ATA for this mint does not exist yet, quoted at zero slippage
+//     so max_sol_cost = solIn = budget exactly. NO rent-floor reserve, NO
+//     fee margin, NO slippage-band discount (the old budget / 1.10 sizing
+//     left ~10% of the spendable balance unbought; the 2026-09-08 band
+//     commit is gone). A wallet ends at exactly 0.002 SOL after the buy.
+//     Skipped when the balance cannot cover the keep + ATA rent + base fee.
 //   - Sell: for every selected keyed wallet, sell sellPct% of the wallet's
 //     current token balance of the tracked mint (walletTokenBalance).
 //     Skipped when the balance is zero.
@@ -41,8 +41,8 @@
 // every tx is signed manually with the wallet's Keypair (anchor Wallet is
 // Node-only in the browser, and the anchor Program is gone entirely).
 
-import { TOKEN_2022_PROGRAM_ID, getAssociatedTokenAddressSync } from "@solana/spl-token";
 import bs58 from "bs58";
+import { TOKEN_2022_PROGRAM_ID, getAssociatedTokenAddressSync } from "@solana/spl-token";
 import { Connection, Keypair, PublicKey, Transaction } from "@solana/web3.js";
 import {
   AUTO_CONFIRM_TIMEOUT_MS,
@@ -122,16 +122,17 @@ function pctNum(pct: number): number {
 }
 
 /** One MAX-buy worker: spends the wallet's TOTAL SOL balance minus a flat
- *  0.002 SOL keep (MAX_BUY_KEEP_SOL_LAMPORTS) plus the mechanical costs the
- *  tx itself needs to land: the Token-2022 ATA rent when the ATA does not
- *  exist yet (the buy's ATA-create ix bills the wallet) and the 5,000-lamport
- *  base tx fee (the wallet is its own fee payer). Quoted at ZERO slippage so
- *  max_sol_cost = solIn = budget: every lamport above the keep goes into the
- *  curve, and the wallet ends at exactly 0.002 SOL (no rent-floor reserve, no
- *  slippage-band discount). Resolves the confirmed signature, or null when
- *  skipped (live balance cannot cover the keep + ATA rent + base fee).
- *  Throws on build/send/confirm errors so the settled count reports the
- *  wallet as failed. */
+ *  0.002 SOL keep (MAX_BUY_KEEP_SOL_LAMPORTS) plus the 5,000-lamport base
+ *  tx fee (the wallet is its own fee payer) plus the Token-2022 ATA rent
+ *  ONLY when the wallet's ATA for this mint does not exist yet (the buy's
+ *  ATA-create ix bills the wallet; once it exists the rent is skipped so the
+ *  wallet buys that much more). Quoted at ZERO slippage so
+ *  max_sol_cost = solIn = budget: every lamport above the keep + ATA rent
+ *  goes into the curve, and the wallet ends at exactly 0.002 SOL (no
+ *  rent-floor reserve, no slippage-band discount). Resolves the confirmed
+ *  signature, or null when skipped (live balance cannot cover the keep + ATA
+ *  rent + base fee). Throws on build/send/confirm errors so the settled
+ *  count reports the wallet as failed. */
 async function buyOne(
   connection: Connection,
   mint: PublicKey,
@@ -155,13 +156,13 @@ async function buyOne(
   );
   const ataInfo = await connection.getAccountInfo(ata, "confirmed");
   const reserveAta = ataInfo ? BigInt(0) : BigInt(ataRent);
-  // MAX budget (flat keep): spend the TOTAL balance minus a flat 0.002 SOL
-  // keep plus the mechanical costs the tx needs to land (the ATA rent when
-  // the ATA is missing + the wallet's own base tx fee). No rent-exempt-floor
-  // reserve, no fee margin, no slippage-band discount: with the wallet
-  // ending at exactly 0.002 SOL after the buy, every other lamport is
-  // committed to the curve (a wallet that already holds its ATA skips the
-  // ATA rent, so it buys that much more).
+  // MAX budget (flat keep + ATA rent only when the ATA is missing): spend
+  // the TOTAL balance minus a flat 0.002 SOL keep, the wallet's own
+  // 5,000-lamport base tx fee, and the Token-2022 ATA rent ONLY when the ATA
+  // does not exist yet (the buy's ATA-create ix bills it). No
+  // rent-exempt-floor reserve, no fee margin, no slippage-band discount: the
+  // wallet ends at exactly 0.002 SOL after the buy and every other lamport is
+  // committed to the curve.
   const budget =
     live - MAX_BUY_KEEP_SOL_LAMPORTS - reserveAta - MANUAL_TX_BASE_FEE_LAMPORTS;
   if (budget <= BigInt(0)) return null;
@@ -273,13 +274,16 @@ function tally(
 
 /**
  * Max-buys every selected keyed wallet: each spends its TOTAL SOL balance
- * minus a flat 0.002 SOL keep (plus the ATA rent when the ATA is missing and
- * the base tx fee), quoted at ZERO slippage so max_sol_cost = solIn = budget
- * exactly. The wallet ends at exactly 0.002 SOL (no rent-floor reserve, no
- * slippage-band discount). Skipped = balance cannot cover the keep + the
- * mechanical costs; failed = build/send/confirm error; completed = confirmed
- * on-chain (signatures collected). The shared blockhash is fetched ONCE for
- * the whole batch (the v4 batch pattern).
+ * minus a flat 0.002 SOL keep plus the base tx fee plus the Token-2022 ATA
+ * rent ONLY when that wallet's ATA for the mint is missing, quoted at ZERO
+ * slippage so max_sol_cost = solIn = budget exactly. The wallet ends at
+ * exactly 0.002 SOL (no rent-floor reserve, no fee margin, no slippage-band
+ * discount; the ATA rent is reserved only when the ATA does not exist yet,
+ * so a re-buy that already holds the ATA does not strand that rent).
+ * Skipped = balance cannot cover the keep + ATA rent + base fee; failed =
+ * build/send/confirm error; completed = confirmed on-chain (signatures
+ * collected). The shared blockhash is fetched ONCE for the whole batch (the
+ * v4 batch pattern).
  */
 export async function buySelectedWallets(
   opts: BuySelectedOptions
