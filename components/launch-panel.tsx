@@ -108,7 +108,7 @@ import {
 	isFeeSharingRevert,
 	type CreatorClaimReport,
 } from "../lib/claim-creator-fee";
-import { capBuySolForSlippage, readPumpCurveState, type PumpCurveState } from "../lib/pump";
+import { readPumpCurveState, type PumpCurveState } from "../lib/pump";
 import {
 	formatSolLamports,
 	sellAllManagedWallets,
@@ -363,16 +363,19 @@ export function LaunchPanel({
 				`migrate : automatic (pump.fun migrates to PumpSwap on graduation; create args = name/symbol/uri only)`,
 			);
 			// Buy sizing: MAX. Every selected dev wallet commits its FULL
-			// spendable SOL balance, exactly like the manual Buy Max
-			// (lib/batch-trade buyOne): solIn = spendable / 1.10 via
-			// capBuySolForSlippage, and the launch buy's own 10% slippage
-			// quote (quoteLaunchBuys) caps max_sol_cost AT the spendable, so
-			// a live-curve tick between quote and execution is absorbed
-			// instead of reverting (Custom 6002 TooMuchSolRequired) or
-			// pulling the wallet below its reserve. The creator does NOT
-			// fund dev wallets (it only covers the create tx + fees). The
-			// spendable base = live balance minus the rent-exempt floor +
-			// fee margin each wallet must retain post-buy
+			// spendable SOL balance and empties itself down to the rent
+			// floor: solIn = spendable (no slippage discount) and the launch
+			// buy quotes with slippageBps = 0 so max_sol_cost = spendable
+			// exactly. The wallet pays its ATA + creator_vault +
+			// user_volume_accumulator rents plus the curve + 1% fee, and
+			// ends at the post-buy rent floor (~0.0009 SOL), buying the
+			// maximum possible tokens. (The pre-fill lands right after
+			// create, so the curve is fresh; on-chain fee/curve rounding
+			// keeps the real cost a hair UNDER spendable, so max_sol_cost is
+			// never exceeded.) The creator does NOT fund dev wallets (it only
+			// covers the create tx + fees). The spendable base = live balance
+			// minus the rent-exempt floor + fee margin each wallet must
+			// retain post-buy
 			// (postBuyFloorLamports) plus the rents for the accounts the buy
 			// instruction creates and bills the wallet for:
 			//   - Token-2022 ATA (170B): created by the buy ix pair.
@@ -406,15 +409,10 @@ export function LaunchPanel({
 						`dev wallet ${shortAddress(w.address, 6)} has no spendable SOL: balance ${(Number(live) / LAMPORTS_PER_SOL).toFixed(4)} SOL is below the ${(Number(reserveLamports) / LAMPORTS_PER_SOL).toFixed(4)} SOL launch reserve (rent floor + fee margin + ATA rent + creator_vault + user_volume_accumulator rent). Fund/disperse SOL to the selected dev wallets before launching.`,
 					);
 				}
-				const solIn = capBuySolForSlippage(spendable);
-				if (solIn <= BigInt(0)) {
-					throw new Error(
-						`dev wallet ${shortAddress(w.address, 6)}: spendable ${(Number(spendable) / LAMPORTS_PER_SOL).toFixed(4)} SOL is below the 10% slippage minimum. Fund the wallet.`,
-					);
-				}
+				const solIn = spendable;
 				buys.push({ wallet: kp, solInLamports: solIn });
 				log(
-					`  dev ${kp.publicKey.toBase58().slice(0, 12)}... balance ${(Number(live) / LAMPORTS_PER_SOL).toFixed(4)} SOL -> buys ${(Number(solIn) / LAMPORTS_PER_SOL).toFixed(4)} SOL (MAX: full ${(Number(spendable) / LAMPORTS_PER_SOL).toFixed(4)} SOL spendable under the 10% slippage band)`,
+					`  dev ${kp.publicKey.toBase58().slice(0, 12)}... balance ${(Number(live) / LAMPORTS_PER_SOL).toFixed(4)} SOL -> buys ${(Number(solIn) / LAMPORTS_PER_SOL).toFixed(4)} SOL (empties to ${(Number(reserveLamports) / LAMPORTS_PER_SOL).toFixed(4)} SOL rent floor)`,
 				);
 			}
 
@@ -513,6 +511,10 @@ export function LaunchPanel({
 				uri: finalUri,
 				buys,
 				mintKeypair,
+				// Empty-to-floor: quote the pre-fill buys with ZERO slippage so
+				// max_sol_cost = solIn = spendable and each wallet spends its
+				// full balance (ending at the ~0.0009 rent floor), not 90.9%.
+				slippageBps: BigInt(0),
 				// No creator -> wallet funding txs: every dev wallet buys from
 				// its OWN pre-funded balance (the buildLaunchSequence default
 				// fundLamportsPerWallet = null emits no fund tx).
