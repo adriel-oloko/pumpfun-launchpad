@@ -367,7 +367,9 @@ export function LaunchPanel({
 			// floor: solIn = spendable (no slippage discount) and the launch
 			// buy quotes with slippageBps = 0 so max_sol_cost = spendable
 			// exactly. The wallet pays its ATA + creator_vault +
-			// user_volume_accumulator rents plus the curve + 1% fee, and
+			// user_volume_accumulator rents plus the curve + 1.25% fee (the
+			// live fee program's 95 bps protocol + 30 bps creator; see
+			// PUMP_FEE_BPS), and
 			// ends at the post-buy rent floor (~0.0009 SOL), buying the
 			// maximum possible tokens. (The pre-fill lands right after
 			// create, so the curve is fresh; on-chain fee/curve rounding

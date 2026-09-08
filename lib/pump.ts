@@ -159,8 +159,15 @@ export const PUMP_MAYHEM_PROGRAM_ID = new PublicKey(
   "MAyhSmzXzV1pTf7LsNkrNwkWKTo4ougAJ1PPg47MD4e"
 );
 
-/** Protocol fee, basis points (100 = 1%), applied on the input side. */
-export const PUMP_FEE_BPS: bigint = BigInt(100);
+/** Total buy/sell fee, basis points, applied on the input side.
+ *  LIVE (Sep 2026): protocol 95 bps + creator 30 bps = 125 bps (1.25%),
+ *  returned by the fee program's GetFees CPI (pfeeUxB6…), NOT the global
+ *  account's legacy fee_basis_points. The old 100 bps (1%) under-quoted the
+ *  buy, so with zero slippage max_sol_cost = solIn was too low and the buy
+ *  reverted Custom 6002 (TooMuchSolRequired) on empty-to-floor launches.
+ *  The fee is tiered by market cap; 125 is the flat rate a fresh token sees.
+ *  Prefer reading it live over hardcoding (pump.fun can change it). */
+export const PUMP_FEE_BPS: bigint = BigInt(125);
 
 /** Default slippage headroom in basis points (10%) for client-side quotes:
  *  generous enough for reserve drift between quote and execution AND for the
