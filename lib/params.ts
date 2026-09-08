@@ -57,3 +57,12 @@ export const DEFAULT_LOCK_LP: boolean = true;
  *  batch delete). Mirrors v4's 0.0001 ETH dust floor. Unit: lamports. Value:
  *  100_000 (0.0001 SOL). */
 export const DUST_SOL_LAMPORTS: bigint = BigInt(100_000);
+
+/** Flat SOL a wallet KEEPS after a MAX buy (manual Buy Max + launch dev
+ *  wallet pre-fill). The max buy spends the wallet's TOTAL balance minus this
+ *  fixed keep (and the mechanical ATA-rent/base-fee costs the tx itself needs
+ *  to land): no rent-floor reserve, no fee margin, no slippage-band discount.
+ *  Wallet with 0.1 SOL ends at 0.002 SOL after the buy. 0.002 > the 890,880
+ *  lamport rent-exempt floor, so the wallet stays open. Unit: lamports. Value:
+ *  2_000_000 (0.002 SOL). */
+export const MAX_BUY_KEEP_SOL_LAMPORTS: bigint = BigInt(2_000_000);

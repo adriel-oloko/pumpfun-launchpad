@@ -5,17 +5,15 @@
 // semantics of v4-launchpad's "Buy / Sell" tab but on the pump.fun Solana
 // client:
 //
-//   - Buy (MAX, 2026-09-07; slippage-band commit 2026-09-08): for every
-//     selected keyed wallet, drain its spendable SOL into the curve.
-//     Everything above the rent-exempt floor, the (first-buy) Token-2022 ATA
-//     rent, and the base tx fee is committed. The quote lands UNDER the 10%
-//     slippage band (solIn = budget / 1.10 via capBuySolForSlippage) while
-//     max_sol_cost stays AT the budget (budget = solIn * 1.10), so the
-//     program's cost check can absorb a live-curve tick between quote and
-//     execution (Custom 6002 TooMuchSolRequired otherwise) without ever
-//     pulling the wallet below its rent floor. The wallet ends between its
-//     0.00089 rent floor (full 10% fill) and ~9% above it (no drift).
-//     Skipped when there is nothing above those reserves.
+//   - Buy (MAX, 2026-09-08; flat-keep commit): for every selected keyed
+//     wallet, spend its TOTAL SOL balance minus a flat 0.002 SOL keep (plus
+//     the mechanical Token-2022 ATA rent when the ATA does not exist yet and
+//     the 5,000-lamport base tx fee), quoted at zero slippage so
+//     max_sol_cost = solIn = budget exactly. NO rent-floor reserve, NO fee
+//     margin, NO slippage-band discount (the old budget / 1.10 sizing left
+//     ~10% of the spendable balance unbought; the 2026-09-08 band commit is
+//     gone). A wallet with 0.1 SOL ends at 0.002 SOL after the buy. Skipped
+//     when the balance cannot cover the keep + the mechanical costs.
 //   - Sell: for every selected keyed wallet, sell sellPct% of the wallet's
 //     current token balance of the tracked mint (walletTokenBalance).
 //     Skipped when the balance is zero.
@@ -53,21 +51,21 @@ import {
   type AutoWallet,
 } from "./auto";
 import {
-  RENT_EXEMPT_FLOOR,
   sendAndConfirmWithRetry,
   walletTokenBalance,
 } from "./bundle/launch";
 import type { SendTx } from "./bundle/protected-send";
+import { MAX_BUY_KEEP_SOL_LAMPORTS } from "./params";
 import {
   buildPumpBuyIx,
-  capBuySolForSlippage,
   quotePumpBuy,
   resolvePumpFeeRecipient,
 } from "./pump";
 
 /** Single-signature legacy tx base fee (lamports). A manual buy is one signer
  *  (the wallet) on a plain raw-RPC tx, so the base fee is exactly 5,000 — the
- *  max-buy budget reserves it precisely so the wallet drains to the floor. */
+ *  max-buy budget reserves it precisely so the wallet lands exactly at its
+ *  0.002 SOL keep. */
 const MANUAL_TX_BASE_FEE_LAMPORTS: bigint = BigInt(5_000);
 
 /** Final outcome of one manual batch trade (the v4 batch pattern). */
@@ -123,17 +121,17 @@ function pctNum(pct: number): number {
   return Math.round(clampPct(pct, 0) * 100);
 }
 
-/** One MAX-buy worker: drains the wallet's spendable budget into the curve,
- *  leaving at least the rent-exempt floor (0.00089 SOL) untouched. The quote
- *  commits UNDER the default 10% slippage band (solIn = budget / 1.10 via
- *  capBuySolForSlippage) and max_sol_cost stays AT the budget, so the
- *  program's own cost check can absorb a live-curve tick between quote and
- *  execution without reverting (Custom 6002 TooMuchSolRequired otherwise)
- *  and without ever pulling the wallet below its rent floor. Resolves the
- *  confirmed signature, or null when skipped (budget <= 0 after the floor +
- *  ATA rent + base fee, or the slippage-clamped commit is 0). Throws on
- *  build/send/confirm errors so the settled count reports the wallet as
- *  failed. */
+/** One MAX-buy worker: spends the wallet's TOTAL SOL balance minus a flat
+ *  0.002 SOL keep (MAX_BUY_KEEP_SOL_LAMPORTS) plus the mechanical costs the
+ *  tx itself needs to land: the Token-2022 ATA rent when the ATA does not
+ *  exist yet (the buy's ATA-create ix bills the wallet) and the 5,000-lamport
+ *  base tx fee (the wallet is its own fee payer). Quoted at ZERO slippage so
+ *  max_sol_cost = solIn = budget: every lamport above the keep goes into the
+ *  curve, and the wallet ends at exactly 0.002 SOL (no rent-floor reserve, no
+ *  slippage-band discount). Resolves the confirmed signature, or null when
+ *  skipped (live balance cannot cover the keep + ATA rent + base fee).
+ *  Throws on build/send/confirm errors so the settled count reports the
+ *  wallet as failed. */
 async function buyOne(
   connection: Connection,
   mint: PublicKey,
@@ -157,28 +155,28 @@ async function buyOne(
   );
   const ataInfo = await connection.getAccountInfo(ata, "confirmed");
   const reserveAta = ataInfo ? BigInt(0) : BigInt(ataRent);
-  // MAX budget: everything above the wallet's 890,880-lamport rent-exempt
-  // floor, the (first-buy) Token-2022 ATA rent, and the 5,000-lamport base
-  // fee. max_sol_cost is capped AT this budget (never above), so the wallet
-  // can never be pulled below its floor; the quote commits under the 10%
-  // slippage band below so a price tick up is absorbed instead of reverting.
+  // MAX budget (flat keep): spend the TOTAL balance minus a flat 0.002 SOL
+  // keep plus the mechanical costs the tx needs to land (the ATA rent when
+  // the ATA is missing + the wallet's own base tx fee). No rent-exempt-floor
+  // reserve, no fee margin, no slippage-band discount: with the wallet
+  // ending at exactly 0.002 SOL after the buy, every other lamport is
+  // committed to the curve (a wallet that already holds its ATA skips the
+  // ATA rent, so it buys that much more).
   const budget =
-    live - BigInt(RENT_EXEMPT_FLOOR) - reserveAta - MANUAL_TX_BASE_FEE_LAMPORTS;
+    live - MAX_BUY_KEEP_SOL_LAMPORTS - reserveAta - MANUAL_TX_BASE_FEE_LAMPORTS;
   if (budget <= BigInt(0)) return null;
-  // Commit UNDER the slippage band so the tx lands: quote solIn = budget /
-  // 1.10 (10% default) and hand max_sol_cost = budget as the ceiling (budget
-  // = solIn * 1.10). The program can then fill up to budget if the live
-  // curve ticks up between quote and execution (without this band any tick
-  // reverts the tx with Custom 6002 TooMuchSolRequired), while a
-  // full-slippage fill lands the wallet exactly at its 0.00089 rent floor,
-  // never below.
-  const solIn = capBuySolForSlippage(budget);
-  if (solIn <= BigInt(0)) return null;
+  // Full spend at ZERO slippage: solIn = budget, so max_sol_cost = budget =
+  // solIn and the program's cost check can never pull the wallet below its
+  // 0.002 keep. (The 10% band is deliberately gone: under it the quote only
+  // committed budget / 1.10, leaving ~9% of the balance unbought whenever
+  // the curve did not drift.)
+  const solIn = budget;
   const creator = new PublicKey(curve.creator);
   const quote = quotePumpBuy({
     solInLamports: solIn,
     virtualSolReserves: curve.solReserve,
     virtualTokenReserves: curve.tokenReserve,
+    slippageBps: BigInt(0),
   });
   const ixs = buildPumpBuyIx({
     mint,
@@ -186,9 +184,9 @@ async function buyOne(
     creator,
     feeRecipient,
     tokensOut: quote.tokensOut,
-    // max_sol_cost = budget = solIn * 1.10: headroom ABOVE budget would
-    // overdraw (the wallet holds nothing above the floor), but capping AT
-    // budget is what absorbs the drift.
+    // max_sol_cost = solIn = budget: every lamport above the flat keep is
+    // committed; any live-curve tick ABOVE the quote reverts (Custom 6002)
+    // rather than overdrawing the wallet below its 0.002 keep.
     maxSolCost: budget,
   });
   const tx = new Transaction({
@@ -274,15 +272,12 @@ function tally(
 }
 
 /**
- * Max-buys every selected keyed wallet: each drains its spendable budget
- * into the curve, everything above the rent-exempt floor, the (first-buy)
- * ATA rent, and the base fee, quoted under the default 10% slippage band
- * (solIn = budget / 1.10) with max_sol_cost capped AT the budget, so a
- * live-curve tick between quote and execution can neither revert the tx
- * (Custom 6002 TooMuchSolRequired) nor overdraw the wallet below its rent
- * floor. Each wallet ends between its 0.00089 rent floor (full-slippage
- * fill) and ~9% above it (no drift). Skipped = nothing above those
- * reserves; failed = build/send/confirm error; completed = confirmed
+ * Max-buys every selected keyed wallet: each spends its TOTAL SOL balance
+ * minus a flat 0.002 SOL keep (plus the ATA rent when the ATA is missing and
+ * the base tx fee), quoted at ZERO slippage so max_sol_cost = solIn = budget
+ * exactly. The wallet ends at exactly 0.002 SOL (no rent-floor reserve, no
+ * slippage-band discount). Skipped = balance cannot cover the keep + the
+ * mechanical costs; failed = build/send/confirm error; completed = confirmed
  * on-chain (signatures collected). The shared blockhash is fetched ONCE for
  * the whole batch (the v4 batch pattern).
  */

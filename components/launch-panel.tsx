@@ -6,8 +6,8 @@
 // Form: token name / symbol / metadata URI (direct entry; see the
 // Arweave/IPFS decision comment below), the connected creator key (the
 // SAME wallet the masthead connects via pumpfun.creatorKey.v1), the
-// selected dev wallets that each buy MAX (their full spendable SOL under
-// the same 10% slippage-band sizing as the manual Buy Max; the creator
+// selected dev wallets that each buy MAX (their TOTAL balance down to a
+// flat 0.002 SOL keep, the same sizing as the manual Buy Max; the creator
 // only covers the create tx; wallets must hold SOL, fund/disperse them
 // first), and a Launch button that
 // drives lib/bundle:
@@ -102,7 +102,7 @@ import { makeAppConnection } from "../lib/connection";
 import { solanaNetwork } from "../lib/network";
 import { useCreatorWallet } from "../lib/creator-wallet";
 import { pubkeyFromSecretKey } from "../lib/managed-wallets";
-import { DECIMALS } from "../lib/params";
+import { DECIMALS, MAX_BUY_KEEP_SOL_LAMPORTS } from "../lib/params";
 import {
 	claimCreatorFees,
 	isFeeSharingRevert,
@@ -362,23 +362,16 @@ export function LaunchPanel({
 			log(
 				`migrate : automatic (pump.fun migrates to PumpSwap on graduation; create args = name/symbol/uri only)`,
 			);
-			// Buy sizing: MAX. Every selected dev wallet commits its FULL
-			// spendable SOL balance and empties itself down to the rent
-			// floor: solIn = spendable (no slippage discount) and the launch
-			// buy quotes with slippageBps = 0 so max_sol_cost = spendable
-			// exactly. The wallet pays its ATA + creator_vault +
-			// user_volume_accumulator rents plus the curve + 1.25% fee (the
-			// live fee program's 95 bps protocol + 30 bps creator; see
-			// PUMP_FEE_BPS), and
-			// ends at the post-buy rent floor (~0.0009 SOL), buying the
-			// maximum possible tokens. (The pre-fill lands right after
-			// create, so the curve is fresh; on-chain fee/curve rounding
-			// keeps the real cost a hair UNDER spendable, so max_sol_cost is
-			// never exceeded.) The creator does NOT fund dev wallets (it only
-			// covers the create tx + fees). The spendable base = live balance
-			// minus the rent-exempt floor + fee margin each wallet must
-			// retain post-buy
-			// (postBuyFloorLamports) plus the rents for the accounts the buy
+			// Buy sizing: MAX (flat 0.002 SOL keep). Every selected dev wallet
+			// commits its TOTAL balance minus a flat 0.002 SOL keep
+			// (MAX_BUY_KEEP_SOL_LAMPORTS) plus the rents for the accounts the
+			// buy instruction creates and bills the wallet for; the launch
+			// buy quotes with slippageBps = 0 so max_sol_cost = solIn =
+			// spendable exactly and each wallet ends at 0.002 SOL, buying the
+			// maximum possible tokens. The creator does NOT fund dev wallets
+			// (it only covers the create tx + fees). The spendable base =
+			// live balance minus the flat post-buy keep each wallet retains
+			// (0.002 SOL) plus the rents for the accounts the buy
 			// instruction creates and bills the wallet for:
 			//   - Token-2022 ATA (170B): created by the buy ix pair.
 			//   - creator_vault (0B): created by the FIRST buy (PDA keyed by
@@ -389,14 +382,17 @@ export function LaunchPanel({
 			//     buy (PDA keyed by user).
 			// Missing these rents caused the pre-fill buy to revert with
 			// `Custom 1` (System Program insufficient lamports) even when the
-			// panel's own spendable check passed.
+			// panel's own spendable check passed. (The pre-fill lands right
+			// after create, so the curve is fresh; on-chain fee/curve
+			// rounding keeps the real cost a hair UNDER spendable, so
+			// max_sol_cost is never exceeded.)
 			const ataRent = await ataRentLamports(connection);
 			const creatorVaultRent =
 				await connection.getMinimumBalanceForRentExemption(0);
 			const userVolumeAccumulatorRent =
 				await connection.getMinimumBalanceForRentExemption(106);
 			const reserveLamports =
-				postBuyFloorLamports() +
+				MAX_BUY_KEEP_SOL_LAMPORTS +
 				BigInt(ataRent) +
 				BigInt(creatorVaultRent) +
 				BigInt(userVolumeAccumulatorRent);
@@ -408,13 +404,13 @@ export function LaunchPanel({
 				const spendable = live - reserveLamports;
 				if (spendable <= BigInt(0)) {
 					throw new Error(
-						`dev wallet ${shortAddress(w.address, 6)} has no spendable SOL: balance ${(Number(live) / LAMPORTS_PER_SOL).toFixed(4)} SOL is below the ${(Number(reserveLamports) / LAMPORTS_PER_SOL).toFixed(4)} SOL launch reserve (rent floor + fee margin + ATA rent + creator_vault + user_volume_accumulator rent). Fund/disperse SOL to the selected dev wallets before launching.`,
+						`dev wallet ${shortAddress(w.address, 6)} has no spendable SOL: balance ${(Number(live) / LAMPORTS_PER_SOL).toFixed(4)} SOL is below the ${(Number(reserveLamports) / LAMPORTS_PER_SOL).toFixed(4)} SOL launch reserve (0.002 SOL post-buy keep + ATA rent + creator_vault + user_volume_accumulator rent). Fund/disperse SOL to the selected dev wallets before launching.`,
 					);
 				}
 				const solIn = spendable;
 				buys.push({ wallet: kp, solInLamports: solIn });
 				log(
-					`  dev ${kp.publicKey.toBase58().slice(0, 12)}... balance ${(Number(live) / LAMPORTS_PER_SOL).toFixed(4)} SOL -> buys ${(Number(solIn) / LAMPORTS_PER_SOL).toFixed(4)} SOL (empties to ${(Number(reserveLamports) / LAMPORTS_PER_SOL).toFixed(4)} SOL rent floor)`,
+					`  dev ${kp.publicKey.toBase58().slice(0, 12)}... balance ${(Number(live) / LAMPORTS_PER_SOL).toFixed(4)} SOL -> buys ${(Number(solIn) / LAMPORTS_PER_SOL).toFixed(4)} SOL (keeps 0.002 SOL post-buy after rents)`,
 				);
 			}
 
@@ -513,9 +509,9 @@ export function LaunchPanel({
 				uri: finalUri,
 				buys,
 				mintKeypair,
-				// Empty-to-floor: quote the pre-fill buys with ZERO slippage so
+				// Empty-to-keep: quote the pre-fill buys with ZERO slippage so
 				// max_sol_cost = solIn = spendable and each wallet spends its
-				// full balance (ending at the ~0.0009 rent floor), not 90.9%.
+				// full balance (ending at the flat 0.002 SOL keep), not 90.9%.
 				slippageBps: BigInt(0),
 				// No creator -> wallet funding txs: every dev wallet buys from
 				// its OWN pre-funded balance (the buildLaunchSequence default
@@ -1270,9 +1266,9 @@ export function LaunchPanel({
 					</div>
 
 					{/* Buy sizing for the selected dev wallets: MAX. Every
-                    wallet commits its FULL spendable SOL balance under the
-                    10% slippage band (the same sizing as the manual Buy Max;
-                    see the launch handler). The creator does NOT fund dev
+                    wallet commits its TOTAL balance down to a flat 0.002 SOL
+                    keep (the same sizing as the manual Buy Max; see the
+                    launch handler). The creator does NOT fund dev
                     wallets, fund/disperse them first. */}
 					<div className="lg:col-span-4">
 						<div className="flex items-center gap-3">
@@ -1283,8 +1279,8 @@ export function LaunchPanel({
 								{selectedWallets.length} selected
 							</span>
 						</div>
-						{/* Selected dev wallets as pills: each commits MAX (its full
-                        spendable SOL under the 10% slippage band) at launch.
+						{/* Selected dev wallets as pills: each commits MAX (its
+                        TOTAL balance down to the flat 0.002 SOL keep) at launch.
                         The x on a pill's right DESELECTS it (checked-set only:
                         the wallet stays in the roster; watch-only wallets get
                         a dimmed WATCH tag and cannot sign launch buys). */}
@@ -1299,7 +1295,7 @@ export function LaunchPanel({
 										key={w.address}
 										title={
 											w.key
-												? "MAX buy: full spendable SOL under the 10% slippage band"
+												? "MAX buy: TOTAL balance down to the flat 0.002 SOL keep"
 												: "WATCH-ONLY: no secret key, cannot sign launch buys"
 										}
 										className="label-mono bg-transparent inline-flex items-center gap-1.5 border-2 border-[#3a4956] rounded-full bg-paper p-2 text-[11px]">

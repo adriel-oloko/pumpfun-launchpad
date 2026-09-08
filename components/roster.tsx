@@ -696,7 +696,7 @@ export function Roster({ api }: { api: RosterApi }) {
             ) : null}
 
             {/* column header (ink strip) */}
-            <div className="label-mono flex items-center gap-2 border-2 border-ink bg-[#52d593] px-3 py-1.5 text-ink">
+            <div className="label-mono flex items-center gap-2 border-2 border-[#3a4956] bg-[#52d593] px-3 py-1.5 text-ink rounded-t-md">
                 <div className="flex w-6 shrink-0 items-center">
                     <input
                         type="checkbox"
@@ -723,7 +723,7 @@ export function Roster({ api }: { api: RosterApi }) {
             </div>
 
             {/* rows */}
-            <div className="border-2 border-t-0 border-ink">
+            <div className="border-2 border-t-0 border-[#3a4956] rounded-b-sm">
                 {api.wallets.map((w) => {
                     const isHub = w.address === hubAddress
                     const bal = api.balances.get(w.address)

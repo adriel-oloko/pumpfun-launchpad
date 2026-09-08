@@ -9,8 +9,8 @@
 //     tracks (any valid base58 Solana mint; a launch pre-fills it).
 //   - Managed-wallet tabs (radio `tabs-lift`, name="managed-tabs"):
 //       * BUY / SELL tab (M8A, 2026-09-03): FIRST tab + defaultChecked.
-//         Manual batch trade over the CHECKED keyed wallets: Buy MAX drains
-//         each wallet's full spendable SOL (down to the 0.00089 rent floor)
+//         Manual batch trade over the CHECKED keyed wallets: Buy MAX spends
+//         each wallet's TOTAL SOL balance (down to a flat 0.002 SOL keep)
 //         on the curve / sell sellPct% of each wallet's own token balance
 //         (lib/batch-trade.ts, concurrent per-wallet signed
 //         txs). Global keyboard shortcuts b/B = buy max, s/S = sell (only
@@ -275,8 +275,8 @@ export function TradePanel({
 	// ------------------------------------------------------------------
 	// The "Buy / Sell" tab (FIRST managed-tabs radio, defaultChecked) runs a
 	// one-click batch trade over the wallets CHECKED in the roster: Buy MAX
-	// drains each checked wallet's full spendable SOL (down to the 0.00089
-	// rent floor) on the curve; Sell sells sellPct% of each wallet's OWN
+	// spends each checked wallet's TOTAL SOL balance (down to a flat 0.002
+	// SOL keep) on the curve; Sell sells sellPct% of each wallet's OWN
 	// token balance of the mint above. One signed tx per
 	// wallet, fired concurrently (the v4 batch pattern); the report shows the
 	// final counts + the confirmed signatures. Global keyboard shortcuts:
@@ -1115,7 +1115,7 @@ export function TradePanel({
 			}
 			className="flex-1">
 			<div className="flex flex-col gap-4">
-				<div className="sticky top-0 z-30 flex flex-col gap-4">
+				<div className="sticky top-0 z-30 flex flex-col gap-4 bg-[rgb(20_32_40)]">
 					{/* Token identity header: the curve mint's square image beside the
           token-address input; the field aside shows the on-chain name +
           symbol (from the Token-2022 in-mint metadata) once they load. */}
@@ -1173,7 +1173,7 @@ export function TradePanel({
 						/>
 					) : null}
 
-					<div className="border-t-2 border-ink pt-3">
+					<div className="border-t-2 border-[#3a4956] pt-3">
 						{/* trade for managed wallets: the roster of keys (1440h rolling
             expiry) with checkbox-batch selection lives below the tabs. */}
 						<span className="label-mono !text-[11px]">
@@ -1214,8 +1214,8 @@ export function TradePanel({
 							<div role="tabpanel" className="tab-content">
 								{/* Manual batch trade (M8A): the v4 Buy/Sell grid - one row,
 								four cells, no labels or borders. Cell 1 is the roster batch
-								size; Buy MAX drains each CHECKED keyed wallet's full
-								spendable SOL (down to its 0.00089 rent floor) on the curve —
+								size; Buy MAX spends each CHECKED keyed wallet's TOTAL
+								SOL balance (down to a flat 0.002 SOL keep) on the curve —
 								the buy's max_sol_cost IS the budget, so a price tick up
 								reverts cleanly, never an overdraw; Sell sells sellPct% of
 								each wallet's own token balance (lib/batch-trade.ts, one
@@ -1245,7 +1245,7 @@ export function TradePanel({
 										onClick={() =>
 											void runManualTrade("buy")
 										}
-										title="Drains each selected wallet's spendable SOL (down to the 0.00089 rent floor) on the curve"
+										title="Spends each selected wallet's TOTAL SOL balance (down to a flat 0.002 SOL keep) on the curve"
 										disabled={
 											manualBusy ||
 											autoRunning ||
@@ -1320,7 +1320,7 @@ export function TradePanel({
                 wording. Start/Stop drive the M5 scheduler; exactly one shows
                 the pressed face at any time. */}
 								<div className="flex flex-col gap-2">
-									<div className="flex items-center gap-2 border-2 border-ink px-2 py-1.5 rounded-md">
+									<div className="flex items-center gap-2 border-2 border-[#3a4956] px-2 py-1.5 rounded-md">
 										<input
 											type="checkbox"
 											className="checkbox-brutal shrink-0"
@@ -1381,7 +1381,7 @@ export function TradePanel({
 												: ""}
 										</span>
 									</div>
-									<div className="flex items-center gap-2 border-2 border-ink px-2 py-1.5 rounded-md">
+									<div className="flex items-center gap-2 border-2 border-[#3a4956] px-2 py-1.5 rounded-md">
 										<input
 											type="checkbox"
 											className="checkbox-brutal shrink-0"
@@ -1762,7 +1762,7 @@ export function TradePanel({
 /** A finished manual batch trade, ready for the report view. */
 interface ManualBatchReport {
 	side: "buy" | "sell";
-	/** Sell % used; null = Buy MAX (the buy side drains to the rent floor). */
+	/** Sell % used; null = Buy MAX (the buy side spends down to the flat 0.002 SOL keep). */
 	pct: number | null;
 	result: ManualBatchResult;
 }
