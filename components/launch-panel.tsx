@@ -373,12 +373,28 @@ export function LaunchPanel({
 			// fund dev wallets (it only covers the create tx + fees). The
 			// spendable base = live balance minus the rent-exempt floor +
 			// fee margin each wallet must retain post-buy
-			// (postBuyFloorLamports) and the Token-2022 ATA rent. The ATA
-			// for the FRESH mint never exists yet, so its rent is always
-			// reserved (the buy ix pair creates the ATA from the wallet's
-			// own lamports).
+			// (postBuyFloorLamports) plus the rents for the accounts the buy
+			// instruction creates and bills the wallet for:
+			//   - Token-2022 ATA (170B): created by the buy ix pair.
+			//   - creator_vault (0B): created by the FIRST buy (PDA keyed by
+			//     creator). The preflight sandbox sims every wallet behind a
+			//     fresh create, so EVERY wallet reserves it (the real flow
+			//     then over-reserves for wallets 2+, which is safe).
+			//   - user_volume_accumulator (106B): created by each wallet's own
+			//     buy (PDA keyed by user).
+			// Missing these rents caused the pre-fill buy to revert with
+			// `Custom 1` (System Program insufficient lamports) even when the
+			// panel's own spendable check passed.
 			const ataRent = await ataRentLamports(connection);
-			const reserveLamports = postBuyFloorLamports() + BigInt(ataRent);
+			const creatorVaultRent =
+				await connection.getMinimumBalanceForRentExemption(0);
+			const userVolumeAccumulatorRent =
+				await connection.getMinimumBalanceForRentExemption(106);
+			const reserveLamports =
+				postBuyFloorLamports() +
+				BigInt(ataRent) +
+				BigInt(creatorVaultRent) +
+				BigInt(userVolumeAccumulatorRent);
 			const buys: BuyAllocation[] = [];
 			for (const { w, kp } of walletKps) {
 				const live = BigInt(
@@ -387,7 +403,7 @@ export function LaunchPanel({
 				const spendable = live - reserveLamports;
 				if (spendable <= BigInt(0)) {
 					throw new Error(
-						`dev wallet ${shortAddress(w.address, 6)} has no spendable SOL: balance ${(Number(live) / LAMPORTS_PER_SOL).toFixed(4)} SOL is below the ${(Number(reserveLamports) / LAMPORTS_PER_SOL).toFixed(4)} SOL launch reserve (rent floor + fee margin + ATA rent). Fund/disperse SOL to the selected dev wallets before launching.`,
+						`dev wallet ${shortAddress(w.address, 6)} has no spendable SOL: balance ${(Number(live) / LAMPORTS_PER_SOL).toFixed(4)} SOL is below the ${(Number(reserveLamports) / LAMPORTS_PER_SOL).toFixed(4)} SOL launch reserve (rent floor + fee margin + ATA rent + creator_vault + user_volume_accumulator rent). Fund/disperse SOL to the selected dev wallets before launching.`,
 					);
 				}
 				const solIn = capBuySolForSlippage(spendable);
