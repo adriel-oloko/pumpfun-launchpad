@@ -139,7 +139,7 @@ export function StatusLine({
     // Two-color rule: tones differ only by inversion or weight, never hue.
     const cls =
         tone === 'error'
-            ? 'text-ink font-bold'
+            ? 'text-white font-bold'
             : tone === 'ok'
               ? 'font-bold'
               : 'opacity-70'
