@@ -34,7 +34,7 @@ if (
 function makePooledConnection(pool: string[]): Connection {
     return new Connection(
         pool[0] ??
-            'https://mainnet.helius-rpc.com/?api-key=03a5d09b-993b-417b-b2d0-a43581cbce7e',
+            'https://alien-billowing-voice.solana-mainnet.quiknode.pro/63ad5544cf41a4110f8a9bc5e8b2fa31420b620f',
         {
             commitment: 'confirmed',
             fetch: (input: RequestInfo | URL, init?: RequestInit) =>
