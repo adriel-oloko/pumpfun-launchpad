@@ -39,6 +39,9 @@
 // 6 decimals, 1e9 supply — lib/params.ts, unchanged).
 
 import {
+  ACCOUNT_SIZE,
+  ACCOUNT_TYPE_SIZE,
+  AccountType,
   ExtensionType,
   TOKEN_2022_PROGRAM_ID,
   getAssociatedTokenAddressSync,
@@ -1260,6 +1263,12 @@ export function postBuyFloorLamports(): bigint {
  * Returns null when the account does not exist or cannot be decoded (e.g.
  * the metadata PDA was never created). Used by the launch panel and the
  * verify script to confirm the on-chain metadata after a launch.
+ *
+ * The MPL account stores name/symbol/uri in FIXED-SIZE, NUL-PADDED fields
+ * (name 32, symbol 10, uri 200 bytes): the length prefix is the string's
+ * length, so decoding yields the padding too. Strip it here so no caller
+ * ever renders or compares a NUL (the Trade header shows name ($TICKER)
+ * straight from this read).
  */
 export async function readMetadataStrings(
   connection: Connection,
@@ -1276,7 +1285,11 @@ export async function readMetadataStrings(
     const len = data.readUInt32LE(offset);
     offset += 4;
     if (offset + len > data.length) return null;
-    const s = data.subarray(offset, offset + len).toString("utf8");
+    const s = data
+      .subarray(offset, offset + len)
+      .toString("utf8")
+      .replace(/\0+$/, "")
+      .trim();
     offset += len;
     return s;
   };
@@ -1290,10 +1303,19 @@ export async function readMetadataStrings(
 /**
  * Reads the name / symbol / uri from a Token-2022 mint's in-mint token
  * metadata extension (create_v2 stores metadata IN THE MINT, not in a
- * Metaplex account). Returns null when the mint is not Token-2022 or has no
- * metadata extension. The extension payload layout (spl-token-metadata
- * TokenMetadata): Option<update_authority> (1B flag + 32B if set) + mint
- * (32B) + name/symbol/uri as u32-LE-length-prefixed strings.
+ * Metaplex account). Returns null when the mint is not Token-2022, carries no
+ * extension area, or has no metadata extension.
+ *
+ * Layout, measured on live mainnet pump.fun mints (scripts/probe-token2022-metadata.ts)
+ * after the first version of this reader returned null for EVERY real mint:
+ *   - Account: the 82-byte Mint struct, then padding out to ACCOUNT_SIZE
+ *     (165), then the account-type byte (`AccountType.Mint` = 1), then the TLV
+ *     extension area. spl-token's own unpackMint slices the TLV area the same
+ *     way; handing getExtensionData the RAW account data matches nothing.
+ *   - TokenMetadata payload: OptionalNonZeroPubkey update_authority (32 raw
+ *     bytes, NO option tag; zeroed = none), then the mint (32 bytes), then
+ *     name / symbol / uri as u32-LE-length-prefixed strings. Decoding the
+ *     leading byte as an option flag shifts every field by one and fails.
  */
 export async function readToken2022Metadata(
   connection: Connection,
@@ -1301,20 +1323,30 @@ export async function readToken2022Metadata(
 ): Promise<{ name: string; symbol: string; uri: string } | null> {
   const info = await connection.getAccountInfo(mint, "confirmed");
   if (!info) return null;
-  const ext = getExtensionData(ExtensionType.TokenMetadata, info.data);
+  // Legacy SPL mints have no extension area at all; their metadata, when they
+  // have any, lives in a Metaplex account (readMetadataStrings).
+  if (!info.owner.equals(TOKEN_2022_PROGRAM_ID)) return null;
+  if (info.data.length <= ACCOUNT_SIZE) return null;
+  if (info.data[ACCOUNT_SIZE] !== AccountType.Mint) return null;
+  const tlv = info.data.subarray(ACCOUNT_SIZE + ACCOUNT_TYPE_SIZE);
+  const ext = getExtensionData(ExtensionType.TokenMetadata, tlv);
   if (!ext) return null;
   try {
     let offset = 0;
-    const hasUpdateAuthority = ext[offset];
-    offset += 1;
-    if (hasUpdateAuthority) offset += 32;
+    offset += 32; // update_authority (OptionalNonZeroPubkey, no option tag)
     offset += 32; // mint
     const readStr = (): string | null => {
       if (offset + 4 > ext.length) return null;
       const len = ext.readUInt32LE(offset);
       offset += 4;
       if (offset + len > ext.length) return null;
-      const s = ext.subarray(offset, offset + len).toString("utf8");
+      // Same NUL/whitespace normalize as the Metaplex reader: a name is
+      // never allowed to reach the UI padded.
+      const s = ext
+        .subarray(offset, offset + len)
+        .toString("utf8")
+        .replace(/\0+$/, "")
+        .trim();
       offset += len;
       return s;
     };

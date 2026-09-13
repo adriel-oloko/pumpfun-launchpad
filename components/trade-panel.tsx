@@ -71,7 +71,7 @@ import {
 	sellSelectedWalletsMigrated,
 	type ManualBatchResult,
 } from "../lib/batch-trade";
-import { readToken2022Metadata } from "../lib/bundle";
+import { readMetadataStrings, readToken2022Metadata } from "../lib/bundle";
 import {
 	WITHDRAW_FEE_RESERVE_LAMPORTS,
 	deleteEmptyWallets,
@@ -85,6 +85,7 @@ import { shortAddress } from "../lib/format";
 import { isValidPubkey } from "../lib/managed-wallets";
 import { canonicalMigratedPoolPda } from "../lib/migrate";
 import { DUST_SOL_LAMPORTS } from "../lib/params";
+import { pumpMetadataPda } from "../lib/pump";
 import { formatSolLamports } from "../lib/sell-all";
 import { Roster, type RosterApi } from "./roster";
 import { useToasts } from "./toast-stack";
@@ -125,8 +126,9 @@ export function TradePanel({
 	const inputCls = "font-mono text-[12px]";
 
 	// Token identity for the header: on-chain name/symbol/uri come from the
-	// mint's Token-2022 in-mint metadata extension, image + socials from a
-	// best-effort fetch of the off-chain JSON at that uri. Each read is stored
+	// mint's Token-2022 in-mint metadata extension, or failing that from its
+	// Metaplex metadata account; image + socials come from a best-effort
+	// fetch of the off-chain JSON at that uri. Each read is stored
 	// WITH its mint so a stale async result can never paint over a newer
 	// mint's header: the derived locals below fall back to empty until
 	// header.mint matches the current mint input (no synchronous setState in
@@ -153,10 +155,18 @@ export function TradePanel({
 			setTokenHeader({ mint, meta: null, json: null, status: "loading" });
 			try {
 				const connection = makeAppConnection();
-				const meta = await readToken2022Metadata(
-					connection,
-					new PublicKey(mint),
-				);
+				const mintPk = new PublicKey(mint);
+				// Two on-chain homes for name / symbol / uri, tried in that
+				// order: a create_v2 mint carries them IN THE MINT (Token-2022
+				// metadata extension), a legacy SPL mint carries them in its
+				// Metaplex metadata account. Whichever exists gives the header
+				// its name; only a mint with NEITHER has no identity to show.
+				const meta =
+					(await readToken2022Metadata(connection, mintPk)) ??
+					(await readMetadataStrings(
+						connection,
+						pumpMetadataPda(mintPk)[0],
+					));
 				if (cancelled) return;
 				if (!meta) {
 					setTokenHeader({
@@ -1213,17 +1223,24 @@ export function TradePanel({
 									mint ? (
 										tokenMeta ? (
 											<span
-												title={`${tokenMeta.name} (${tokenMeta.symbol}) · ${mint}`}
+												title={`${tokenMeta.name} ($${tokenMeta.symbol}) · ${mint}`}
 												className="truncate">
-												{tokenMeta.name} (
-												{tokenMeta.symbol})
+												{`${tokenMeta.name} ($${tokenMeta.symbol})`}
 											</span>
 										) : metaStatus === "loading" ? (
 											<span title={mint}>
 												READING TOKEN META...
 											</span>
 										) : (
-											<span>{shortAddress(mint, 6)}</span>
+											// Implemented: the name comes from the
+											// on-chain metadata (in-mint Token-2022
+											// extension, else the Metaplex account).
+											// This branch means the mint carries
+											// NEITHER, so the base58 address is its
+											// only identity.
+											<span title={mint}>
+												{shortAddress(mint, 6)}
+											</span>
 										)
 									) : undefined
 								}>
@@ -1877,7 +1894,7 @@ function ManualReportView({ report }: { report: ManualBatchReport }) {
 	const verb = side === "buy" ? "BOUGHT" : "SOLD";
 	const total = result.completed + result.skipped + result.failed;
 	return (
-		<div className="reveal-up flex flex-col gap-1 border-2 border-ink px-2 py-1.5">
+		<div className="reveal-up flex flex-col gap-1 px-2 py-1.5 input-brutal mt-4">
 			<p className="label-mono !text-[11px] font-bold">
 				{side === "buy" ? "BUY MAX" : `SELL ${pct}%`}
 				{venue === "pumpSwap" ? " · PUMPSWAP" : ""}: {verb}{" "}
