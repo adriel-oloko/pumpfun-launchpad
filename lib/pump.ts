@@ -117,6 +117,85 @@ export async function resolvePumpFeeRecipient(
   return pumpFeeRecipientFallback();
 }
 
+/* ------------------------------------------------------------------ */
+/* Live global-account reads (cluster params + token-program guard)    */
+/* ------------------------------------------------------------------ */
+
+/** The curve/token parameters the LIVE global account seeds a fresh curve
+ *  with. The virtual SOL reserve is CLUSTER-SPECIFIC (mainnet 30 SOL, devnet
+ *  1 SOL) — that is exactly the D-2 bug: quoting devnet launches against the
+ *  mainnet constant silently under-buys by ~30x. */
+export interface PumpGlobalParams {
+  feeRecipient: PublicKey;
+  initialVirtualTokenReserves: bigint;
+  initialVirtualSolReserves: bigint;
+  initialRealTokenReserves: bigint;
+  tokenTotalSupply: bigint;
+  feeBasisPoints: bigint;
+}
+
+/** Reads the LIVE cluster parameters from pump.fun's global account
+ *  (PUMP_GLOBAL). Offsets verified live on both clusters:
+ *
+ *    [41:73]   fee_recipient
+ *    [73:81]   initial_virtual_token_reserves
+ *    [81:89]   initial_virtual_sol_reserves
+ *    [89:97]   initial_real_token_reserves
+ *    [97:105]  token_total_supply
+ *    [105:113] fee_basis_points
+ *
+ *  Throws on a missing or short account so a bad read can never silently
+ *  supply a wrong curve seed. Callers pair this with
+ *  `virtualSolReserveFallback(network)` for the failed-read case. */
+export async function readPumpGlobalParams(
+  connection: Connection
+): Promise<PumpGlobalParams> {
+  const info = await connection.getAccountInfo(PUMP_GLOBAL, "confirmed");
+  if (!info) {
+    throw new Error(`pump global account ${PUMP_GLOBAL.toBase58()} not found`);
+  }
+  const data = info.data;
+  const MIN_LEN = 113;
+  if (data.length < MIN_LEN) {
+    throw new Error(
+      `pump global account too short: ${data.length} < ${MIN_LEN} bytes`
+    );
+  }
+  const readU64 = (offset: number): bigint => {
+    let v = BigInt(0);
+    for (let i = 7; i >= 0; i--) {
+      v = (v << BigInt(8)) | BigInt(data[offset + i]);
+    }
+    return v;
+  };
+  return {
+    feeRecipient: new PublicKey(data.subarray(41, 73)),
+    initialVirtualTokenReserves: readU64(73),
+    initialVirtualSolReserves: readU64(81),
+    initialRealTokenReserves: readU64(89),
+    tokenTotalSupply: readU64(97),
+    feeBasisPoints: readU64(105),
+  };
+}
+
+/** Invariant guard: throws unless `mint` is owned by Token-2022. Every token
+ *  the active `create_v2` path makes is Token-2022; this is asserted, never
+ *  branched on (legacy-SPL pump tokens are out of scope). */
+export async function assertToken2022Mint(
+  connection: Connection,
+  mint: PublicKey
+): Promise<void> {
+  const info = await connection.getAccountInfo(mint, "confirmed");
+  if (!info) {
+    throw new Error(`mint account ${mint.toBase58()} not found`);
+  }
+  if (!info.owner.equals(TOKEN_2022_PROGRAM_ID)) {
+    throw new Error(
+      `mint ${mint.toBase58()} is owned by ${info.owner.toBase58()}, not Token-2022 (${TOKEN_2022_PROGRAM_ID.toBase58()})`
+    );
+  }
+}
+
 /** pump.fun event authority PDA (seeds: ["__event_authority"], double
  *  underscore). Derived from the program id, NOT a fixed pubkey. */
 export const PUMP_EVENT_AUTHORITY: PublicKey = PublicKey.findProgramAddressSync(
@@ -435,6 +514,13 @@ export async function readPumpCurveState(
 /* OUT because pump.fun's buy takes tokens_out, not SOL in)            */
 /* ------------------------------------------------------------------ */
 
+/** Integer ceiling division (a/b rounded up); `b` must be positive. Used by
+ *  the fill quote so the cost is a floor, never rounded down below the
+ *  on-chain requirement. */
+function ceilDiv(a: bigint, b: bigint): bigint {
+  return (a + b - BigInt(1)) / b;
+}
+
 export interface PumpBuyQuote {
   /** Token amount handed to the buy instruction (raw units). */
   tokensOut: bigint;
@@ -528,6 +614,103 @@ export function quotePumpSell(opts: {
   const minSolOutput =
     (netSolOut * (BigInt(10_000) - slippageBps)) / BigInt(10_000);
   return { grossSolOut, netSolOut, minSolOutput };
+}
+
+export interface PumpFillQuote {
+  /** All remaining real tokens: this buy graduates the curve. */
+  tokensOut: bigint;
+  /** Curve-computed SOL cost added to the virtual SOL reserve (net of fee). */
+  costLamports: bigint;
+  /** max_sol_cost handed to the buy instruction (fee grossed up + slippage). */
+  maxSolCost: bigint;
+}
+
+/** The three curve reserves a quote needs: the constant-product virtual
+ *  reserves plus the HARD CAP (`realTokenReserves`). A full PumpCurveState is
+ *  structurally assignable. */
+export interface PumpCurveReserves {
+  virtualSolReserves: bigint;
+  virtualTokenReserves: bigint;
+  realTokenReserves: bigint;
+}
+
+/** One pre-graduation chunk quote (explicit token amount in). */
+export interface PumpChunkQuote {
+  /** Token amount handed to the buy instruction (raw units). */
+  tokensOut: bigint;
+  /** Curve-computed SOL cost added to the virtual SOL reserve (net of fee). */
+  costLamports: bigint;
+  /** max_sol_cost handed to the buy instruction (fee grossed up + slippage). */
+  maxSolCost: bigint;
+}
+
+/**
+ * Chunk-sizing quote: take an EXPLICIT token amount. Integer ceiling math, no
+ * floats:
+ *
+ *   costLamports = ceil(tokensOut * virtualSolReserves / (virtualTokenReserves - tokensOut))
+ *   maxSolCost   = ceil(cost * 10000/(10000-feeBps) * (10000+slippageBps)/10000)
+ *
+ * The curve is a HARD CAP and does not clamp: a `tokensOut` above the
+ * remaining `realTokenReserves` must THROW (an oversized buy reverts
+ * `NotEnoughTokensToBuy` on chain). `costLamports` is a FLOOR (a live curve
+ * can read a few hundred lamports above it); `maxSolCost` carries the slippage
+ * headroom. The input-side fee constant is the live flat rate
+ * (`PUMP_FEE_BPS` = 125 bps).
+ */
+export function quotePumpChunk(
+  curve: PumpCurveReserves,
+  tokensOut: bigint,
+  slippageBps: bigint = PUMP_DEFAULT_SLIPPAGE_BPS
+): PumpChunkQuote {
+  if (tokensOut <= BigInt(0)) {
+    throw new Error(`chunk tokens_out must be positive, got ${tokensOut}`);
+  }
+  if (tokensOut > curve.realTokenReserves) {
+    throw new Error(
+      `chunk tokens_out ${tokensOut} exceeds the remaining real tokens ${curve.realTokenReserves} (curve hard cap, no clamp)`
+    );
+  }
+  if (curve.virtualTokenReserves <= tokensOut) {
+    throw new Error(
+      "curve virtual token reserve is not above the chunk tokens_out"
+    );
+  }
+  const denom = curve.virtualTokenReserves - tokensOut;
+  const costLamports = ceilDiv(tokensOut * curve.virtualSolReserves, denom);
+  const grossWithFee = ceilDiv(
+    costLamports * BigInt(10_000),
+    BigInt(10_000) - PUMP_FEE_BPS
+  );
+  const maxSolCost = ceilDiv(
+    grossWithFee * (BigInt(10_000) + slippageBps),
+    BigInt(10_000)
+  );
+  return { tokensOut, costLamports, maxSolCost };
+}
+
+/**
+ * Fill-sizing quote: take ALL remaining real tokens so this buy drives
+ * real_token_reserves to 0 and the program migrates the curve to PumpSwap in
+ * the same instruction. Delegates to `quotePumpChunk` so the integer ceiling
+ * math stays in one place. `costLamports` is a FLOOR (a live curve can read a
+ * few hundred lamports above it); `maxSolCost` carries the slippage headroom.
+ */
+export function quotePumpFill(
+  curve: PumpCurveReserves,
+  slippageBps: bigint = PUMP_DEFAULT_SLIPPAGE_BPS
+): PumpFillQuote {
+  if (curve.realTokenReserves <= BigInt(0)) {
+    throw new Error(
+      "curve has no real tokens left to fill (already graduated?)"
+    );
+  }
+  const q = quotePumpChunk(curve, curve.realTokenReserves, slippageBps);
+  return {
+    tokensOut: q.tokensOut,
+    costLamports: q.costLamports,
+    maxSolCost: q.maxSolCost,
+  };
 }
 
 /** Max SOL a buy may commit given a wallet's spendable balance and the

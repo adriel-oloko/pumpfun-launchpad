@@ -58,16 +58,21 @@ import {
 } from "@solana/web3.js";
 import type { AddressLookupTableAccount } from "@solana/web3.js";
 import {
+  PUMP_FEE_BPS,
   PUMP_METAPLEX_PROGRAM_ID,
   buildPumpBuyIx,
   buildPumpCreateIx,
   pumpBondingCurvePda,
   pumpMetadataPda,
   pumpMintAuthorityPda,
-  quotePumpBuy,
+  quotePumpChunk,
+  readPumpCurveState,
+  readPumpGlobalParams,
   resolvePumpFeeRecipient,
 } from "../pump";
-import { VIRTUAL_SOL_RESERVE, VIRTUAL_TOKEN_RESERVE } from "../params";
+import { buildPumpMigrateV2Ix, canonicalMigratedPoolPda } from "../migrate";
+import { VIRTUAL_TOKEN_RESERVE, virtualSolReserveFallback } from "../params";
+import { solanaNetwork } from "../network";
 import { DEFAULT_PRIORITY_FEE_MICRO_LAMPORTS } from "../fees";
 import { isBlockhashExpiredError } from "../tx-errors";
 import { grindVanityMintKeypair } from "../vanity";
@@ -84,9 +89,19 @@ export const MAX_COMPUTE_UNITS = 1_400_000;
 /** Per-tx compute-unit limits for the REAL bundle txs. Stamping
  *  MAX_COMPUTE_UNITS on every tx made a 3-tx launch bundle reserve 4.2M CU,
  *  which Jito's cost model rejected (ExceedsCostModel -> Invalid). Measured
- *  consumption: create ~111k, buy (incl. ATA create + tip) ~205k. */
+ *  consumption: create ~111k, buy (incl. ATA create + tip) ~205k. The explicit
+ *  MigrateV2 (pool + ATAs + LP mint + boost CPIs) gets the manual runner's
+ *  400k ceiling. */
 export const CREATE_CU_LIMIT = 150_000;
 export const BUY_CU_LIMIT = 250_000;
+export const MIGRATE_CU_LIMIT = 400_000;
+
+/** Real-token-reserve fallback for a FRESH curve when the live PUMP_GLOBAL
+ *  read fails. The real token reserve is identical on mainnet and devnet
+ *  (only the virtual SOL seed differs), so one constant covers both. */
+export const REAL_TOKEN_RESERVE_FALLBACK: bigint = BigInt(
+  "793100000000000"
+);
 
 /** Default serialized-byte budget for a buy tx. Every mainnet-launch buy tx
  *  now carries its OWN Sender tip transfer (~90 bytes) — Tier 1 sequential
@@ -113,10 +128,14 @@ export interface LaunchPdas {
   metadata: PublicKey;
 }
 
-/** One dev wallet's buy. */
+/** One dev wallet's planned buy. */
 export interface BuyAllocation {
   wallet: Keypair;
-  /** SOL in lamports this wallet sends into the curve. */
+  /** Planned GROSS SOL this wallet commits (the buy's `max_sol_cost`
+   *  ceiling), lamports. The program floors its 125 bps input fee per buy, so
+   *  the curve receives the NET (`quoteLaunchBuys().costLamports`); the
+   *  graduating buy takes the remaining real tokens and closes any floor
+   *  shortfall. */
   solInLamports: bigint;
 }
 
@@ -152,15 +171,24 @@ export interface LaunchSequence {
   createIx: TransactionInstruction;
   createTx: Transaction;
   buyTxs: BuyTx[];
+  /** Explicit pump.fun MigrateV2 (canonical pool creation) sent AFTER the
+   *  fill buys, in the same slot. Signed by the creator alone. Idempotent:
+   *  a Custom 6040 revert means the coin is already migrated. NULL when the
+   *  build was asked for a create+buys-only sequence (`includeMigrate: false`).
+   */
+  migrateIx: TransactionInstruction | null;
+  migrateTx: Transaction | null;
   blockhash: { blockhash: string; lastValidBlockHeight: number };
-  /** Signers per tx, aligned with [fund?, create, ...buyTxs]. */
+  /** Signers per tx, aligned with [fund?, create, ...buyTxs, migrate]. */
   signersByTx: Keypair[][];
 }
 
 export interface BuildLaunchOptions {
   connection: Connection;
-  /** Creator: signs create (with the mint keypair), is fee payer on every
-   *  tx, pays funding. */
+  /** Creator: signs create (with the mint keypair), pays the create tx and
+   *  the explicit MigrateV2. NOT the fee payer of the fill buys: each buy tx
+   *  is paid by the pair's first wallet. Any wallet funding must happen in a
+   *  separate, earlier tx (never inside the launch pack). */
   creator: Keypair;
   name: string;
   symbol: string;
@@ -191,6 +219,16 @@ export interface BuildLaunchOptions {
    *  "pump", exactly like real pump.fun tokens. Cosmetic only: the ticker's
    *  `.pump` SUFFIX is still indexer-applied; name/symbol/uri are untouched. */
   mintKeypair?: Keypair;
+  /** Build the explicit MigrateV2 tx (default true). When false the sequence
+   *  is create + buys only: the shape the mainnet pre-migration sell-all test
+   *  needs. The default path (undefined/true) is unchanged. */
+  includeMigrate?: boolean;
+  /** Whether the final buy graduates the curve (default true). When false
+   *  EVERY buy takes only its planned share and the MigrateV2 tx is omitted
+   *  automatically (a non-graduating launch must not create the canonical
+   *  pool), so callers do not have to set both flags. The operator's UI test
+   *  launch uses this to create a coin that stays on the open curve. */
+  graduate?: boolean;
 }
 
 /** Derives every pump.fun address for one launch from the fresh mint
@@ -204,43 +242,115 @@ export function deriveLaunchPdas(mint: PublicKey): LaunchPdas {
 }
 
 /**
- * Quotes every pre-fill buy against the curve's INITIAL virtual reserves
- * (30 SOL / 1.073B tokens = 1_073_000_000_000_000 raw units at 6 decimals;
- * the state right after create, before any buy can land on a fresh mint),
- * chaining each fill's simulated reserve movement into the next quote.
- * Returns the per-wallet pump.fun buy args aligned 1:1 with `buys`.
+ * Resolves the curve seed a FRESH launch quotes against: the LIVE
+ * `PUMP_GLOBAL` account on success (devnet seeds 1 SOL of virtual SOL,
+ * mainnet 30 SOL — the D-2 trap), otherwise the cluster-keyed fallback. The
+ * virtual token reserve is identical on both clusters; the real token reserve
+ * is identical on BOTH clusters too (only the virtual SOL seed differs).
+ */
+export async function resolveLaunchCurveSeed(connection: Connection): Promise<{
+  virtualSolReserves: bigint;
+  virtualTokenReserves: bigint;
+  realTokenReserves: bigint;
+}> {
+  try {
+    const g = await readPumpGlobalParams(connection);
+    return {
+      virtualSolReserves: g.initialVirtualSolReserves,
+      virtualTokenReserves: g.initialVirtualTokenReserves,
+      realTokenReserves: g.initialRealTokenReserves,
+    };
+  } catch {
+    return {
+      virtualSolReserves: virtualSolReserveFallback(solanaNetwork()),
+      virtualTokenReserves: VIRTUAL_TOKEN_RESERVE,
+      realTokenReserves: REAL_TOKEN_RESERVE_FALLBACK,
+    };
+  }
+}
+
+/** Per-wallet launch buy args (aligned 1:1 with `buys`). */
+export interface LaunchBuyQuote {
+  tokensOut: bigint;
+  maxSolCost: bigint;
+  /** Curve-computed NET SOL this buy adds to the virtual SOL reserve. */
+  costLamports: bigint;
+}
+
+/**
+ * Quotes every pre-fill buy against the curve's INITIAL reserves, chaining
+ * each chunk's simulated reserve movement into the next quote. `seed` is the
+ * caller-resolved cluster seed (`resolveLaunchCurveSeed`): a fresh curve
+ * starts there before any buy can land.
+ *
+ * `BuyAllocation.solInLamports` is the planned GROSS budget; each
+ * non-graduating chunk derives `tokens_out` from the per-buy fee floor
+ * (`net = floor(gross*9875/10000)`) and quotes the forward cost with
+ * `quotePumpChunk`. By default (`graduate` true) the FINAL buy is forced to
+ * take ALL remaining real tokens (the curve hard cap), so the curve completes
+ * no matter how the earlier per-buy floors rounded. With `graduate: false`
+ * every buy — including the last — takes only ITS planned share, leaving the
+ * curve open (the operator's UI test launch).
  */
 export function quoteLaunchBuys(
   buys: BuyAllocation[],
-  slippageBps?: bigint
-): { tokensOut: bigint; maxSolCost: bigint }[] {
-  let vsr = VIRTUAL_SOL_RESERVE;
-  let vtr = VIRTUAL_TOKEN_RESERVE;
-  const quotes: { tokensOut: bigint; maxSolCost: bigint }[] = [];
-  for (const buy of buys) {
-    const q = quotePumpBuy({
-      solInLamports: buy.solInLamports,
-      virtualSolReserves: vsr,
-      virtualTokenReserves: vtr,
-      slippageBps,
+  slippageBps: bigint | undefined,
+  seed: {
+    virtualSolReserves: bigint;
+    virtualTokenReserves: bigint;
+    realTokenReserves: bigint;
+  },
+  /** When true (default) the final buy graduates the curve; when false every
+   *  buy takes only its planned share and the curve stays open. */
+  graduate: boolean = true
+): LaunchBuyQuote[] {
+  let vsr = seed.virtualSolReserves;
+  let vtr = seed.virtualTokenReserves;
+  let rtr = seed.realTokenReserves;
+  const quotes: LaunchBuyQuote[] = [];
+  for (let i = 0; i < buys.length; i++) {
+    const isLast = graduate && i === buys.length - 1;
+    let tokensOut: bigint;
+    if (isLast) {
+      // The graduating buy takes every remaining real token.
+      tokensOut = rtr;
+    } else {
+      const gross = buys[i].solInLamports;
+      if (gross <= BigInt(0)) {
+        throw new Error(
+          `launch buy ${i} has a non-positive planned budget ${gross}`
+        );
+      }
+      const net = (gross * (BigInt(10_000) - PUMP_FEE_BPS)) / BigInt(10_000);
+      tokensOut = (net * vtr) / (vsr + net);
+    }
+    const q = quotePumpChunk(
+      { virtualSolReserves: vsr, virtualTokenReserves: vtr, realTokenReserves: rtr },
+      tokensOut,
+      slippageBps
+    );
+    vsr = vsr + q.costLamports;
+    vtr = vtr - q.tokensOut;
+    rtr = rtr - q.tokensOut;
+    quotes.push({
+      tokensOut: q.tokensOut,
+      maxSolCost: q.maxSolCost,
+      costLamports: q.costLamports,
     });
-    vsr = q.nextVirtualSolReserves;
-    vtr = q.nextVirtualTokenReserves;
-    quotes.push({ tokensOut: q.tokensOut, maxSolCost: q.maxSolCost });
   }
   return quotes;
 }
 
-/** Serialized size of a signed tx built from ixs + signers. */
+/** Serialized size of a signed buy tx. The pair's FIRST wallet is the fee
+ *  payer, so only the pair signs (the creator is NOT on fill txs). */
 function signedSize(
-  creator: Keypair,
   ixs: TransactionInstruction[],
   wallets: Keypair[],
   blockhash: string,
   computeUnitLimit: number,
   priorityFeeMicroLamports: number
 ): number {
-  const tx = new Transaction({ feePayer: creator.publicKey, blockhash, lastValidBlockHeight: 0 });
+  const tx = new Transaction({ feePayer: wallets[0].publicKey, blockhash, lastValidBlockHeight: 0 });
   tx.add(ComputeBudgetProgram.setComputeUnitLimit({ units: computeUnitLimit }));
   if (priorityFeeMicroLamports > 0) {
     tx.add(
@@ -250,7 +360,7 @@ function signedSize(
     );
   }
   tx.add(...ixs);
-  tx.sign(creator, ...wallets);
+  tx.sign(...wallets);
   try {
     return tx.serialize().length;
   } catch {
@@ -260,9 +370,9 @@ function signedSize(
   }
 }
 
-/** Materializes one packed buy tx (unsigned). */
+/** Materializes one packed buy tx (unsigned). The pair's FIRST wallet is the
+ *  fee payer; the creator is absent from every fill tx. */
 function materializeBuyTx(
-  creator: Keypair,
   walletIxs: TransactionInstruction[][],
   wallets: Keypair[],
   blockhash: string,
@@ -272,7 +382,7 @@ function materializeBuyTx(
 ): BuyTx {
   const instructions = walletIxs.flat();
   const tx = new Transaction({
-    feePayer: creator.publicKey,
+    feePayer: wallets[0].publicKey,
     blockhash,
     lastValidBlockHeight: 0,
   });
@@ -291,9 +401,9 @@ function materializeBuyTx(
 /**
  * Greedily packs the dev buys into buy transactions under the byte budget.
  * Each wallet's buy is two instructions (ATA-create idempotent + pump.fun
- * buy); the wallets sign their own buys and the creator signs as fee payer.
- * Measured (M10): ~200 bytes/wallet, 2 wallets max per tx (1060 bytes), 3
- * overflow the 1232-byte limit.
+ * buy); the pair's FIRST wallet is the fee payer and the pair signs its own
+ * buy — the creator is NOT on the fill txs. Measured (M10): ~200
+ * bytes/wallet, 2 wallets max per tx, 3 overflow the 1232-byte limit.
  */
 export function packBuyTxs(opts: {
   creator: Keypair;
@@ -350,7 +460,6 @@ export function packBuyTxs(opts: {
       walletIxs: [...current.walletIxs, ixs],
     };
     const size = signedSize(
-      creator,
       candidate.walletIxs.flat(),
       candidate.wallets,
       blockhash,
@@ -364,7 +473,6 @@ export function packBuyTxs(opts: {
       // the candidate would overflow the budget: close the current tx
       out.push(
         materializeBuyTx(
-          creator,
           current.walletIxs,
           current.wallets,
           blockhash,
@@ -375,7 +483,6 @@ export function packBuyTxs(opts: {
       );
       current = { wallets: [buy.wallet], walletIxs: [ixs] };
       currentSize = signedSize(
-        creator,
         ixs,
         [buy.wallet],
         blockhash,
@@ -387,7 +494,6 @@ export function packBuyTxs(opts: {
   if (current && current.wallets.length > 0) {
     out.push(
       materializeBuyTx(
-        creator,
         current.walletIxs,
         current.wallets,
         blockhash,
@@ -424,6 +530,8 @@ export async function buildLaunchSequence(
     computeUnitLimit,
     priorityFeeMicroLamports,
     slippageBps,
+    includeMigrate = true,
+    graduate = true,
   } = opts;
   if (buys.length === 0) throw new Error("at least one dev wallet buy is required");
 
@@ -439,6 +547,7 @@ export async function buildLaunchSequence(
   const priorityFee = priorityFeeMicroLamports ?? DEFAULT_PRIORITY_FEE_MICRO_LAMPORTS;
   const createCuLimit = computeUnitLimit ?? CREATE_CU_LIMIT;
   const buyCuLimit = computeUnitLimit ?? BUY_CU_LIMIT;
+  const migrateCuLimit = computeUnitLimit ?? MIGRATE_CU_LIMIT;
   const addFeeIxs = (tx: Transaction, cuLimit?: number): void => {
     if (cuLimit !== undefined) {
       tx.add(ComputeBudgetProgram.setComputeUnitLimit({ units: cuLimit }));
@@ -509,7 +618,12 @@ export async function buildLaunchSequence(
 
   // M10: client-side quotes (pump.fun buy takes tokens_out + max_sol_cost,
   // so the SOL->tokens math happens here, chained across the fills).
-  const quotes = quoteLaunchBuys(buys, slippageBps);
+  // M10 + D-2: resolve the curve seed LIVE from the pump.fun global account
+  // (devnet 1 SOL vs mainnet 30 SOL virtual SOL). A hardcoded seed silently
+  // under-buys a devnet launch by ~30x. Fall back per cluster on a failed
+  // read.
+  const seed = await resolveLaunchCurveSeed(connection);
+  const quotes = quoteLaunchBuys(buys, slippageBps, seed, graduate);
 
   const buyTxs = packBuyTxs({
     creator,
@@ -524,10 +638,37 @@ export async function buildLaunchSequence(
     priorityFeeMicroLamports: priorityFee,
   });
 
+  // C3: the explicit MigrateV2 is the LAST launch tx. The reference coins
+  // created the canonical pool in a separate transaction after the fill buys
+  // (the fill txs contained no CreatePool), so the launch must not rely on
+  // the graduating buy to migrate. Signed by the creator alone and sent in the
+  // same slot; a Custom 6040 revert means it already migrated (idempotent).
+  // `includeMigrate: false` (mainnet pre-migration sell-all test) omits it and
+  // the sequence is create + buys only. A NON-graduating launch (`graduate:
+  // false`) also omits it automatically: the curve stays open, so there is no
+  // pool to create. Callers never have to set both flags.
+  const buildMigrate = graduate && includeMigrate;
+  let migrateIx: TransactionInstruction | null = null;
+  let migrateTx: Transaction | null = null;
+  if (buildMigrate) {
+    migrateIx = buildPumpMigrateV2Ix({
+      baseMint: mintKeypair.publicKey,
+      user: creator.publicKey,
+    });
+    migrateTx = new Transaction({
+      feePayer: creator.publicKey,
+      blockhash: latest.blockhash,
+      lastValidBlockHeight: 0,
+    });
+    addFeeIxs(migrateTx, migrateCuLimit);
+    migrateTx.add(migrateIx);
+  }
+
   const signersByTx: Keypair[][] = [];
   if (fundTx) signersByTx.push([creator]);
   signersByTx.push([creator, mintKeypair]);
-  for (const bt of buyTxs) signersByTx.push([creator, ...bt.wallets]);
+  for (const bt of buyTxs) signersByTx.push([...bt.wallets]);
+  if (migrateIx) signersByTx.push([creator]);
 
   return {
     pda,
@@ -542,8 +683,74 @@ export async function buildLaunchSequence(
     createIx,
     createTx,
     buyTxs,
+    migrateIx,
+    migrateTx,
     blockhash,
     signersByTx,
+  };
+}
+
+/** An assembled Tier 2 relay bundle: the launch txs plus their matching
+ *  signer lists, with the explicit MigrateV2 removed when the canonical pool
+ *  already exists. */
+export interface LaunchBundlePack {
+  txs: Transaction[];
+  signersByTx: Keypair[][];
+  /** True when the migrate tx was dropped because the pool already existed. */
+  migrateDropped: boolean;
+  /** The canonical PumpSwap pool PDA for the launch mint. */
+  poolKey: PublicKey;
+  /** The curve's `complete` flag (false when the curve does not exist yet). */
+  curveComplete: boolean;
+}
+
+/**
+ * Tier 2 idempotency guard (spec section 8 item 4). An atomic relay bundle
+ * cannot swallow ONE transaction's `Custom: 6040` (already migrated) revert
+ * the way `sendSequentially` does, so before submitting the bundle this reads
+ * the curve completion flag and the canonical PumpSwap pool account. When the
+ * pool already exists the explicit MigrateV2 (and its signer entry) is dropped
+ * from the bundle — otherwise the whole atomic bundle would revert on the
+ * already-migrated coin.
+ *
+ * Pure with respect to the launch: it only READS the chain and never builds or
+ * sends a transaction. A fresh mint has neither a curve nor a pool, so the
+ * normal path keeps the migrate tx.
+ */
+export async function assembleLaunchBundle(
+  connection: Connection,
+  seq: LaunchSequence
+): Promise<LaunchBundlePack> {
+  const [poolKey] = canonicalMigratedPoolPda(seq.pda.mint);
+  const [curveRead, poolInfo] = await Promise.all([
+    readPumpCurveState(connection, seq.pda.mint),
+    connection.getAccountInfo(poolKey, "confirmed"),
+  ]);
+  const poolExists = poolInfo !== null;
+
+  const txs: Transaction[] = [];
+  if (seq.fundTx) txs.push(seq.fundTx);
+  txs.push(seq.createTx);
+  for (const bt of seq.buyTxs) txs.push(bt.tx);
+
+  const signersByTx: Keypair[][] = [...seq.signersByTx];
+  let migrateDropped = false;
+  if (seq.migrateTx) {
+    if (poolExists) {
+      // signersByTx ends with the migrate signer entry, matching the migrate tx.
+      signersByTx.pop();
+      migrateDropped = true;
+    } else {
+      txs.push(seq.migrateTx);
+    }
+  }
+
+  return {
+    txs,
+    signersByTx,
+    migrateDropped,
+    poolKey,
+    curveComplete: curveRead.kind === "ok" && curveRead.curve.complete,
   };
 }
 
@@ -563,12 +770,13 @@ export function signTx(tx: Transaction, signers: Keypair[]): Transaction {
   return tx;
 }
 
-/** The [fund?, create, ...buys] tx list in execution order. */
+/** The [fund?, create, ...buys, migrate] tx list in execution order. */
 export function sequenceTxs(seq: LaunchSequence): Transaction[] {
   const txs: Transaction[] = [];
   if (seq.fundTx) txs.push(seq.fundTx);
   txs.push(seq.createTx);
   for (const bt of seq.buyTxs) txs.push(bt.tx);
+  if (seq.migrateTx) txs.push(seq.migrateTx);
   return txs;
 }
 
@@ -790,6 +998,21 @@ export async function sendAndConfirmWithRetry(
     : new Error(`${label} failed after ${attempts} send attempts`);
 }
 
+/** True when the message is pump's "already migrated" revert (Custom 6040):
+ *  the canonical pool already exists, so the explicit MigrateV2 is
+ *  idempotent and its revert is a SUCCESS for the launch. */
+function isAlreadyMigratedRevert(msg: string): boolean {
+  return /custom["\s:]*6040/i.test(msg);
+}
+
+/** The confirmed/failed tx signature a sender embeds in its message as
+ *  `label (SIG) ...`, when present. Used only to surface the idempotent
+ *  migrate revert; never to fabricate a success. */
+function signatureFromError(msg: string): string {
+  const m = msg.match(/\(([1-9A-HJ-NP-Za-km-z]{32,88})\)/);
+  return m ? m[1] : "";
+}
+
 /** Sends the sequence as normal transactions, confirming each (Tier 1).
  *  Each tx goes through the shared Helius Sender SWQOS-only sender
  *  (sendProtectedTx): on MAINNET it is re-signed per attempt with the tx's
@@ -801,7 +1024,12 @@ export async function sendAndConfirmWithRetry(
  *  one (up to 3 attempts), never a bare failure or a hang. A mid-sequence
  *  failure throws with the partial-state context: the txs that already
  *  confirmed are named so the caller never mistakes a partial launch for a
- *  no-op. */
+ *  no-op.
+ *
+ *  The explicit MigrateV2 is idempotent: a `Custom: 6040` (already migrated)
+ *  revert on the LAST tx is treated as success (the canonical pool exists).
+ *  An atomic relay bundle cannot swallow one tx's revert, so this handling is
+ *  Tier 1 only. */
 export async function sendSequentially(
   connection: Connection,
   seq: LaunchSequence,
@@ -813,6 +1041,7 @@ export async function sendSequentially(
   if (seq.fundTx) labels.push("fund");
   labels.push("create");
   for (let i = 0; i < seq.buyTxs.length; i++) labels.push(`buy${i + 1}`);
+  if (seq.migrateTx) labels.push("migrate");
 
   const sent: { label: string; signature: string }[] = [];
   for (let i = 0; i < txs.length; i++) {
@@ -835,6 +1064,15 @@ export async function sendSequentially(
       sent.push({ label, signature });
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
+      if (label === "migrate" && isAlreadyMigratedRevert(msg)) {
+        // The coin is already migrated (Custom 6040): the canonical pool
+        // exists, so the explicit MigrateV2 did its job. Record the failed
+        // attempt's signature when the sender surfaced it.
+        const signature = signatureFromError(msg);
+        if (opts.onSignature) opts.onSignature(label, signature);
+        sent.push({ label, signature });
+        continue;
+      }
       const partial =
         sent.length > 0
           ? ` NOTE: ${sent.length} earlier launch tx(s) already confirmed (${sent

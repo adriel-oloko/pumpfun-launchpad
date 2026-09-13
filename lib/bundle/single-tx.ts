@@ -35,9 +35,8 @@ import {
   quotePumpBuy,
   resolvePumpFeeRecipient,
 } from "../pump";
-import { VIRTUAL_SOL_RESERVE, VIRTUAL_TOKEN_RESERVE } from "../params";
 import { DEFAULT_PRIORITY_FEE_MICRO_LAMPORTS } from "../fees";
-import { MAX_TX_BYTES, deriveLaunchPdas } from "./launch";
+import { MAX_TX_BYTES, deriveLaunchPdas, resolveLaunchCurveSeed } from "./launch";
 import { grindVanityMintKeypair } from "../vanity";
 
 /** Combined compute-unit budget: create ~111k + buy (incl. ATA create + tip)
@@ -120,10 +119,13 @@ export async function buildSingleTxLaunch(
   const latest = await connection.getLatestBlockhash("confirmed");
   const feeRecipient = await resolvePumpFeeRecipient(connection);
 
+  // D-2: the single-tx quote must use the LIVE cluster seed (devnet 1 SOL vs
+  // mainnet 30 SOL virtual SOL), not a hardcoded mainnet constant.
+  const seed = await resolveLaunchCurveSeed(connection);
   const quote = quotePumpBuy({
     solInLamports,
-    virtualSolReserves: VIRTUAL_SOL_RESERVE,
-    virtualTokenReserves: VIRTUAL_TOKEN_RESERVE,
+    virtualSolReserves: seed.virtualSolReserves,
+    virtualTokenReserves: seed.virtualTokenReserves,
   });
 
   const createIx = buildPumpCreateIx({

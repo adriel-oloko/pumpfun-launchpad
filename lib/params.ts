@@ -9,6 +9,12 @@
 // smaller numbers cost launch fills 6 decimals of magnitude (dust fills).
 // The TypeScript client (M2 scripts, M4 UI) must read its numbers from this
 // file and never hardcode them.
+//
+// CLUSTER WARNING (2026-09): the virtual SOL seed is NOT the same on both
+// clusters (mainnet 30 SOL, devnet 1 SOL). Live-read `PUMP_GLOBAL` and fall
+// back to `virtualSolReserveFallback(network)`; never sum a hardcoded seed.
+
+import type { SolanaNetwork } from "./network";
 
 /** Token decimals, the number of digits after the decimal point on the mint.
  *  Unit: decimal places. Value: 6 (pump.fun reference). */
@@ -21,8 +27,27 @@ export const DECIMALS: number = 6;
 export const TOTAL_SUPPLY: bigint = BigInt(1_000_000_000_000_000);
 
 /** Virtual SOL reserve seeded into the constant-product curve at creation.
- *  Unit: lamports (1 SOL = 1_000_000_000 lamports). Value: 30 SOL. */
+ *  Unit: lamports (1 SOL = 1_000_000_000 lamports). Value: 30 SOL.
+ *
+ *  MAINNET ONLY. Devnet seeds a 1 SOL virtual reserve
+ *  (`initial_virtual_sol_reserves = 1000000000` on the live global account).
+ *  Anything that quotes against a hardcoded curve seed must go through
+ *  `virtualSolReserveFallback(network)`, never this constant directly. */
 export const VIRTUAL_SOL_RESERVE: bigint = BigInt(30_000_000_000);
+
+/** Devnet's virtual SOL seed (live global-account read: 1_000_000_000). */
+export const VIRTUAL_SOL_RESERVE_DEVNET: bigint = BigInt(1_000_000_000);
+
+/** Cluster-keyed fallback for the curve's virtual SOL seed, used only when
+ *  the live `PUMP_GLOBAL` read fails. Mainnet seeds 30 SOL, devnet 1 SOL; the
+ *  virtual TOKEN reserve is identical on both clusters. */
+export function virtualSolReserveFallback(
+  network: SolanaNetwork
+): bigint {
+  return network === "mainnet"
+    ? VIRTUAL_SOL_RESERVE
+    : VIRTUAL_SOL_RESERVE_DEVNET;
+}
 
 /** Virtual token reserve seeded into the constant-product curve at creation.
  *  Unit: raw token units. Value: 1_073_000_000_000_000 (1.073B tokens at
@@ -33,24 +58,6 @@ export const VIRTUAL_TOKEN_RESERVE: bigint = BigInt(1_073_000_000_000_000);
 /** Protocol fee charged on the input side of every buy and sell.
  *  Unit: basis points (1% = 100 bps, 100% = 10_000 bps). Value: 100 (1%). */
 export const FEE_BPS: bigint = BigInt(100);
-
-/** Curve graduation threshold: the total SOL reserve (virtual 30 SOL plus real
- *  buy proceeds) at which the curve is considered filled. Unit: lamports.
- *  Value: 85 SOL, which is the 30 virtual SOL plus roughly 55 real SOL, the
- *  point where pump.fun reclaims the virtual reserve and graduates. */
-export const GRADUATION_THRESHOLD_SOL: bigint = BigInt(85_000_000_000);
-
-/** Default for the per-token auto-migration option, pre-filled into the launch
- *  dashboard and stored on the curve at create() time. When true, the buy that
- *  fills the curve graduates it in the same instruction; when false, the
- *  recorded creator calls the graduate instruction manually. */
-export const DEFAULT_AUTO_MIGRATE: boolean = true;
-
-/** Default for the per-token LP-lock option, pre-filled into the launch
- *  dashboard and stored on the curve at create() time. When true, the client
- *  migration script burns the LP minted by the PumpSwap createPool call; when
- *  false, the LP stays under the creator (they can remove liquidity later). */
-export const DEFAULT_LOCK_LP: boolean = true;
 
 /** SOL dust threshold that gates managed-wallet deletion: a wallet whose SOL
  *  balance is below this is treated as empty and can be removed (per-row x or

@@ -44,11 +44,7 @@ import {
 } from "@solana/web3.js";
 import { PUMP_AMM_SDK, OnlinePumpAmmSdk, PumpAmmSdk } from "@pump-fun/pump-swap-sdk";
 import { sendProtectedTx } from "./bundle/protected-send";
-import {
-  CANONICAL_POOL_INDEX,
-  WSOL_MINT,
-  pumpSwapPoolPda,
-} from "./migrate";
+import { WSOL_MINT, canonicalMigratedPoolPda } from "./migrate";
 import {
   PUMP_EVENT_AUTHORITY,
   PUMP_PROGRAM_ID,
@@ -272,12 +268,7 @@ export async function claimCreatorFees(
   let ammCoinCreator: PublicKey | null = null;
   let ammVaultBefore = BigInt(0);
   if (graduated) {
-    const [poolKey] = pumpSwapPoolPda(
-      CANONICAL_POOL_INDEX,
-      curve.creator,
-      mint,
-      WSOL_MINT
-    );
+    const [poolKey] = canonicalMigratedPoolPda(mint);
     const poolInfo = await connection.getAccountInfo(poolKey, "confirmed");
     if (!poolInfo) {
       ammLeg = { skipped: "PumpSwap pool not found for this mint (not migrated yet)" };

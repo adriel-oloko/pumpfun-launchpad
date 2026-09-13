@@ -44,6 +44,36 @@ export function isOnChainRevert(msg: string): boolean {
   );
 }
 
+/** True when the venue reverted because the price moved past the caller's
+ *  slippage floor. Distinct from a permanent on-chain revert: the tx did NOT
+ *  execute, and a retry against a FRESHLY READ price can succeed. Retry loops
+ *  MUST check this BEFORE `isOnChainRevert`, which matches `custom program
+ *  error` / `instructionerror` and would otherwise mark the price move as
+ *  permanent (and never re-quote).
+ *
+ *  Real revert forms (do not re-derive):
+ *
+ *  Pool leg (pump-amm `sell.rs:170`), captured from a live devnet tx:
+ *    "AnchorError thrown in programs/pump-amm/src/instructions/swap/sell.rs:170.
+ *     Error Code: ExceededSlippage. Error Number: 6004.
+ *     Error Message: ExceededSlippage."
+ *  and the instruction-error form our own sender throws from
+ *  `confirmed.value.err`:
+ *    transaction failed on chain: {"InstructionError":[1,{"Custom":6004}]}
+ *
+ *  Curve leg (pump program; numeric code inferred from the program error enum
+ *  and NOT observed at runtime in this run):
+ *    Error Code: TooLittleSolReceived. Error Message:
+ *    "slippage: Too little SOL received to sell the given amount of tokens."
+ *    (the repo already documents 6002 = TooMuchSolRequired in lib/pump.ts)
+ *
+ *  Match on the NAME (or the custom 6004 code), never on an inferred number. */
+export function isSlippageRevert(msg: string): boolean {
+  return /ExceededSlippage|TooLittleSolReceived|too little sol received|custom:?\s*6004|"custom"\s*:\s*6004|exceeded slippage|slippage/i.test(
+    msg
+  );
+}
+
 /** Converts a raw error message into a short, actionable line. Unknown
  *  messages pass through trimmed (never invent a cause). */
 export function friendlyTxError(raw: string): string {
@@ -69,6 +99,14 @@ export function friendlyTxError(raw: string): string {
   }
   if (isInsufficientFundsError(msg)) {
     return "Insufficient funds in the paying wallet for this transaction.";
+  }
+  if (isSlippageRevert(msg)) {
+    return (
+      "The price moved past the slippage floor before this sell landed. The " +
+      "transaction reverted and nothing was sold; the client re-quotes against " +
+      "the fresh price and retries. If every retry fails, lower the size or " +
+      "serialise the round (concurrency: 1) rather than widening slippage."
+    );
   }
   if (isOnChainRevert(msg)) {
     return "The transaction reverted on chain (see the raw error below).";

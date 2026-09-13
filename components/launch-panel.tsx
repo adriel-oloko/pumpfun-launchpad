@@ -6,15 +6,14 @@
 // Form: token name / symbol / metadata URI (direct entry; see the
 // Arweave/IPFS decision comment below), the connected creator key (the
 // SAME wallet the masthead connects via pumpfun.creatorKey.v1), the
-// selected dev wallets that each buy MAX (their TOTAL balance down to a
-// flat 0.002 SOL keep, the same sizing as the manual Buy Max; the creator
-// only covers the create tx; wallets must hold SOL, fund/disperse them
-// first), and a Launch button that
+// selected dev wallets, each funded to its planned fill gross budget; the
+// creator only covers the create tx + the explicit MigrateV2; wallets must
+// hold SOL, fund/disperse them first), and a Launch button that
 // drives lib/bundle:
 //
 //   Tier 1 (default): buildLaunchSequence + preflightLaunch +
 //                     sendSequentially, which submits every launch tx
-//                     (fund -> create -> buys) through the shared Helius
+//                     (create -> buys -> migrate) through the shared Helius
 //                     Sender SWQOS-only sender on MAINNET (each tx with its
 //                     own 0.000005 SOL tip + priority fee, mev-protect) and
 //                     through plain RPC on devnet (unchanged).
@@ -73,6 +72,7 @@ import {
 import bs58 from "bs58";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import {
+	assembleLaunchBundle,
 	ataRentLamports,
 	buildLaunchSequence,
 	ensurePumpLookupTable,
@@ -80,6 +80,7 @@ import {
 	postBuyFloorLamports,
 	preflightLaunch,
 	readToken2022Metadata,
+	resolveLaunchCurveSeed,
 	sendSequentially,
 	simulateBundle,
 	walletTokenBalance,
@@ -111,9 +112,23 @@ import {
 import {
 	pumpCreatorVaultPda,
 	pumpUserVolumeAccumulatorPda,
+	quotePumpFill,
 	readPumpCurveState,
 	type PumpCurveState,
 } from "../lib/pump";
+import { canonicalMigratedPoolPda } from "../lib/migrate";
+import {
+	assertMigratedPool,
+	SLOT_CHECK_NOT_EXERCISED,
+	LATE_READ_NOT_APPLICABLE,
+	type MigratedPoolFacts,
+} from "../lib/pool-assertions";
+import {
+	OnlinePumpAmmSdk,
+	boostVaultAta,
+	boostVaultAuthorityPda,
+} from "@pump-fun/pump-swap-sdk";
+import { TOKEN_PROGRAM_ID } from "@solana/spl-token";
 import {
 	formatSolLamports,
 	sellAllManagedWallets,
@@ -141,6 +156,12 @@ const EXPLORER_QS = solanaNetwork() === "devnet" ? "?cluster=devnet" : "";
 const DEFAULT_TIP_SOL = (
 	DEFAULT_JITO_TIP_LAMPORTS / LAMPORTS_PER_SOL
 ).toString();
+
+/** TEST LAUNCH (no graduate): the single gross buy the creator commits in
+ *  test mode. Small by design: it only needs to give the creator a non-zero
+ *  token balance to sell, and it must stay far below the curve fill so the
+ *  curve stays OPEN (no graduation, no MigrateV2). */
+const TEST_LAUNCH_DEV_BUY_LAMPORTS = BigInt(10_000_000);
 
 function errMsg(e: unknown): string {
 	if (e instanceof Error) return e.message;
@@ -211,6 +232,11 @@ export function LaunchPanel({
 	const [manualMetadata, setManualMetadata] = useState(false);
 	const [advancedOpen, setAdvancedOpen] = useState(false);
 	const [tier, setTier] = useState<"1" | "2">("1");
+	// TEST LAUNCH (no graduate): create + ONE small dev buy from the creator,
+	// skip the fill roster and the MigrateV2, and leave the curve OPEN so Sell
+	// All routes through the bonding curve. Explicit, always visible, OFF by
+	// default: the normal fill-and-graduate plan is untouched when it is off.
+	const [testLaunch, setTestLaunch] = useState(false);
 	const [tipSol, setTipSol] = useState(DEFAULT_TIP_SOL);
 	const [busy, setBusy] = useState(false);
 	const [statusLines, setStatusLines] = useState<string[]>([]);
@@ -284,12 +310,23 @@ export function LaunchPanel({
 					`symbol too long (${Buffer.byteLength(symbol, "utf8")} > 10 bytes)`,
 				);
 
-			if (selectedWallets.length === 0) {
+			const isTestLaunch = testLaunch;
+			if (!isTestLaunch && selectedWallets.length === 0) {
 				throw new Error("select at least one dev wallet in the roster");
 			}
 			// Keyedness validated UP FRONT (before metadata is published on
-			// the backend): watch-only wallets cannot sign buys.
-			const walletKps = selectedWallets.map((w) => {
+			// the backend): watch-only wallets cannot sign buys. TEST LAUNCH
+			// does not use the fill roster — it dev-buys from the creator's own
+			// wallet, so the plan is a synthetic single-wallet roster.
+			const rosterForPlan = isTestLaunch
+				? [
+						{
+							address: creator.publicKey.toBase58(),
+							key: creatorKey ?? undefined,
+						},
+					]
+				: selectedWallets;
+			const walletKps = rosterForPlan.map((w) => {
 				if (!w.key) {
 					throw new Error(
 						`wallet ${shortAddress(w.address, 6)} has no key (watch-only wallets cannot sign buys)`,
@@ -364,32 +401,35 @@ export function LaunchPanel({
 			log(
 				`program : pump.fun native (6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P)`,
 			);
-			log(
-				`migrate : automatic (pump.fun migrates to PumpSwap on graduation; create args = name/symbol/uri only)`,
-			);
-			// Buy sizing: MAX (flat 0.002 SOL keep + account rent ONLY for the
-			// accounts this launch actually creates). Each selected dev wallet
-			// spends its TOTAL balance minus a flat 0.002 SOL keep
-			// (MAX_BUY_KEEP_SOL_LAMPORTS) minus the rent for each account the
-			// launch genuinely creates, quoted with slippageBps = 0 so
-			// max_sol_cost = solIn = spendable exactly and each wallet ends at
-			// 0.002 SOL, buying the maximum possible tokens. The creator does
-			// NOT fund dev wallets (it only covers the create tx + fees), and a
-			// dev wallet pays no tx fee at launch (the creator is the fee
+			if (isTestLaunch) {
+				log(
+					"TEST LAUNCH (no graduate): curve stays OPEN, NO MigrateV2, one small dev buy from the creator",
+				);
+			} else {
+				log(
+					`migrate : explicit MigrateV2 after the fill buys (canonical PumpSwap pool; create args = name/symbol/uri only)`,
+				);
+			}
+			// C1: plan the FILL, not MAX. A MAX-sized buy over-quotes (a wallet
+			// bigger than the curve's remaining real tokens reverts
+			// NotEnoughTokensToBuy), so the launch plans explicit GROSS budgets
+			// whose net deposits reach the fresh curve's fill and the graduating
+			// buy takes the remaining real tokens. Read the curve seed LIVE
+			// (devnet seeds 1 SOL of virtual SOL, mainnet 30 SOL). Each wallet's
+			// gross budget is scaled to its spendable balance, so a wallet with
+			// more SOL carries more of the fill; the excess stays in the wallet
+			// (the program charges its curve-computed cost, never the
+			// max_sol_cost ceiling). The creator does NOT fund dev wallets from
+			// this pack: any funding happens in a separate, earlier tx, and a dev
+			// wallet pays no launch tx fee (its pair's first wallet is the fee
 			// payer). Each rent is reserved ONLY when its account does not
-			// already exist on-chain, so a re-launch / re-buy that already
-			// holds the accounts does not over-reserve and strand SOL:
+			// already exist on-chain, so a re-launch / re-buy that already holds
+			// the accounts does not over-reserve and strand SOL:
 			//   - Token-2022 ATA: the mint is fresh, so every wallet reserves it.
 			//   - creator_vault (PDA keyed by creator): reserved ONLY when the
 			//     creator has not launched before.
 			//   - user_volume_accumulator (PDA keyed by wallet): reserved ONLY
 			//     when that wallet has not bought before.
-			// Missing a rent the buy DOES create reverts the pre-fill with
-			// `Custom 1`; reserving a rent the buy does NOT create is what
-			// previously left wallets stranded above 0.002. (The pre-fill lands
-			// right after create, so the curve is fresh; on-chain fee/curve
-			// rounding keeps the real cost a hair UNDER spendable, so
-			// max_sol_cost is never exceeded.)
 			const ataRent = await ataRentLamports(connection);
 			const creatorVaultRent =
 				await connection.getMinimumBalanceForRentExemption(0);
@@ -402,7 +442,35 @@ export function LaunchPanel({
 			const reserveCv = creatorVaultInfo
 				? BigInt(0)
 				: BigInt(creatorVaultRent);
-			const buys: BuyAllocation[] = [];
+			const seed = await resolveLaunchCurveSeed(connection);
+			const fill = quotePumpFill(
+				{
+					virtualSolReserves: seed.virtualSolReserves,
+					virtualTokenReserves: seed.virtualTokenReserves,
+					realTokenReserves: seed.realTokenReserves,
+				},
+				BigInt(0),
+			);
+			// A flat 0.002 SOL headroom absorbs the per-buy 125 bps fee floor:
+			// the chained net deposits land a few lamports short of the fill, and
+			// the graduating buy takes the exact remainder.
+			const fillGross = fill.maxSolCost + BigInt(2_000_000);
+			// TEST LAUNCH replaces the fill target with one small gross buy from
+			// the creator; the fill/graduation path keeps fillGross unchanged.
+			const fillTarget = isTestLaunch
+				? TEST_LAUNCH_DEV_BUY_LAMPORTS
+				: fillGross;
+			if (isTestLaunch) {
+				log(
+					`test buy: ${(Number(fillTarget) / LAMPORTS_PER_SOL).toFixed(6)} SOL gross from the creator (curve NOT filled) -> curve stays OPEN`,
+				);
+			} else {
+				log(
+					`fill    : net ${(Number(fill.costLamports) / LAMPORTS_PER_SOL).toFixed(6)} SOL -> gross target ${(Number(fillGross) / LAMPORTS_PER_SOL).toFixed(6)} SOL`,
+				);
+			}
+			const capacities: bigint[] = [];
+			let totalCapacity = BigInt(0);
 			for (const { w, kp } of walletKps) {
 				const live = BigInt(
 					await connection.getBalance(kp.publicKey, "confirmed"),
@@ -425,14 +493,39 @@ export function LaunchPanel({
 						`dev wallet ${shortAddress(w.address, 6)} has no spendable SOL: balance ${(Number(live) / LAMPORTS_PER_SOL).toFixed(4)} SOL is below the ${(Number(reserveLamports) / LAMPORTS_PER_SOL).toFixed(4)} SOL launch reserve (0.002 SOL post-buy keep + ATA rent + creator_vault + user_volume_accumulator rent). Fund/disperse SOL to the selected dev wallets before launching.`,
 					);
 				}
-				const solIn = spendable;
-				buys.push({ wallet: kp, solInLamports: solIn });
+				capacities.push(spendable);
+				totalCapacity += spendable;
 				log(
-					`  dev ${kp.publicKey.toBase58().slice(0, 12)}... balance ${(Number(live) / LAMPORTS_PER_SOL).toFixed(4)} SOL -> buys ${(Number(solIn) / LAMPORTS_PER_SOL).toFixed(4)} SOL (keeps 0.002 SOL post-buy)`,
+					`  dev ${kp.publicKey.toBase58().slice(0, 12)}... balance ${(Number(live) / LAMPORTS_PER_SOL).toFixed(4)} SOL -> spendable ${(Number(spendable) / LAMPORTS_PER_SOL).toFixed(4)} SOL`,
+				);
+			}
+			if (!isTestLaunch && totalCapacity < fillGross) {
+				throw new Error(
+					`dev wallets can commit at most ${(Number(totalCapacity) / LAMPORTS_PER_SOL).toFixed(6)} SOL but the curve fill needs ${(Number(fillGross) / LAMPORTS_PER_SOL).toFixed(6)} SOL. Fund/disperse more SOL to the selected dev wallets (a separate, earlier tx) before launching.`,
+				);
+			}
+			// Proportional GROSS allocation; the last wallet also carries the
+			// integer-division remainder so the total reaches the target.
+			const buys: BuyAllocation[] = [];
+			let allocated = BigInt(0);
+			for (let i = 0; i < walletKps.length; i++) {
+				const isLast = i === walletKps.length - 1;
+				let budget = isLast
+					? fillTarget - allocated
+					: (capacities[i] * fillTarget) / totalCapacity;
+				if (budget > capacities[i]) budget = capacities[i];
+				if (budget < BigInt(0)) budget = BigInt(0);
+				allocated += budget;
+				buys.push({ wallet: walletKps[i].kp, solInLamports: budget });
+			}
+			for (const b of buys) {
+				log(
+					`  plan  ${b.wallet.publicKey.toBase58().slice(0, 12)}... commits ${(Number(b.solInLamports) / LAMPORTS_PER_SOL).toFixed(6)} SOL gross`,
 				);
 			}
 
-			// The creator funds ONLY the create tx. The pump.fun `create_v2`
+			// The creator funds the create tx AND the explicit MigrateV2 (the
+			// pool + LP mint + pool ATAs rent). The pump.fun `create_v2`
 			// instruction makes the creator fund the accounts it allocates,
 			// all rent-exempt:
 			//   - Token-2022 mint (~400-570B; metadata lives IN-MINT via the
@@ -443,10 +536,11 @@ export function LaunchPanel({
 			//   - mayhem_state + mayhem_token_vault: created then CLOSED
 			//     for non-mayhem tokens (net zero, but the creator must
 			//     cover their rent mid-tx) — reserved as a flat buffer
-			// The creator is ALSO the fee payer on the create tx and every
-			// packed buy tx (each dev wallet keeps its own balance for the
-			// buy and pays no tx fee at launch), so the margin includes the
-			// base fee for the create + up to one base fee per buy wallet.
+			// The creator is ALSO the fee payer on the create tx and the
+			// MigrateV2 tx, but NOT on the fill buys (each pair's first wallet
+			// pays its own fee), so the margin is the create rent + create and
+			// migrate base fees + a flat migration-rent reserve for the pool
+			// accounts the MigrateV2 creates.
 			const mintSize =
 				340 +
 				Buffer.byteLength(name, "utf8") +
@@ -468,20 +562,32 @@ export function LaunchPanel({
 					await connection.getMinimumBalanceForRentExemption(340),
 				) + // mayhem_state (ephemeral)
 				BigInt(await connection.getMinimumBalanceForRentExemption(170)); // mayhem_token_vault (ephemeral)
+			// Flat reserve for the pool + LP mint + pool ATAs the explicit
+			// MigrateV2 creates (the creator is the migrate `user`). 0.05 SOL is
+			// comfortably above the measured pool-account rent on both clusters.
+			const MIGRATE_RENT_RESERVE_LAMPORTS = BigInt(50_000_000);
 			const createMargin =
 				createRent +
 				postBuyFloorLamports() +
-				BigInt(30_000 + 5_000 * buys.length);
+				MIGRATE_RENT_RESERVE_LAMPORTS +
+				BigInt(30_000 + 5_000);
 			const creatorBal = await connection.getBalance(
 				creator.publicKey,
 				"confirmed",
 			);
+			// TEST LAUNCH has no MigrateV2 but the creator ALSO funds its own dev
+			// buy, so require the create margin plus that buy.
+			const requiredMargin =
+				createMargin +
+				(isTestLaunch ? TEST_LAUNCH_DEV_BUY_LAMPORTS : BigInt(0));
 			log(
-				`fund    : dev wallets spend their OWN SOL; creator covers the create tx only (needs >= ${(Number(createMargin) / LAMPORTS_PER_SOL).toFixed(4)} SOL)`,
+				isTestLaunch
+					? `fund    : creator covers the create tx AND its own ${(Number(fillTarget) / LAMPORTS_PER_SOL).toFixed(6)} SOL dev buy (needs >= ${(Number(requiredMargin) / LAMPORTS_PER_SOL).toFixed(4)} SOL; no MigrateV2)`
+					: `fund    : dev wallets spend their OWN SOL; creator covers the create + MigrateV2 txs (needs >= ${(Number(requiredMargin) / LAMPORTS_PER_SOL).toFixed(4)} SOL)`,
 			);
-			if (creatorBal < createMargin) {
+			if (creatorBal < requiredMargin) {
 				throw new Error(
-					`creator balance ${(Number(creatorBal) / LAMPORTS_PER_SOL).toFixed(4)} SOL too low; need >= ${(Number(createMargin) / LAMPORTS_PER_SOL).toFixed(4)} SOL for the create tx (rent + floor + fees). Dev wallets are NOT funded from the creator anymore: fund/disperse them first.`,
+					`creator balance ${(Number(creatorBal) / LAMPORTS_PER_SOL).toFixed(4)} SOL too low; need >= ${(Number(requiredMargin) / LAMPORTS_PER_SOL).toFixed(4)} SOL for the create ${isTestLaunch ? "+ own dev buy" : "+ MigrateV2"} txs (rent + floor + fees). Dev wallets are NOT funded from the creator anymore: fund/disperse them first.`,
 				);
 			}
 
@@ -527,13 +633,20 @@ export function LaunchPanel({
 				uri: finalUri,
 				buys,
 				mintKeypair,
-				// Empty-to-keep: quote the pre-fill buys with ZERO slippage so
-				// max_sol_cost = solIn = spendable and each wallet spends its
-				// full balance (ending at the flat 0.002 SOL keep), not 90.9%.
+				// ZERO slippage: the plan already sizes the fill, and the buy's
+				// max_sol_cost is the fee-grossed-up chunk cost. Any wallet
+				// headroom stays in the wallet (the program charges its
+				// curve-computed cost).
 				slippageBps: BigInt(0),
-				// No creator -> wallet funding txs: every dev wallet buys from
-				// its OWN pre-funded balance (the buildLaunchSequence default
-				// fundLamportsPerWallet = null emits no fund tx).
+				// TEST LAUNCH sets graduate: false, which keeps the final buy at
+				// its planned share (curve stays OPEN) and suppresses the
+				// MigrateV2 automatically. The normal launch keeps the default
+				// (graduate: true) and its fill-and-graduate behaviour.
+				graduate: !isTestLaunch,
+				// No creator -> wallet funding txs INSIDE the pack: every dev
+				// wallet buys from its OWN pre-funded balance (the
+				// buildLaunchSequence default fundLamportsPerWallet = null emits
+				// no fund tx). Funding is a separate, earlier tx.
 				// Byte budget: every mainnet-launch buy tx now carries its OWN
 				// Helius Sender tip transfer (~90 bytes) — sendSequentially
 				// submits through the SWQOS-only sender on mainnet — so buy
@@ -570,7 +683,7 @@ export function LaunchPanel({
 
 			if (tier === "1") {
 				log(
-					"sending launch txs sequentially (fund -> create -> buys)...",
+					"sending launch txs sequentially (create -> buys -> migrate)...",
 				);
 				// sendSequentially routes each launch tx through Helius Sender
 				// SWQOS-only on mainnet (flat 5,000-lamport tip, LAST
@@ -627,12 +740,14 @@ export function LaunchPanel({
 					.filter((r) => r.configured)
 					.map((r) => r.id);
 				let tier2Result: BundleSubmissionResult | null = null;
-				const bundleTxs = [
-					seq.fundTx,
-					seq.createTx,
-					...seq.buyTxs.map((b) => b.tx),
-				].filter((t): t is NonNullable<typeof t> => t !== null);
-				const bundleSigners = seq.signersByTx;
+				const bundlePack = await assembleLaunchBundle(connection, seq);
+				if (bundlePack.migrateDropped) {
+					log(
+						`tier 2 idempotency: canonical pool ${bundlePack.poolKey.toBase58()} already exists (curve.complete=${bundlePack.curveComplete}); dropping the MigrateV2 tx from the bundle (an atomic bundle cannot swallow its Custom: 6040 revert).`,
+					);
+				}
+				const bundleTxs = bundlePack.txs;
+				const bundleSigners = bundlePack.signersByTx;
 				// NextBlock / Astralane / bloXroute bundles cap at 4 txs
 				// (pump.fun buy ixs pack 2 wallets per tx, measured M10), so
 				// a launch over ~6 funded wallets exceeds the cap. Surface
@@ -897,6 +1012,83 @@ export function LaunchPanel({
 					log(
 						`price      : ${(Number(c.virtualSolReserves) / Number(c.virtualTokenReserves)).toFixed(6)} lamports/token`,
 					);
+					// C4 / section 4 (UI report): after graduation, print the canonical
+					// PumpSwap pool + the boost fields. The explicit MigrateV2 runs
+					// before this, so a complete curve should have the pool.
+					if (c.complete) {
+						try {
+							const [poolKey] = canonicalMigratedPoolPda(mintPk);
+							const pool = await new OnlinePumpAmmSdk(connection).fetchPool(
+								poolKey,
+							);
+							const [baseAcc, quoteAcc] = await Promise.all([
+								connection.getTokenAccountBalance(
+									pool.poolBaseTokenAccount,
+									"confirmed",
+								),
+								connection.getTokenAccountBalance(
+									pool.poolQuoteTokenAccount,
+									"confirmed",
+								),
+							]);
+							const boostAuthority = boostVaultAuthorityPda(poolKey);
+							const boostVault = boostVaultAta(
+								boostAuthority,
+								pool.quoteMint,
+								TOKEN_PROGRAM_ID,
+							);
+							let boostBalance = BigInt(0);
+							try {
+								const b = await connection.getTokenAccountBalance(
+									boostVault,
+									"confirmed",
+								);
+								boostBalance = BigInt(b.value.amount);
+							} catch {
+								// the boost vault ATA is optional/late; a missing account is
+								// not fatal (assertion 12 reports it).
+							}
+							log(`pool       : ${poolKey.toBase58()} (canonical PumpSwap)`);
+							// Section 4: the SAME assertion table the devnet runner and the
+							// offline tests print, through the same function.
+							const facts: MigratedPoolFacts = {
+								cluster: solanaNetwork(),
+								mint: mintPk,
+								curveCreator: c.creator,
+								curveComplete: c.complete,
+								pool: {
+									poolAuthority: pool.creator,
+									baseMint: pool.baseMint,
+									quoteMint: pool.quoteMint,
+									coinCreator: pool.coinCreator,
+									poolBaseTokenAccount: pool.poolBaseTokenAccount,
+									poolQuoteTokenAccount: pool.poolQuoteTokenAccount,
+									virtualQuoteReserves: BigInt(
+										pool.virtualQuoteReserves.toString(),
+									),
+									lpSupply: BigInt(pool.lpSupply.toString()),
+									isMayhemMode: pool.isMayhemMode,
+									isCashbackCoin: pool.isCashbackCoin,
+								},
+								vaultBaseRaw: BigInt(baseAcc.value.amount),
+								vaultQuoteLamports: BigInt(quoteAcc.value.amount),
+								boostVaultAuthority: boostAuthority,
+								boostAtaLamports: boostBalance,
+							};
+							log("=== pool assertions (section 4) ===");
+							for (const check of assertMigratedPool(facts, { atMigration: true })) {
+								const notEvaluated =
+									check.actual === SLOT_CHECK_NOT_EXERCISED ||
+									check.actual === LATE_READ_NOT_APPLICABLE;
+								const status = check.ok ? "ok  " : notEvaluated ? "n/a " : "FAIL";
+								log(
+									`  ${status} ${check.name}: expected=${check.expected} actual=${check.actual}`,
+								);
+							}
+						} catch (e) {
+							log(`pool report: ${errMsg(e)}`);
+						}
+					}
 				} else {
 					log("curve state: not found (create tx did not land?)");
 				}
@@ -911,6 +1103,11 @@ export function LaunchPanel({
 			} else {
 				log(
 					"metadata  : could not decode the Token-2022 in-mint metadata",
+				);
+			}
+			if (isTestLaunch) {
+				log(
+					"TEST LAUNCH: coin did NOT graduate — the curve remains OPEN and NO MigrateV2 was sent. Sell All will route through the bonding curve.",
 				);
 			}
 			log("=== launch complete ===");
@@ -977,6 +1174,11 @@ export function LaunchPanel({
 	const [sellBusy, setSellBusy] = useState(false);
 	const [sellError, setSellError] = useState<string | null>(null);
 	const [sellReport, setSellReport] = useState<SellAllReport | null>(null);
+	// STAGE 2B submit routing, no operator control: the ACTIVE Tier 2 relays
+	// are mainnet services, so a mainnet Sell All is ONE atomic relay bundle
+	// and devnet stays per-wallet (the library refuses "bundle" on a
+	// non-mainnet cluster regardless). The bundle tip payer is the library's
+	// own default: the first wallet in FOLD order.
 	const keyedCount = roster.wallets.filter((w) => w.key).length;
 
 	const handleSellAll = async () => {
@@ -999,6 +1201,13 @@ export function LaunchPanel({
 		const sigs: string[] = [];
 		try {
 			const connection = makeAppConnection();
+			// STAGE 2B: bundle on mainnet (the only cluster with relays),
+			// per-wallet on devnet (the library refuses "bundle" there).
+			// foldedFloors is passed explicitly (true is the default) so the
+			// call site is honest about the folded-floor plan the bundle order
+			// depends on.
+			const submit =
+				solanaNetwork() === "mainnet" ? "bundle" : "perWallet";
 			// M10: sellAllManagedWallets signs every sell with the roster
 			// Keypairs and hand-builds the pump.fun sell ixs itself (no anchor
 			// Program, no IDL) — only the connection + mint + roster are needed.
@@ -1007,6 +1216,8 @@ export function LaunchPanel({
 				mint: new PublicKey(mint),
 				wallets: roster.wallets,
 				slippagePct: 5,
+				submit,
+				foldedFloors: true,
 			});
 			setSellReport(report);
 			roster.refreshBalances();
@@ -1358,6 +1569,23 @@ export function LaunchPanel({
 					</div>
 				) : null}
 
+				<div className="border-t-2 border-white pt-3">
+					<label
+						className="label-mono flex cursor-pointer items-start gap-2"
+						title="create the coin and dev-buy it from the creator WITHOUT filling/graduating the curve; no MigrateV2; Sell All then routes through the bonding curve">
+						<input
+							type="checkbox"
+							checked={testLaunch}
+							onChange={(e) => setTestLaunch(e.target.checked)}
+							disabled={busy}
+						/>
+						<span>
+							TEST LAUNCH (no graduate) — create + ONE small dev
+							buy from the creator; curve stays OPEN; NO MigrateV2
+						</span>
+					</label>
+				</div>
+
 				<div className="flex flex-wrap items-center justify-between gap-2 border-t-2 border-white pt-3">
 					<div className="flex items-center gap-2">
 						<span
@@ -1402,6 +1630,18 @@ export function LaunchPanel({
 							className="flex-1">
 							{claimBusy ? "Claiming..." : "Claim Fees"}
 						</Btn>
+					</div>
+
+					{/* No submit control: a mainnet Sell All is always ONE atomic
+					relay bundle (tip paid by the first FOLD wallet), and devnet
+					is always per-wallet because every relay is a mainnet
+					service. The line below is the routing fact, not a choice. */}
+					<div className="mt-2 flex flex-wrap items-center gap-2">
+						<span className="label-mono opacity-60">
+							{solanaNetwork() === "mainnet"
+								? "SUBMIT: BUNDLE (ONE ATOMIC RELAY BUNDLE, FOLD ORDER)"
+								: "SUBMIT: PER-WALLET (NO RELAYS ON DEVNET)"}
+						</span>
 					</div>
 
 					{mint && keyedCount === 0 ? (
@@ -1450,6 +1690,9 @@ export function LaunchPanel({
 					{claimReport ? (
 						<ClaimFeesStatusView report={claimReport} />
 					) : null}
+					{sellReport ? (
+						<SellAllReportView report={sellReport} />
+					) : null}
 				</div>
 
 				{/* status log (preserved from M4) */}
@@ -1475,11 +1718,57 @@ function SellAllReportView({ report }: { report: SellAllReport }) {
 		report.route === "curve"
 			? `ROUTE: CURVE SELL (NOT GRADUATED) · creator ${shortAddress(report.creator, 6)}`
 			: `ROUTE: PUMSWAP SELL (GRADUATED) · pool ${shortAddress(report.poolKey ?? "", 6)}`;
+	const bundle = report.submit === "bundle";
+	const submitLabel = bundle
+		? `SUBMIT: BUNDLE${report.bundleRelay ? ` (relay ${report.bundleRelay})` : ""}`
+		: "SUBMIT: PER-WALLET";
+	const soldOutcomes = report.outcomes.filter((o) => o.status === "sold");
+	// The operator's pass criterion: EVERY transaction landed on the FIRST
+	// attempt. Per-wallet: no sold wallet needed a retry / re-quote. Bundle:
+	// the atomic bundle landed on its first submission attempt.
+	const retried = soldOutcomes.filter(
+		(o) => (o.attempts ?? 1) > 1 || o.retriedOnSlippage === true,
+	);
+	const firstAttemptAll =
+		report.failed === 0 &&
+		soldOutcomes.length > 0 &&
+		(bundle ? (report.bundleAttempts ?? 1) === 1 : retried.length === 0);
+	const headline =
+		report.failed > 0
+			? bundle
+				? "FIRST ATTEMPT: NO — BUNDLE DID NOT LAND"
+				: "FIRST ATTEMPT: NO — RUN FAILED"
+			: soldOutcomes.length === 0
+				? "FIRST ATTEMPT: N/A (NOTHING TO SELL)"
+				: firstAttemptAll
+					? `FIRST ATTEMPT: ALL LANDED FIRST TRY (${soldOutcomes.length} SOLD)`
+					: bundle
+						? `FIRST ATTEMPT: NO — BUNDLE NEEDED ${report.bundleAttempts ?? "?"} ATTEMPT(S)`
+						: `FIRST ATTEMPT: NO — ${retried.length} WALLET(S) NEEDED RETRIES`;
+	const bundleFailure = report.outcomes.find(
+		(o) => o.address === "bundle" && o.status === "failed",
+	);
 	return (
 		<div className="reveal-up flex flex-col gap-1 border-2 border-ink px-2 py-1.5">
 			<p className="label-mono !text-[10px] font-bold break-all">
 				{routeLabel}
 			</p>
+			<p className="label-mono !text-[10px] break-all">
+				{submitLabel}
+			</p>
+			<p className="label-mono !text-[11px] font-bold">
+				{headline}
+			</p>
+			{bundle ? (
+				<p className="label-mono !text-[10px] break-all opacity-90">
+					RELAY RESULT:{" "}
+					{report.failed === 0
+						? `${report.bundleRelay ?? "RELAY"} ACCEPTED, LANDED ON ATTEMPT ${report.bundleAttempts ?? 1}${report.bundleId ? ` · bundle ${report.bundleId}` : ""}`
+						: (bundleFailure?.reason ??
+							report.bundleNote ??
+							"BUNDLE DID NOT LAND")}
+				</p>
+			) : null}
 			<p className="label-mono !text-[11px] font-bold">
 				SOLD {report.sold}/{report.total} · SKIPPED {report.skipped} ·
 				FAILED {report.failed}
@@ -1501,12 +1790,21 @@ function SellAllReportView({ report }: { report: SellAllReport }) {
 
 function SellOutcomeRow({ outcome }: { outcome: SellOutcome }) {
 	const addr = shortAddress(outcome.address, 6);
+	const attempts = outcome.attempts ?? 1;
+	// R4/STAGE 2B: the pass criterion is visible per row — every transaction's
+	// ATTEMPTS count, plus the slippage re-quote flag when one happened.
+	const retryNote =
+		outcome.status === "sold" && outcome.retriedOnSlippage
+			? " · RE-QUOTED (SLIPPAGE)"
+			: "";
 	let body;
 	if (outcome.status === "sold") {
 		body = (
 			<span>
 				SOLD {fmtTokens(outcome.tokenSold)} TOK →{" "}
 				{formatSolLamports(outcome.solReceivedLamports)}
+				{retryNote}
+				{` · ATTEMPTS ${attempts}`}
 				{outcome.signature ? (
 					<span className="ml-1">
 						<ExplorerLink hash={outcome.signature} />
@@ -1519,7 +1817,16 @@ function SellOutcomeRow({ outcome }: { outcome: SellOutcome }) {
 			<span>SKIPPED ({outcome.reason ?? "no key / zero balance"})</span>
 		);
 	} else {
-		body = <span>FAILED ({outcome.reason ?? "error"})</span>;
+		body = (
+			<span>
+				FAILED · ATTEMPTS {attempts} ({outcome.reason ?? "error"})
+				{outcome.lastFailedSignature ? (
+					<span className="ml-1">
+						<ExplorerLink hash={outcome.lastFailedSignature} />
+					</span>
+				) : null}
+			</span>
+		);
 	}
 	return (
 		<p className="label-mono !text-[10px] break-all opacity-90">

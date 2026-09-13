@@ -52,11 +52,7 @@ import {
     parseSecretKeys,
     persistManagedWallets,
 } from '../lib/managed-wallets'
-import {
-    CANONICAL_POOL_INDEX,
-    WSOL_MINT,
-    pumpSwapPoolPda,
-} from '../lib/migrate'
+import { canonicalMigratedPoolPda } from '../lib/migrate'
 import { DECIMALS, DUST_SOL_LAMPORTS } from '../lib/params'
 import { useToasts } from './toast-stack'
 
@@ -166,10 +162,13 @@ function fmtSolValue(lamports: bigint): string {
  * approximation, never an exact quote:
  *   - NOT graduated: constant-product curve reserves,
  *     solReserve * 10^DECIMALS / tokenReserve (raw units).
- *   - GRADUATED: the migrated PumpSwap pool's actual base/quote token
- *     account balances (quoteReserve * 10^DECIMALS / baseReserve); the pool
- *     is derived from the pump.fun curve's recorded creator exactly like
- *     pump.fun's auto-migration seeded it.
+ *   - GRADUATED: the migrated PumpSwap pool's effective quote reserve
+ *     ((quote ATA balance + pool.virtualQuoteReserves) * 10^DECIMALS /
+ *     baseReserve); the pool is derived from the pump.fun curve's recorded
+ *     creator exactly like pump.fun's auto-migration seeded it. Every
+ *     reference pool carries a ~17.58 SOL virtual quote reserve on top of the
+ *     real vault (the boost leg), so pricing from the vault alone is ~20.7%
+ *     too low.
  * Returns null when the mint has no curve/pool to price against; throws on
  * transport/RPC errors so the caller can flag the balances stale.
  */
@@ -181,15 +180,10 @@ async function readSolPerTokenRaw(
     if (read.kind !== 'ok') return null
     const curve = read.curve
     if (curve.graduated) {
-        const [poolKey] = pumpSwapPoolPda(
-            CANONICAL_POOL_INDEX,
-            new PublicKey(curve.creator),
-            mint,
-            WSOL_MINT
-        )
+        const [poolKey] = canonicalMigratedPoolPda(mint)
         const poolInfo = await connection.getAccountInfo(poolKey, 'confirmed')
-        // Pool absent = migration never ran on this cluster (PumpSwap is
-        // mainnet-only), so there is nothing to price against yet.
+        // Pool absent = the token has not migrated yet, so there is nothing
+        // to price against. (PumpSwap is deployed on both clusters.)
         if (!poolInfo) return null
         const pool = await new OnlinePumpAmmSdk(connection).fetchPool(poolKey)
         const [baseAcc, quoteAcc] = await Promise.all([
@@ -205,7 +199,12 @@ async function readSolPerTokenRaw(
         const baseReserve = BigInt(baseAcc.value.amount)
         const quoteReserve = BigInt(quoteAcc.value.amount)
         if (baseReserve <= BigInt(0) || quoteReserve <= BigInt(0)) return null
-        return (quoteReserve * BigInt(10 ** DECIMALS)) / baseReserve
+        // Boost-aware: the SDK's pool carries virtualQuoteReserves ON TOP of
+        // the real vault (the AMM adds it internally on every swap). Pricing
+        // from poolQuoteTokenAccount alone is ~20.7% too low.
+        const effectiveQuoteReserve =
+            quoteReserve + BigInt(pool.virtualQuoteReserves.toString())
+        return (effectiveQuoteReserve * BigInt(10 ** DECIMALS)) / baseReserve
     }
     if (curve.solReserve <= BigInt(0) || curve.tokenReserve <= BigInt(0)) {
         return null
