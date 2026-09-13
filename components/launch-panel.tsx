@@ -157,10 +157,11 @@ const DEFAULT_TIP_SOL = (
 	DEFAULT_JITO_TIP_LAMPORTS / LAMPORTS_PER_SOL
 ).toString();
 
-/** TEST LAUNCH (no graduate): the single gross buy the creator commits in
- *  test mode. Small by design: it only needs to give the creator a non-zero
- *  token balance to sell, and it must stay far below the curve fill so the
- *  curve stays OPEN (no graduation, no MigrateV2). */
+/** TEST LAUNCH (no graduate): the gross buy the creator commits in test mode
+ *  AND the per-wallet cap for every selected dev wallet's own test buy. Small
+ *  by design: it only needs to give each wallet a non-zero token balance to
+ *  sell, and it must stay far below the curve fill so the curve stays OPEN (no
+ *  graduation, no MigrateV2). */
 const TEST_LAUNCH_DEV_BUY_LAMPORTS = BigInt(10_000_000);
 
 function errMsg(e: unknown): string {
@@ -232,10 +233,11 @@ export function LaunchPanel({
 	const [manualMetadata, setManualMetadata] = useState(false);
 	const [advancedOpen, setAdvancedOpen] = useState(false);
 	const [tier, setTier] = useState<"1" | "2">("1");
-	// TEST LAUNCH (no graduate): create + ONE small dev buy from the creator,
-	// skip the fill roster and the MigrateV2, and leave the curve OPEN so Sell
-	// All routes through the bonding curve. Explicit, always visible, OFF by
-	// default: the normal fill-and-graduate plan is untouched when it is off.
+	// TEST LAUNCH (no graduate): create + the creator's own small buy + one
+	// small buy per selected keyed dev wallet, skip the fill roster and the
+	// MigrateV2, and leave the curve OPEN so Sell All routes through the bonding
+	// curve. Explicit, always visible, OFF by default: the normal
+	// fill-and-graduate plan is untouched when it is off.
 	const [testLaunch, setTestLaunch] = useState(false);
 	const [tipSol, setTipSol] = useState(DEFAULT_TIP_SOL);
 	const [busy, setBusy] = useState(false);
@@ -316,14 +318,16 @@ export function LaunchPanel({
 			}
 			// Keyedness validated UP FRONT (before metadata is published on
 			// the backend): watch-only wallets cannot sign buys. TEST LAUNCH
-			// does not use the fill roster — it dev-buys from the creator's own
-			// wallet, so the plan is a synthetic single-wallet roster.
+			// dev-buys from EVERY selected dev wallet (plus the creator's own
+			// wallet, the reference pack's first buy), so its plan roster is the
+			// creator entry followed by the selected dev wallets.
 			const rosterForPlan = isTestLaunch
 				? [
 						{
 							address: creator.publicKey.toBase58(),
 							key: creatorKey ?? undefined,
 						},
+						...selectedWallets,
 					]
 				: selectedWallets;
 			const walletKps = rosterForPlan.map((w) => {
@@ -403,7 +407,7 @@ export function LaunchPanel({
 			);
 			if (isTestLaunch) {
 				log(
-					"TEST LAUNCH (no graduate): curve stays OPEN, NO MigrateV2, one small dev buy from the creator",
+					"TEST LAUNCH (no graduate): curve stays OPEN, NO MigrateV2, the creator's own small buy plus one small buy per selected dev wallet",
 				);
 			} else {
 				log(
@@ -455,14 +459,15 @@ export function LaunchPanel({
 			// the chained net deposits land a few lamports short of the fill, and
 			// the graduating buy takes the exact remainder.
 			const fillGross = fill.maxSolCost + BigInt(2_000_000);
-			// TEST LAUNCH replaces the fill target with one small gross buy from
-			// the creator; the fill/graduation path keeps fillGross unchanged.
+			// TEST LAUNCH replaces the fill target with one small gross buy per
+			// wallet (the creator's own buy AND the cap for each selected dev
+			// wallet); the fill/graduation path keeps fillGross unchanged.
 			const fillTarget = isTestLaunch
 				? TEST_LAUNCH_DEV_BUY_LAMPORTS
 				: fillGross;
 			if (isTestLaunch) {
 				log(
-					`test buy: ${(Number(fillTarget) / LAMPORTS_PER_SOL).toFixed(6)} SOL gross from the creator (curve NOT filled) -> curve stays OPEN`,
+					`test buy: creator's own ${(Number(fillTarget) / LAMPORTS_PER_SOL).toFixed(6)} SOL and up to ${(Number(fillTarget) / LAMPORTS_PER_SOL).toFixed(6)} SOL per selected dev wallet, each sized by its spendable capacity (curve NOT filled) -> curve stays OPEN`,
 				);
 			} else {
 				log(
@@ -471,7 +476,8 @@ export function LaunchPanel({
 			}
 			const capacities: bigint[] = [];
 			let totalCapacity = BigInt(0);
-			for (const { w, kp } of walletKps) {
+			for (let i = 0; i < walletKps.length; i++) {
+				const { w, kp } = walletKps[i];
 				const live = BigInt(
 					await connection.getBalance(kp.publicKey, "confirmed"),
 				);
@@ -488,35 +494,64 @@ export function LaunchPanel({
 					reserveCv +
 					reserveUva;
 				const spendable = live - reserveLamports;
-				if (spendable <= BigInt(0)) {
-					throw new Error(
-						`dev wallet ${shortAddress(w.address, 6)} has no spendable SOL: balance ${(Number(live) / LAMPORTS_PER_SOL).toFixed(4)} SOL is below the ${(Number(reserveLamports) / LAMPORTS_PER_SOL).toFixed(4)} SOL launch reserve (0.002 SOL post-buy keep + ATA rent + creator_vault + user_volume_accumulator rent). Fund/disperse SOL to the selected dev wallets before launching.`,
-					);
-				}
 				capacities.push(spendable);
 				totalCapacity += spendable;
 				log(
 					`  dev ${kp.publicKey.toBase58().slice(0, 12)}... balance ${(Number(live) / LAMPORTS_PER_SOL).toFixed(4)} SOL -> spendable ${(Number(spendable) / LAMPORTS_PER_SOL).toFixed(4)} SOL`,
 				);
+				if (spendable <= BigInt(0)) {
+					// TEST LAUNCH: a selected dev wallet that cannot afford a buy is
+					// reported and skipped (it simply holds no tokens). The creator
+					// entry is index 0 and is never skipped; the fill path keeps the
+					// hard error for every wallet.
+					if (isTestLaunch && i > 0) {
+						log(
+							`  skip  ${kp.publicKey.toBase58().slice(0, 12)}... cannot afford a dev buy (balance ${(Number(live) / LAMPORTS_PER_SOL).toFixed(4)} SOL is below the ${(Number(reserveLamports) / LAMPORTS_PER_SOL).toFixed(4)} SOL launch reserve); keeping it out of the plan`,
+						);
+						continue;
+					}
+					throw new Error(
+						`dev wallet ${shortAddress(w.address, 6)} has no spendable SOL: balance ${(Number(live) / LAMPORTS_PER_SOL).toFixed(4)} SOL is below the ${(Number(reserveLamports) / LAMPORTS_PER_SOL).toFixed(4)} SOL launch reserve (0.002 SOL post-buy keep + ATA rent + creator_vault + user_volume_accumulator rent). Fund/disperse SOL to the selected dev wallets before launching.`,
+					);
+				}
 			}
 			if (!isTestLaunch && totalCapacity < fillGross) {
 				throw new Error(
 					`dev wallets can commit at most ${(Number(totalCapacity) / LAMPORTS_PER_SOL).toFixed(6)} SOL but the curve fill needs ${(Number(fillGross) / LAMPORTS_PER_SOL).toFixed(6)} SOL. Fund/disperse more SOL to the selected dev wallets (a separate, earlier tx) before launching.`,
 				);
 			}
-			// Proportional GROSS allocation; the last wallet also carries the
-			// integer-division remainder so the total reaches the target.
 			const buys: BuyAllocation[] = [];
-			let allocated = BigInt(0);
-			for (let i = 0; i < walletKps.length; i++) {
-				const isLast = i === walletKps.length - 1;
-				let budget = isLast
-					? fillTarget - allocated
-					: (capacities[i] * fillTarget) / totalCapacity;
-				if (budget > capacities[i]) budget = capacities[i];
-				if (budget < BigInt(0)) budget = BigInt(0);
-				allocated += budget;
-				buys.push({ wallet: walletKps[i].kp, solInLamports: budget });
+			if (isTestLaunch) {
+				// Creator first: the reference launch pack's first buy is the
+				// creator's. Then EVERY selected dev wallet that can afford a buy
+				// gets one, capped at TEST_LAUNCH_DEV_BUY_LAMPORTS and at its own
+				// spendable capacity (the same clamp the fill path uses).
+				const creatorBudget =
+					fillTarget < capacities[0] ? fillTarget : capacities[0];
+				buys.push({ wallet: walletKps[0].kp, solInLamports: creatorBudget });
+				for (let i = 1; i < walletKps.length; i++) {
+					if (capacities[i] <= BigInt(0)) continue;
+					const budget =
+						fillTarget < capacities[i] ? fillTarget : capacities[i];
+					buys.push({
+						wallet: walletKps[i].kp,
+						solInLamports: budget,
+					});
+				}
+			} else {
+				// Proportional GROSS allocation; the last wallet also carries the
+				// integer-division remainder so the total reaches the target.
+				let allocated = BigInt(0);
+				for (let i = 0; i < walletKps.length; i++) {
+					const isLast = i === walletKps.length - 1;
+					let budget = isLast
+						? fillTarget - allocated
+						: (capacities[i] * fillTarget) / totalCapacity;
+					if (budget > capacities[i]) budget = capacities[i];
+					if (budget < BigInt(0)) budget = BigInt(0);
+					allocated += budget;
+					buys.push({ wallet: walletKps[i].kp, solInLamports: budget });
+				}
 			}
 			for (const b of buys) {
 				log(
@@ -575,14 +610,15 @@ export function LaunchPanel({
 				creator.publicKey,
 				"confirmed",
 			);
-			// TEST LAUNCH has no MigrateV2 but the creator ALSO funds its own dev
-			// buy, so require the create margin plus that buy.
+			// TEST LAUNCH has no MigrateV2 and the dev wallets fund their OWN
+			// buys, but the creator still funds its own small buy, so require the
+			// create margin plus that buy.
 			const requiredMargin =
 				createMargin +
 				(isTestLaunch ? TEST_LAUNCH_DEV_BUY_LAMPORTS : BigInt(0));
 			log(
 				isTestLaunch
-					? `fund    : creator covers the create tx AND its own ${(Number(fillTarget) / LAMPORTS_PER_SOL).toFixed(6)} SOL dev buy (needs >= ${(Number(requiredMargin) / LAMPORTS_PER_SOL).toFixed(4)} SOL; no MigrateV2)`
+					? `fund    : dev wallets spend their OWN SOL; creator covers the create tx AND its own ${(Number(fillTarget) / LAMPORTS_PER_SOL).toFixed(6)} SOL dev buy (needs >= ${(Number(requiredMargin) / LAMPORTS_PER_SOL).toFixed(4)} SOL; no MigrateV2)`
 					: `fund    : dev wallets spend their OWN SOL; creator covers the create + MigrateV2 txs (needs >= ${(Number(requiredMargin) / LAMPORTS_PER_SOL).toFixed(4)} SOL)`,
 			);
 			if (creatorBal < requiredMargin) {

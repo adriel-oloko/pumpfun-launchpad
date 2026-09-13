@@ -776,6 +776,114 @@ describe("stage ui: graduate:false keeps the curve open", () => {
     // create + the single buy, and nothing else.
     expect(seq.signersByTx.length).to.equal(2);
   });
+
+  it("test launch: 5 selected dev wallets each plan a capacity-sized buy plus the creator's own buy, with NO migrate", async () => {
+    const TEST_LAUNCH_DEV_BUY_LAMPORTS = BigInt(10_000_000);
+    /** The UI's per-wallet test-launch size: min(capacity, TEST_LAUNCH_DEV_BUY). */
+    const planBuy = (capacity: bigint) =>
+      TEST_LAUNCH_DEV_BUY_LAMPORTS < capacity
+        ? TEST_LAUNCH_DEV_BUY_LAMPORTS
+        : capacity;
+
+    // The creator's own capacity plus FIVE selected dev-wallet capacities. Two
+    // dev capacities clamp below the standard test size, so the min() is
+    // exercised rather than assumed.
+    const creatorCapacity = BigInt(30_000_000);
+    const devCapacities = [
+      BigInt(20_000_000),
+      TEST_LAUNCH_DEV_BUY_LAMPORTS,
+      BigInt(8_000_000),
+      BigInt(5_000_000),
+      BigInt(12_000_000),
+    ];
+    const creator = Keypair.generate();
+    const devWallets = devCapacities.map(() => Keypair.generate());
+
+    const creatorBudget = planBuy(creatorCapacity);
+    // Print, per dev wallet, the planned buy amount and the capacity it was
+    // sized against (the operator must see the plan before sending).
+    const devBudgets = devCapacities.map((capacity, i) => {
+      const planned = planBuy(capacity);
+      console.log(
+        `   dev wallet ${i + 1}: capacity ${capacity} lamports -> planned buy ${planned} lamports`
+      );
+      return planned;
+    });
+    expect(creatorBudget <= creatorCapacity).to.equal(true);
+    for (let i = 0; i < devBudgets.length; i++) {
+      expect(devBudgets[i] <= devCapacities[i]).to.equal(true);
+    }
+
+    // The TEST LAUNCH plan: creator first (the reference pack's first buy),
+    // then one buy per selected dev wallet. 5 selected wallets -> 5 dev buys
+    // plus the creator's own = 6.
+    const buys = [
+      { wallet: creator, solInLamports: creatorBudget },
+      ...devWallets.map((wallet, i) => ({
+        wallet,
+        solInLamports: devBudgets[i],
+      })),
+    ];
+    expect(buys.length).to.equal(6);
+
+    const seq = await launch.buildLaunchSequence({
+      connection: fakeConnection(),
+      creator,
+      name: "Test",
+      symbol: "TEST",
+      uri: "https://example.com/test.json",
+      buys,
+      mintKeypair: Keypair.generate(),
+      slippageBps: ZERO,
+      graduate: false,
+    });
+    const packed = seq.buyTxs.reduce((a, bt) => a + bt.wallets.length, 0);
+    expect(packed).to.equal(6);
+    // The curve stays OPEN: a NON-graduating launch carries NO MigrateV2.
+    expect(seq.migrateIx).to.equal(null);
+    expect(seq.migrateTx).to.equal(null);
+    // create + the packed buy txs, and no trailing creator-only migrate entry.
+    expect(seq.signersByTx.length).to.equal(1 + seq.buyTxs.length);
+  });
+
+  it("test launch: an unaffordable selected dev wallet is skipped, still NO migrate", async () => {
+    const TEST_LAUNCH_DEV_BUY_LAMPORTS = BigInt(10_000_000);
+    const planBuy = (capacity: bigint) =>
+      TEST_LAUNCH_DEV_BUY_LAMPORTS < capacity
+        ? TEST_LAUNCH_DEV_BUY_LAMPORTS
+        : capacity;
+    const creatorCapacity = BigInt(30_000_000);
+    // wallet 2 has zero spendable capacity: reported + skipped by the UI.
+    const devCapacities = [BigInt(15_000_000), BigInt(0), BigInt(9_000_000)];
+    const creator = Keypair.generate();
+    const devWallets = devCapacities.map(() => Keypair.generate());
+
+    const buys = [
+      { wallet: creator, solInLamports: planBuy(creatorCapacity) },
+      ...devCapacities.flatMap((capacity, i) =>
+        capacity <= BigInt(0)
+          ? []
+          : [{ wallet: devWallets[i], solInLamports: planBuy(capacity) }]
+      ),
+    ];
+    expect(buys.length).to.equal(3); // creator + 2 affordable dev wallets
+
+    const seq = await launch.buildLaunchSequence({
+      connection: fakeConnection(),
+      creator,
+      name: "Skip",
+      symbol: "SKIP",
+      uri: "https://example.com/skip.json",
+      buys,
+      mintKeypair: Keypair.generate(),
+      slippageBps: ZERO,
+      graduate: false,
+    });
+    expect(seq.migrateIx).to.equal(null);
+    expect(seq.migrateTx).to.equal(null);
+    const packed = seq.buyTxs.reduce((a, bt) => a + bt.wallets.length, 0);
+    expect(packed).to.equal(3);
+  });
 });
 
 // STAGE UI (PLAN-UI-SELLALL-STAGE2.md): bundle wallet PAIRING. The active Tier
