@@ -62,6 +62,7 @@ import {
   PUMP_METAPLEX_PROGRAM_ID,
   buildPumpBuyIx,
   buildPumpCreateIx,
+  buildPumpExtendAccountIx,
   pumpBondingCurvePda,
   pumpMetadataPda,
   pumpMintAuthorityPda,
@@ -93,6 +94,11 @@ export const MAX_COMPUTE_UNITS = 1_400_000;
  *  MigrateV2 (pool + ATAs + LP mint + boost CPIs) gets the manual runner's
  *  400k ceiling. */
 export const CREATE_CU_LIMIT = 150_000;
+/** CU ceiling for the FOLDED tx A (create_v2 + extend_account + the creator's
+ *  own ATA create + dev buy). The reference folded tx consumed 198,662 CU, so
+ *  CREATE_CU_LIMIT (150,000) is too low. At 1 lamport/CU this raises tx A's
+ *  priority fee from ~150,000 to ~400,000 lamports. */
+export const CREATE_BUY_CU_LIMIT = 400_000;
 export const BUY_CU_LIMIT = 250_000;
 export const MIGRATE_CU_LIMIT = 400_000;
 
@@ -169,7 +175,11 @@ export interface LaunchSequence {
   /** Funding transfers aligned 1:1 with `buys` (for sandbox pre-flights). */
   fundIxPerWallet: TransactionInstruction[] | null;
   createIx: TransactionInstruction;
-  createTx: Transaction;
+  createTx: Transaction | VersionedTransaction;
+  /** The launch ALT tx A (when folded) was compiled against; null for the
+   *  legacy create-only tx. sendSequentially needs it to re-append the Sender
+   *  tip to the V0 message. */
+  lookupTable: AddressLookupTableAccount | null;
   buyTxs: BuyTx[];
   /** Explicit pump.fun MigrateV2 (canonical pool creation) sent AFTER the
    *  fill buys, in the same slot. Signed by the creator alone. Idempotent:
@@ -195,6 +205,15 @@ export interface BuildLaunchOptions {
   uri: string;
   /** The selected dev wallets and their buy amounts. */
   buys: BuyAllocation[];
+  /** The creator's OWN dev buy, spent from the creator's own SOL and FOLDED
+   *  into tx A (quoted FIRST, before every dev-wallet chunk). When null
+   *  (default) tx A stays the legacy create-only tx and every buy is packed
+   *  as before. Requires `lookupTable`. */
+  creatorDevBuy?: { wallet: Keypair; solInLamports: bigint } | null;
+  /** The launch address lookup table. REQUIRED when `creatorDevBuy` is set
+   *  (the folded tx A is a V0 message compiled against it); ignored by the
+   *  legacy create-only path. */
+  lookupTable?: AddressLookupTableAccount | null;
   /** Optional: lamports each wallet receives from the creator (funding tx).
    *  A single value applies to every wallet; an array applies per wallet. */
   fundLamportsPerWallet?: bigint | bigint[] | null;
@@ -524,6 +543,8 @@ export async function buildLaunchSequence(
     symbol,
     uri,
     buys,
+    creatorDevBuy = null,
+    lookupTable = null,
     fundLamportsPerWallet = null,
     maxBuyTxBytes,
     tipReserveBytes,
@@ -534,18 +555,26 @@ export async function buildLaunchSequence(
     graduate = true,
   } = opts;
   if (buys.length === 0) throw new Error("at least one dev wallet buy is required");
+  if (creatorDevBuy && !lookupTable) {
+    throw new Error(
+      "lookupTable is required when creatorDevBuy is set (folded tx A is a V0 message)"
+    );
+  }
 
   // M7a fee policy: resolve the knobs once so the create tx, the fund tx and
   // every packed buy tx carry the SAME compute-unit price (env-tunable
   // lib/fees.ts default when omitted). Per-tx CU budgeting: the create tx
-  // stamps CREATE_CU_LIMIT and each buy tx stamps BUY_CU_LIMIT (measured
-  // consumption: create ~111k, buy incl. ATA create + tip ~205k). Stamping
-  // MAX_COMPUTE_UNITS on every tx made a 3-tx launch bundle reserve 4.2M CU,
-  // which Jito's cost model rejected (ExceedsCostModel -> Invalid). The fund
-  // tx is a plain transfer and gets no CU-limit ix. A caller-supplied
-  // computeUnitLimit overrides both per-tx defaults.
+  // stamps CREATE_CU_LIMIT (or CREATE_BUY_CU_LIMIT when the creator's dev buy
+  // is folded into it) and each buy tx stamps BUY_CU_LIMIT (measured
+  // consumption: create ~111k, folded create+buy ~199k, buy incl. ATA create
+  // + tip ~205k). Stamping MAX_COMPUTE_UNITS on every tx made a 3-tx launch
+  // bundle reserve 4.2M CU, which Jito's cost model rejected
+  // (ExceedsCostModel -> Invalid). The fund tx is a plain transfer and gets
+  // no CU-limit ix. A caller-supplied computeUnitLimit overrides both per-tx
+  // defaults.
   const priorityFee = priorityFeeMicroLamports ?? DEFAULT_PRIORITY_FEE_MICRO_LAMPORTS;
-  const createCuLimit = computeUnitLimit ?? CREATE_CU_LIMIT;
+  const createCuLimit =
+    computeUnitLimit ?? (creatorDevBuy ? CREATE_BUY_CU_LIMIT : CREATE_CU_LIMIT);
   const buyCuLimit = computeUnitLimit ?? BUY_CU_LIMIT;
   const migrateCuLimit = computeUnitLimit ?? MIGRATE_CU_LIMIT;
   const addFeeIxs = (tx: Transaction, cuLimit?: number): void => {
@@ -585,9 +614,6 @@ export async function buildLaunchSequence(
     symbol,
     uri,
   });
-  const createTx = new Transaction({ feePayer: creator.publicKey, blockhash: latest.blockhash, lastValidBlockHeight: 0 });
-  addFeeIxs(createTx, createCuLimit);
-  createTx.add(createIx);
 
   let fundTx: Transaction | null = null;
   let fundIx: TransactionInstruction[] | null = null;
@@ -623,13 +649,64 @@ export async function buildLaunchSequence(
   // under-buys a devnet launch by ~30x. Fall back per cluster on a failed
   // read.
   const seed = await resolveLaunchCurveSeed(connection);
-  const quotes = quoteLaunchBuys(buys, slippageBps, seed, graduate);
+  // Fold the creator's own dev buy FIRST: quote it against the fresh curve,
+  // then chain every dev-wallet chunk against the reserves its buy leaves
+  // behind. `packBuyTxs` receives `buys` WITHOUT it, so the folded buy is
+  // never packed into a buy tx. The graduating rule still lands on the LAST
+  // buy of the whole sequence (the last dev-wallet chunk).
+  const foldedAllocations: BuyAllocation[] = creatorDevBuy
+    ? [{ wallet: creatorDevBuy.wallet, solInLamports: creatorDevBuy.solInLamports }, ...buys]
+    : buys;
+  const quotes = quoteLaunchBuys(foldedAllocations, slippageBps, seed, graduate);
+  const creatorQuote = creatorDevBuy ? quotes[0] : null;
+  const buyQuotes = creatorDevBuy ? quotes.slice(1) : quotes;
+
+  let createTx: Transaction | VersionedTransaction;
+  if (creatorDevBuy && creatorQuote) {
+    // Reference tx A shape: ONE V0 message compiled against the launch ALT,
+    // carrying ComputeBudget(limit), ComputeBudget(price), create_v2,
+    // extend_account, the creator's own ATA createIdempotent, and the
+    // creator's own dev buy. The Sender tip is appended later by
+    // sendProtectedTx, still LAST. Only [creator, mint] sign it and the
+    // creator is the fee payer.
+    const extendIx = buildPumpExtendAccountIx({
+      bondingCurve: pda.curveState,
+      user: creator.publicKey,
+    });
+    const creatorBuyIxs = buildPumpBuyIx({
+      mint: mintKeypair.publicKey,
+      buyer: creator.publicKey,
+      creator: creator.publicKey,
+      feeRecipient,
+      tokensOut: creatorQuote.tokensOut,
+      maxSolCost: creatorQuote.maxSolCost,
+    });
+    const createInstructions: TransactionInstruction[] = [
+      ComputeBudgetProgram.setComputeUnitLimit({ units: createCuLimit }),
+    ];
+    if (priorityFee > 0) {
+      createInstructions.push(
+        ComputeBudgetProgram.setComputeUnitPrice({ microLamports: priorityFee })
+      );
+    }
+    createInstructions.push(createIx, extendIx, ...creatorBuyIxs);
+    const message = new TransactionMessage({
+      payerKey: creator.publicKey,
+      recentBlockhash: latest.blockhash,
+      instructions: createInstructions,
+    }).compileToV0Message([lookupTable as AddressLookupTableAccount]);
+    createTx = new VersionedTransaction(message);
+  } else {
+    createTx = new Transaction({ feePayer: creator.publicKey, blockhash: latest.blockhash, lastValidBlockHeight: 0 });
+    addFeeIxs(createTx, createCuLimit);
+    createTx.add(createIx);
+  }
 
   const buyTxs = packBuyTxs({
     creator,
     pda,
     buys,
-    quotes,
+    quotes: buyQuotes,
     feeRecipient,
     blockhash: latest.blockhash,
     maxBuyTxBytes,
@@ -682,6 +759,7 @@ export async function buildLaunchSequence(
     fundIxPerWallet,
     createIx,
     createTx,
+    lookupTable: lookupTable ?? null,
     buyTxs,
     migrateIx,
     migrateTx,
@@ -694,7 +772,9 @@ export async function buildLaunchSequence(
  *  signer lists, with the explicit MigrateV2 removed when the canonical pool
  *  already exists. */
 export interface LaunchBundlePack {
-  txs: Transaction[];
+  // Tier 2 needs a separate V0 pass: the folded create tx is a
+  // VersionedTransaction and the relay assembler below still assumes legacy.
+  txs: (Transaction | VersionedTransaction)[];
   signersByTx: Keypair[][];
   /** True when the migrate tx was dropped because the pool already existed. */
   migrateDropped: boolean;
@@ -728,7 +808,7 @@ export async function assembleLaunchBundle(
   ]);
   const poolExists = poolInfo !== null;
 
-  const txs: Transaction[] = [];
+  const txs: (Transaction | VersionedTransaction)[] = [];
   if (seq.fundTx) txs.push(seq.fundTx);
   txs.push(seq.createTx);
   for (const bt of seq.buyTxs) txs.push(bt.tx);
@@ -771,8 +851,10 @@ export function signTx(tx: Transaction, signers: Keypair[]): Transaction {
 }
 
 /** The [fund?, create, ...buys, migrate] tx list in execution order. */
-export function sequenceTxs(seq: LaunchSequence): Transaction[] {
-  const txs: Transaction[] = [];
+export function sequenceTxs(
+  seq: LaunchSequence
+): (Transaction | VersionedTransaction)[] {
+  const txs: (Transaction | VersionedTransaction)[] = [];
   if (seq.fundTx) txs.push(seq.fundTx);
   txs.push(seq.createTx);
   for (const bt of seq.buyTxs) txs.push(bt.tx);
@@ -841,22 +923,54 @@ export async function preflightLaunch(
 }> {
   const latest = await connection.getLatestBlockhash("confirmed");
 
-  // 1) create tx standalone, preceded by up to two funding transfers (the
-  //    sandbox must stay under the 1232-byte limit even for large rosters;
-  //    each buy sandbox below funds its own wallet, so a full funding sweep
-  //    is never needed here).
-  const createTx = new Transaction({
-    feePayer: seq.creator.publicKey,
-    blockhash: latest.blockhash,
-    lastValidBlockHeight: 0,
-  });
-  createTx.add(ComputeBudgetProgram.setComputeUnitLimit({ units: MAX_COMPUTE_UNITS }));
-  if (seq.fundIx) createTx.add(...seq.fundIx.slice(0, 2));
-  createTx.add(seq.createIx);
-  const create = await simulateTx(connection, createTx, [
-    seq.creator,
-    seq.mintKeypair,
-  ]);
+  // 1) tx A standalone. The FOLDED tx A is a V0 message (create_v2 +
+  //    extend_account + the creator's own ATA create + dev buy), so it is
+  //    recompiled over a fresh blockhash with the launch ALT and simulated
+  //    as a whole: the create and the creator's buy are atomic, so a
+  //    standalone simulation is exactly what lands. The LEGACY create-only
+  //    path rebuilds a legacy tx, preceded by up to two funding transfers
+  //    (the sandbox must stay under the 1232-byte limit even for large
+  //    rosters; each buy sandbox below funds its own wallet, so a full
+  //    funding sweep is never needed here). A failed simulation is a hard
+  //    error.
+  let create: SimResult;
+  if (seq.createTx instanceof VersionedTransaction) {
+    const alt = lookupTable ?? seq.lookupTable;
+    if (!alt) {
+      throw new Error(
+        "preflight: the folded create tx is V0 but no lookup table was supplied"
+      );
+    }
+    const decompiled = TransactionMessage.decompile(seq.createTx.message, {
+      addressLookupTableAccounts: [alt],
+    });
+    const message = new TransactionMessage({
+      payerKey: seq.creator.publicKey,
+      recentBlockhash: latest.blockhash,
+      instructions: decompiled.instructions,
+    }).compileToV0Message([alt]);
+    const v0 = new VersionedTransaction(message);
+    v0.sign([seq.creator, seq.mintKeypair]);
+    const r = await connection.simulateTransaction(v0);
+    create = {
+      err: r.value.err ?? null,
+      unitsConsumed: r.value.unitsConsumed ?? null,
+      logs: r.value.logs ?? null,
+    };
+  } else {
+    const createTx = new Transaction({
+      feePayer: seq.creator.publicKey,
+      blockhash: latest.blockhash,
+      lastValidBlockHeight: 0,
+    });
+    createTx.add(ComputeBudgetProgram.setComputeUnitLimit({ units: MAX_COMPUTE_UNITS }));
+    if (seq.fundIx) createTx.add(...seq.fundIx.slice(0, 2));
+    createTx.add(seq.createIx);
+    create = await simulateTx(connection, createTx, [
+      seq.creator,
+      seq.mintKeypair,
+    ]);
+  }
   if (create.err) {
     throw new Error(`preflight: create simulation failed: ${JSON.stringify(create.err)}`);
   }
@@ -1058,6 +1172,9 @@ export async function sendSequentially(
           // The launch txs carry their own setComputeUnitPrice ix (added in
           // buildLaunchSequence); sendProtectedTx must NOT prepend a second.
           skipPriorityFeeIx: true,
+          // The folded tx A is V0; sendProtectedTx needs the ALT to decompile
+          // it and re-append the Sender tip. Legacy txs ignore this.
+          lookupTable: seq.lookupTable ?? undefined,
         }
       );
       if (opts.onSignature) opts.onSignature(label, signature);

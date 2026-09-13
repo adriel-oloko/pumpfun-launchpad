@@ -33,13 +33,20 @@
 //     slippage headroom). Quotes chain across the round's wallets so each
 //     wallet quotes the state the preceding fills leave behind.
 //   - Every instruction is built by hand (lib/pump.ts); the mint's ATAs are
-//     LEGACY SPL (pump.fun mints are not Token-2022). No anchor Program, no
-//     IDL, no BN.
+//     Token-2022 (pump.fun mints are Token-2022 since `create_v2`, so the base
+//     ATA is derived with TOKEN_2022_PROGRAM_ID). No anchor Program, no IDL,
+//     no BN.
 //
-// The graduation guard lives in the scheduler (components/trade-panel.tsx):
-// before each round it fetches the curve state and stops the bot when
-// `graduated` is true. This module exposes the state read so both the Start
-// validation and each tick use the same path.
+//   - GRADUATED mints: the curve is closed (every curve buy/sell reverts), so
+//     the scheduler routes the round to the canonical PumpSwap pool instead
+//     (autoVenueFor + fireAutoBuyPool / fireAutoSellPool). The venue is chosen
+//     from the SAME curve read the scheduler already does; `complete` = 1 means
+//     the pool. The bot never stops on graduation.
+//
+// The venue gate lives in the scheduler (components/trade-panel.tsx): before
+// each round it fetches the curve state and derives the venue. This module
+// exposes the state read and the pure venue seam so both the Start validation
+// and each tick use the same path.
 //
 // Round serialization (one shared autoLockRef) lives in the trade panel, not
 // here: this module's fire functions are pure per-round workers.
@@ -50,6 +57,7 @@
 
 import {
   TOKEN_2022_PROGRAM_ID,
+  TOKEN_PROGRAM_ID,
   getAssociatedTokenAddressSync,
 } from "@solana/spl-token";
 import bs58 from "bs58";
@@ -67,6 +75,8 @@ import {
   sendAndConfirmWithRetry,
   walletTokenBalance,
 } from "./bundle/launch";
+import type { SendTx } from "./bundle/protected-send";
+import { WSOL_MINT, canonicalMigratedPoolPda } from "./migrate";
 import {
   buildPumpBuyIx,
   buildPumpSellIx,
@@ -77,6 +87,8 @@ import {
   resolvePumpFeeRecipient,
   type PumpCurveState,
 } from "./pump";
+import { sellOneWalletOnPool } from "./sell-all";
+import { buyMigratedPool } from "./swap";
 
 /** % of a wallet's spendable SOL balance bought per auto-buy round (v4's
  *  buyPct default). Configurable knob; no UI field exists for it in the AUTO
@@ -100,6 +112,11 @@ export const AUTO_TX_FEE_RESERVE_LAMPORTS: bigint = BigInt(10_000);
  *  fee. Mirrors WITHDRAW_FEE_RESERVE_LAMPORTS in lib/disperse.ts. */
 export const AUTO_SWEEP_FEE_RESERVE_LAMPORTS: bigint = BigInt(10_000);
 
+/** Slippage PERCENT (the PumpSwap SDK's 0-100 unit) the auto pool rounds pass:
+ *  the bot's existing PUMP_DEFAULT_SLIPPAGE_BPS (1000 bps = 10%), so both
+ *  venues tolerate the same adverse move. */
+export const POOL_AUTO_SLIPPAGE_PCT: number = 10;
+
 /** A live roster balance for the picker. Matches the shape useRoster keeps. */
 export interface AutoWalletBalance {
   /** Lamports; null when the last read failed (keep it out of picks). */
@@ -118,11 +135,11 @@ export interface AutoWallet {
 /** Decoded curve state for the auto engine's gates (pump.fun bonding curve;
  *  sol/token reserves are the VIRTUAL reserves the program quotes on). */
 export interface AutoCurveInfo {
-  /** Base58 creator pubkey; every buy/sell carries the creator_vault
+  /** Base58 creator pubkey; every curve buy/sell carries the creator_vault
    *  derived from it (the fee-program creator leg). */
   creator: string;
-  /** True once the curve graduated (`complete` flag); buy/sell revert and
-   *  the bot stops. */
+  /** True once the curve graduated (`complete` flag); the curve is closed and
+   *  the round routes to the canonical PumpSwap pool instead. */
   graduated: boolean;
   solReserve: bigint;
   tokenReserve: bigint;
@@ -158,6 +175,70 @@ export async function readAutoCurveState(
   const read = await readPumpCurveState(connection, mint);
   if (read.kind === "missing") return { kind: "missing" };
   return { kind: "ok", curve: toAutoCurveInfo(read.curve) };
+}
+
+/* ------------------------------------------------------------------ */
+/* Venue routing: bonding curve vs the canonical PumpSwap pool         */
+/* ------------------------------------------------------------------ */
+
+/** Which venue a round trades: the bonding curve, or the canonical PumpSwap
+ *  pool the curve migrates to at graduation. Pure: the caller passes the curve
+ *  it already read, so the route and the round cannot disagree. */
+export type AutoVenue =
+  | { kind: "curve" }
+  | { kind: "pumpSwap"; poolKey: PublicKey };
+
+/** The venue for a round, from the curve the scheduler already read: a
+ *  graduated curve (`complete` = 1) means the canonical PumpSwap pool that
+ *  replaced it; otherwise the curve. Pure (the pool PDA is derived, no RPC). */
+export function autoVenueFor(mint: PublicKey, curve: AutoCurveInfo): AutoVenue {
+  if (!curve.graduated) return { kind: "curve" };
+  return { kind: "pumpSwap", poolKey: canonicalMigratedPoolPda(mint)[0] };
+}
+
+/** Pool MAX/spendable base for one wallet: the same rule the curve worker uses
+ *  (live minus the rent floor, the tx fee reserve, and ONLY the accounts the
+ *  buy tx must create: the Token-2022 base ATA and the WSOL account the SDK
+ *  wraps into). Returns 0 when nothing is spendable. Pure. */
+export function poolSpendableForBuy(opts: {
+  liveLamports: bigint;
+  baseAtaRentLamports: bigint; // 0 when the ATA exists
+  wsolAtaRentLamports: bigint; // 0 when the WSOL ATA exists
+}): bigint {
+  const spendable =
+    opts.liveLamports -
+    BigInt(RENT_EXEMPT_FLOOR) -
+    AUTO_TX_FEE_RESERVE_LAMPORTS -
+    opts.baseAtaRentLamports -
+    opts.wsolAtaRentLamports;
+  return spendable > BigInt(0) ? spendable : BigInt(0);
+}
+
+/** The amount the buy commits: min(buyPct% of spendable, spendable / 1.10).
+ *  Pure. The cap is the curve worker's `capBuySolForSlippage` (the pool buy
+ *  commits `commit * (1 + slippage/100)` as WSOL, so the commit must leave the
+ *  10% band headroom). */
+export function poolBuyCommitLamports(
+  spendableLamports: bigint,
+  buyPct?: number
+): bigint {
+  if (spendableLamports <= BigInt(0)) return BigInt(0);
+  const pctNum = Math.round((buyPct ?? AUTO_BUY_PCT) * 100);
+  const raw = (spendableLamports * BigInt(pctNum)) / BigInt(10_000);
+  const maxCommit = capBuySolForSlippage(spendableLamports);
+  return raw > maxCommit ? maxCommit : raw;
+}
+
+/** The invariant the pool buy depends on: the SDK wraps
+ *  `commit * (1 + slippagePct/100)` as WSOL, and that must never exceed the
+ *  spendable base. Pure, exported so the offline test pins it. Reproduces the
+ *  SDK's `maxQuote = quote * floor((1 + s/100) * 1e9) / 1e9`. */
+export function poolBuyWrapLamports(
+  commitLamports: bigint,
+  slippagePct: number
+): bigint {
+  const factor = BigInt(Math.floor((1 + slippagePct / 100) * 1e9));
+  return (commitLamports * factor) / BigInt(1_000_000_000);
 }
 
 /* ------------------------------------------------------------------ */
@@ -484,6 +565,46 @@ export async function fireAutoBuy(
   return { completed, failed, skipped };
 }
 
+/** The hub sweep shared by both sell legs: measures what the sale added
+ *  (solAfter - solBefore), leaves AUTO_SWEEP_FEE_RESERVE_LAMPORTS behind for
+ *  this transfer's own fee, and sends the rest to the hub. Returns "swept" on
+ *  a confirmed transfer, "ok" when there is nothing to sweep, and
+ *  "sweepFailed" when the transfer failed (the sale itself already landed; a
+ *  sweep failure must never masquerade as a failed sell). */
+export async function sweepProceedsToHub(opts: {
+  connection: Connection;
+  wallet: Keypair;
+  hub: PublicKey;
+  solBefore: bigint;
+  send: SendTx;
+}): Promise<"swept" | "ok" | "sweepFailed"> {
+  const { connection, wallet, hub, solBefore, send } = opts;
+  try {
+    const solAfter = BigInt(
+      await connection.getBalance(wallet.publicKey, "confirmed")
+    );
+    const proceeds = solAfter - solBefore;
+    const amount = proceeds - AUTO_SWEEP_FEE_RESERVE_LAMPORTS;
+    if (amount <= BigInt(0)) return "ok";
+    const sweepTx = new Transaction({ feePayer: wallet.publicKey });
+    sweepTx.add(
+      SystemProgram.transfer({
+        fromPubkey: wallet.publicKey,
+        toPubkey: hub,
+        lamports: Number(amount),
+      })
+    );
+    await send(connection, sweepTx, [wallet], {
+      attempts: 2,
+      confirmTimeoutMs: AUTO_CONFIRM_TIMEOUT_MS,
+      label: "auto sell sweep",
+    });
+    return "swept";
+  } catch {
+    return "sweepFailed";
+  }
+}
+
 export interface FireAutoSellOptions {
   connection: Connection;
   mint: PublicKey;
@@ -596,36 +717,18 @@ export async function fireAutoSell(
         // The sale landed. Now sweep its proceeds to the hub (only what the
         // sale added: solAfter - solBefore, leaving a fee reserve behind for
         // this sweep's own transfer fee so the wallet keeps its pre-sale
-        // balance and stays rent-exempt).
+        // balance and stays rent-exempt). A failed sweep must not masquerade
+        // as a failed sell (which the engine never re-fires), so it is
+        // reported separately for a manual Withdraw of that row.
         if (hubDest === null || solBefore === null) return "ok";
         if (hubDest.equals(kp.publicKey)) return "ok";
-        try {
-          const solAfter = BigInt(
-            await connection.getBalance(kp.publicKey, "confirmed")
-          );
-          const proceeds = solAfter - solBefore;
-          const amount = proceeds - AUTO_SWEEP_FEE_RESERVE_LAMPORTS;
-          if (amount <= BigInt(0)) return "ok";
-          const sweepTx = new Transaction({ feePayer: kp.publicKey });
-          sweepTx.add(
-            SystemProgram.transfer({
-              fromPubkey: kp.publicKey,
-              toPubkey: hubDest,
-              lamports: Number(amount),
-            })
-          );
-          await send(connection, sweepTx, [kp], {
-            attempts: 2,
-            confirmTimeoutMs: AUTO_CONFIRM_TIMEOUT_MS,
-            label: "auto sell sweep",
-          });
-          return "swept";
-        } catch {
-          // The sale is done; a failed sweep must not masquerade as a failed
-          // sell (which the engine never re-fires). Report it separately so
-          // the operator can Withdraw that row manually.
-          return "sweepFailed";
-        }
+        return sweepProceedsToHub({
+          connection,
+          wallet: kp,
+          hub: hubDest,
+          solBefore,
+          send,
+        });
       }
     )
   );
@@ -649,6 +752,222 @@ export async function fireAutoSell(
       }
     } else {
       failed += 1;
+    }
+  }
+  return { completed, failed, skipped, swept, sweepFailed };
+}
+
+/* ------------------------------------------------------------------ */
+/* Round execution on the migrated PumpSwap venue                      */
+/* ------------------------------------------------------------------ */
+
+export interface FireAutoBuyPoolOptions {
+  connection: Connection;
+  mint: PublicKey;
+  poolKey: PublicKey;
+  wallets: AutoWallet[];
+  /** % of the wallet's spendable SOL balance to buy (default 95). */
+  buyPct?: number;
+  /** MIN SOL gate enforced again on the LIVE balance at fire time. */
+  minSolLamports: bigint;
+}
+
+/**
+ * Fires one auto-buy round on the migrated PumpSwap pool: every picked wallet
+ * buys `buyPct`% of its own pool-spendable SOL as its own signed tx,
+ * concurrently. The spendable base keeps the rent-exempt floor, the fee
+ * margin, and ONLY the rents the buy tx must actually create (the Token-2022
+ * base ATA and the WSOL account the SDK wraps into), so the tx is always
+ * landable. Skipped = live balance under MIN SOL, no spendable base, or a
+ * commit that floors to zero; failed = a build/send/confirm error. Completed =
+ * confirmed on-chain. Buy rounds never sweep.
+ */
+export async function fireAutoBuyPool(
+  opts: FireAutoBuyPoolOptions
+): Promise<AutoRoundResult> {
+  const { connection, mint, poolKey, wallets, minSolLamports } = opts;
+  const buyPct = opts.buyPct ?? AUTO_BUY_PCT;
+  if (wallets.length === 0) {
+    return { completed: 0, failed: 0, skipped: 0 };
+  }
+  // Rents of the two accounts the buy tx creates when missing: the Token-2022
+  // base ATA (170 bytes) and the WSOL account (165 bytes; the SDK creates and
+  // closes it inside the same tx, so its rent comes back). Read once per round
+  // from the live Rent sysvar, exactly like the curve worker's ataRent.
+  const [baseAtaRent, wsolAtaRent] = await Promise.all([
+    connection.getMinimumBalanceForRentExemption(170, "confirmed"),
+    connection.getMinimumBalanceForRentExemption(165, "confirmed"),
+  ]);
+  const results = await Promise.allSettled(
+    wallets.map(async (w): Promise<"ok" | "skipped"> => {
+      const kp = Keypair.fromSecretKey(bs58.decode(w.key));
+      const live = BigInt(
+        await connection.getBalance(kp.publicKey, "confirmed")
+      );
+      // MIN SOL enforced on the live balance (a stale poll must not fire).
+      if (live < minSolLamports) return "skipped";
+      // Reserve each missing ATA's rent (the base ATA is created on demand;
+      // the WSOL account is created + closed by the SDK inside the buy tx).
+      const baseAta = getAssociatedTokenAddressSync(
+        mint,
+        kp.publicKey,
+        false,
+        TOKEN_2022_PROGRAM_ID
+      );
+      const wsolAta = getAssociatedTokenAddressSync(
+        WSOL_MINT,
+        kp.publicKey,
+        false,
+        TOKEN_PROGRAM_ID
+      );
+      const [baseInfo, wsolInfo] = await Promise.all([
+        connection.getAccountInfo(baseAta, "confirmed"),
+        connection.getAccountInfo(wsolAta, "confirmed"),
+      ]);
+      const spendable = poolSpendableForBuy({
+        liveLamports: live,
+        baseAtaRentLamports: baseInfo ? BigInt(0) : BigInt(baseAtaRent),
+        wsolAtaRentLamports: wsolInfo ? BigInt(0) : BigInt(wsolAtaRent),
+      });
+      const commit = poolBuyCommitLamports(spendable, buyPct);
+      if (commit <= BigInt(0)) return "skipped";
+      await buyMigratedPool({
+        connection,
+        poolKey,
+        buyer: kp,
+        quoteLamports: commit,
+        slippagePct: POOL_AUTO_SLIPPAGE_PCT,
+      });
+      return "ok";
+    })
+  );
+  let completed = 0;
+  let failed = 0;
+  let skipped = 0;
+  for (const r of results) {
+    if (r.status === "fulfilled" && r.value === "ok") completed += 1;
+    else if (r.status === "fulfilled") skipped += 1;
+    else failed += 1;
+  }
+  return { completed, failed, skipped };
+}
+
+export interface FireAutoSellPoolOptions {
+  connection: Connection;
+  mint: PublicKey;
+  poolKey: PublicKey;
+  wallets: AutoWallet[];
+  /** % of each wallet's OWN holdings to sell (default 100). */
+  sellPct?: number;
+  /** Base58 address of the hub wallet (the FIRST roster wallet). When set,
+   *  every wallet whose sell CONFIRMS sweeps the sale's SOL proceeds to it in
+   *  a follow-up wallet-signed transfer. When unset the proceeds stay in the
+   *  seller. */
+  hub?: string;
+}
+
+/**
+ * Fires one auto-sell round on the migrated PumpSwap pool: every picked wallet
+ * sells `sellPct`% of its OWN live balance through Sell All's per-wallet pool
+ * leg (sellOneWalletOnPool), concurrently. That leg re-quotes the live pool
+ * per attempt and owns the retry policy, so this worker adds no folded floors:
+ * the round is small and the next round retries. Skipped = zero/unreadable
+ * balance or a % that floors to zero; failed = a build/send/confirm error that
+ * survived the leg's budgets. When `hub` is set, a confirmed sell's proceeds
+ * are swept with sweepProceedsToHub; a sweep failure is reported via
+ * `sweepFailed`, never as a failed sell.
+ */
+export async function fireAutoSellPool(
+  opts: FireAutoSellPoolOptions
+): Promise<AutoRoundResult> {
+  const { connection, mint, poolKey, wallets } = opts;
+  const sellPct = opts.sellPct ?? AUTO_SELL_PCT;
+  if (wallets.length === 0) {
+    return { completed: 0, failed: 0, skipped: 0, swept: 0, sweepFailed: 0 };
+  }
+  // Guard rail BEFORE any network call (a sell of nothing is a no-op, not a
+  // report): the scheduler can never arm a zero/absurd pct round.
+  if (!Number.isFinite(sellPct) || sellPct <= 0 || sellPct > 100) {
+    throw new Error(
+      `sellPct ${sellPct} is outside the allowed range (0, 100] (a sell of nothing is a no-op, not a report)`
+    );
+  }
+  // Pre-flight the pool once: a mint that reports graduated without a pool
+  // behind it fails with ONE clean error instead of N wallet-side failures.
+  const poolInfo = await connection.getAccountInfo(poolKey, "confirmed");
+  if (!poolInfo) {
+    throw new Error(
+      `PUMPSWAP POOL ${poolKey.toBase58()} NOT FOUND (NOT MIGRATED?)`
+    );
+  }
+  // The hub sweep destination: parse once for the round; an unparseable
+  // address disables the sweep (the sells themselves still run).
+  let hubPk: PublicKey | null = null;
+  if (opts.hub) {
+    try {
+      hubPk = new PublicKey(opts.hub);
+    } catch {
+      hubPk = null;
+    }
+  }
+  // Plain raw-RPC send (sendAndConfirmWithRetry), same as the curve leg.
+  const send = sendAndConfirmWithRetry;
+  const results = await Promise.allSettled(
+    wallets.map(
+      async (
+        w
+      ): Promise<"ok" | "skipped" | "failed" | "swept" | "sweepFailed"> => {
+        const kp = Keypair.fromSecretKey(bs58.decode(w.key));
+        // Per-worker const so TS narrows past the null checks below.
+        const hubDest = hubPk;
+        const sweep = hubDest !== null && !hubDest.equals(kp.publicKey);
+        // Pre-sale balance, only when a hub sweep is armed and the seller is
+        // not the hub itself (the proceeds are the wallet's balance delta
+        // across the sell).
+        const solBefore = sweep
+          ? BigInt(await connection.getBalance(kp.publicKey, "confirmed"))
+          : null;
+        const outcome = await sellOneWalletOnPool({
+          connection,
+          mint,
+          poolKey,
+          wallet: kp,
+          sellPct,
+          slippagePct: POOL_AUTO_SLIPPAGE_PCT,
+        });
+        if (outcome.status === "skipped") return "skipped";
+        if (outcome.status === "failed") return "failed";
+        if (hubDest === null || solBefore === null) return "ok";
+        return sweepProceedsToHub({
+          connection,
+          wallet: kp,
+          hub: hubDest,
+          solBefore,
+          send,
+        });
+      }
+    )
+  );
+  let completed = 0;
+  let failed = 0;
+  let skipped = 0;
+  let swept = 0;
+  let sweepFailed = 0;
+  for (const r of results) {
+    if (r.status !== "fulfilled") {
+      failed += 1;
+      continue;
+    }
+    if (r.value === "skipped") skipped += 1;
+    else if (r.value === "failed") failed += 1;
+    else if (r.value === "swept") {
+      completed += 1;
+      swept += 1;
+    } else if (r.value === "sweepFailed") {
+      completed += 1;
+      sweepFailed += 1;
+    } else {
+      completed += 1;
     }
   }
   return { completed, failed, skipped, swept, sweepFailed };

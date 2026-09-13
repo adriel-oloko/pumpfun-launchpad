@@ -19,8 +19,19 @@
 // (0-100), never the basis points lib/pump.ts quotes use.
 
 import { BN } from "@coral-xyz/anchor";
-import { OnlinePumpAmmSdk, PumpAmmSdk } from "@pump-fun/pump-swap-sdk";
-import { Connection, Keypair, PublicKey, Transaction } from "@solana/web3.js";
+import {
+  OnlinePumpAmmSdk,
+  PumpAmmSdk,
+  sellBaseInput as quoteSellBaseInput,
+  type SwapSolanaState,
+} from "@pump-fun/pump-swap-sdk";
+import {
+  Connection,
+  Keypair,
+  PublicKey,
+  Transaction,
+  TransactionInstruction,
+} from "@solana/web3.js";
 import { walletTokenBalance } from "./bundle/launch";
 import { sendRawWithRetry } from "./migrate";
 
@@ -50,6 +61,42 @@ export interface MigratedSellResult {
    *  fee; the SDK closes the intermediate WSOL account, so the proceeds are
    *  native SOL). */
   solReceivedLamports: bigint;
+}
+
+/**
+ * The percent-derived min-out floor for a pool sell, from a swap state the
+ * caller has ALREADY read (pure math, no RPC). Every explicit-min caller (the
+ * stage-2 fold plan) takes `min(folded, this)` so an explicit floor can only
+ * ever LOOSEN the trade:
+ *
+ * measured on a live pool 2026-09-13, the fold's deliberately conservative fee
+ * model came out 1 lamport MORE optimistic than the SDK's own quote for the
+ * same balance, which made the folded floor 1 lamport TIGHTER than the floor
+ * the percent path would have used: enough to revert a sell that would
+ * otherwise have landed. Taking the looser of the two makes "an explicit floor
+ * is never tighter than the percent floor" true by construction instead of by
+ * arithmetic luck.
+ */
+export function poolPercentFloor(
+  state: SwapSolanaState,
+  baseAmount: bigint,
+  slippagePct: number
+): bigint {
+  return BigInt(
+    quoteSellBaseInput({
+      base: new BN(baseAmount.toString()),
+      slippage: slippagePct,
+      baseReserve: state.poolBaseAmount,
+      quoteReserve: state.poolQuoteAmount,
+      virtualQuoteReserves: state.pool.virtualQuoteReserves,
+      globalConfig: state.globalConfig,
+      baseMintAccount: state.baseMintAccount,
+      baseMint: state.pool.baseMint,
+      coinCreator: state.pool.coinCreator,
+      creator: state.pool.creator,
+      feeConfig: state.feeConfig,
+    }).minQuote.toString()
+  );
 }
 
 /**
@@ -130,8 +177,9 @@ export async function sellMigratedPool(opts: {
    *  slippagePct derivation when present. The SDK quotes in percent, so a
    *  FOLDED floor cannot be expressed as one; `sellInstructions` is the same
    *  builder `sellBaseInput` funnels into, only with the min-out handed in
-   *  directly. The caller guarantees it is not tighter than the percent path
-   *  would have produced. */
+   *  directly. This call takes the LOOSER of the handed-in floor and the
+   *  percent floor (poolPercentFloor), so an explicit floor can only ever
+   *  loosen the trade, never tighten it. */
   minOutLamports?: bigint;
 }): Promise<MigratedSellResult> {
   const {
@@ -154,18 +202,18 @@ export async function sellMigratedPool(opts: {
   const beforeSol = BigInt(
     await connection.getBalance(seller.publicKey, "confirmed")
   );
-  const ixs =
-    minOutLamports === undefined
-      ? await sdk.sellBaseInput(
-          state,
-          new BN(baseAmount.toString()),
-          slippagePct
-        )
-      : await sdk.sellInstructions(
-          state,
-          new BN(baseAmount.toString()),
-          new BN(minOutLamports.toString())
-        );
+  const base = new BN(baseAmount.toString());
+  let ixs: TransactionInstruction[];
+  if (minOutLamports === undefined) {
+    ixs = await sdk.sellBaseInput(state, base, slippagePct);
+  } else {
+    // The explicit (folded) floor may only ever LOOSEN the trade: see
+    // poolPercentFloor for why the fold's own floor can come out a lamport
+    // TIGHTER than the percent path.
+    const percentFloor = poolPercentFloor(state, baseAmount, slippagePct);
+    const floor = minOutLamports < percentFloor ? minOutLamports : percentFloor;
+    ixs = await sdk.sellInstructions(state, base, new BN(floor.toString()));
+  }
   const tx = new Transaction({ feePayer: seller.publicKey });
   tx.add(...ixs);
   const signature = await sendRawWithRetry(connection, tx, [seller], {

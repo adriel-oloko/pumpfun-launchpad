@@ -265,6 +265,9 @@ export const PUMP_BUY_DISCRIMINATOR: number[] = [
 export const PUMP_SELL_DISCRIMINATOR: number[] = [
   51, 230, 133, 164, 1, 127, 131, 173, // 0x33e685a4017f83ad
 ];
+export const PUMP_EXTEND_ACCOUNT_DISCRIMINATOR: number[] = [
+  234, 102, 194, 203, 150, 72, 62, 229, // 0xea66c2cb96483ee5 = sha256("global:extend_account")[0:8]
+];
 
 /* ------------------------------------------------------------------ */
 /* Little helpers (ES2017-safe encoders)                               */
@@ -811,6 +814,38 @@ export function buildPumpCreateIx(opts: {
     keys,
     programId: PUMP_PROGRAM_ID,
     data,
+  });
+}
+
+/**
+ * Builds the pump.fun `extend_account` instruction (no args; 8 data bytes).
+ * The five IDL accounts, exact order:
+ *   account          the account being extended (the BONDING CURVE in the
+ *                    reference launches' tx A),
+ *   user             the signer (the creator),
+ *   system_program, event_authority, program.
+ * `create_v2` on the upgraded program only allocates the small curve
+ * account, so the reference's first tx extends it in the same transaction.
+ */
+export function buildPumpExtendAccountIx(opts: {
+  bondingCurve: PublicKey;
+  user: PublicKey;
+}): TransactionInstruction {
+  const { bondingCurve, user } = opts;
+  const keys = [
+    { pubkey: bondingCurve, isSigner: false, isWritable: true },
+    // The IDL marks `user` WRITABLE (it pays the extension rent); the creator
+    // is also the fee payer, so a read-only meta would still compile, which is
+    // exactly why the flag is asserted in tests/launch-fill-plan.ts.
+    { pubkey: user, isSigner: true, isWritable: true },
+    { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
+    { pubkey: PUMP_EVENT_AUTHORITY, isSigner: false, isWritable: false },
+    { pubkey: PUMP_PROGRAM_ID, isSigner: false, isWritable: false },
+  ];
+  return new TransactionInstruction({
+    keys,
+    programId: PUMP_PROGRAM_ID,
+    data: Buffer.from(PUMP_EXTEND_ACCOUNT_DISCRIMINATOR),
   });
 }
 

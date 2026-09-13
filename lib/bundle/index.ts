@@ -20,7 +20,8 @@
 //                 sequentially through the same-origin proxy
 //                 (submitBundleViaFanoutWithRetry); drop-in for
 //                 submitWithRetry with the same BundleSubmissionResult.
-//   lookup.ts   - address-lookup-table helpers for the preflight sandbox.
+//   lookup.ts   - address-lookup-table helpers for the preflight sandbox AND
+//                 the folded V0 launch tx A.
 //
 // Tier 2 order (RELAY_ORDER): nextblock -> astralane -> bloxroute. Jito is
 // NOT in the active order; it is kept as legacy compatibility (diagnostic

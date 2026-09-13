@@ -63,11 +63,16 @@
 // and ALL M4 launch logic are preserved unchanged.
 
 import {
+	ComputeBudgetProgram,
 	Keypair,
 	LAMPORTS_PER_SOL,
 	PublicKey,
 	SystemProgram,
+	TransactionMessage,
+	VersionedTransaction,
 	type Connection,
+	type Transaction,
+	type TransactionInstruction,
 } from "@solana/web3.js";
 import bs58 from "bs58";
 import { useCallback, useEffect, useMemo, useState } from "react";
@@ -75,6 +80,7 @@ import {
 	assembleLaunchBundle,
 	ataRentLamports,
 	buildLaunchSequence,
+	CREATE_BUY_CU_LIMIT,
 	ensurePumpLookupTable,
 	holderCount,
 	postBuyFloorLamports,
@@ -110,6 +116,10 @@ import {
 	type CreatorClaimReport,
 } from "../lib/claim-creator-fee";
 import {
+	PUMP_BUY_DISCRIMINATOR,
+	PUMP_CREATE_V2_DISCRIMINATOR,
+	PUMP_EXTEND_ACCOUNT_DISCRIMINATOR,
+	PUMP_PROGRAM_ID,
 	pumpCreatorVaultPda,
 	pumpUserVolumeAccumulatorPda,
 	quotePumpFill,
@@ -167,6 +177,27 @@ const TEST_LAUNCH_DEV_BUY_LAMPORTS = BigInt(10_000_000);
 function errMsg(e: unknown): string {
 	if (e instanceof Error) return e.message;
 	return String(e);
+}
+
+/** Human label for one tx-A instruction (the fold's fixed shape: CB limit,
+ *  CB price, create_v2, extend_account, ATA createIdempotent, buy). */
+function txAIxLabel(ix: TransactionInstruction): string {
+	const data = Buffer.from(ix.data);
+	if (ix.programId.equals(ComputeBudgetProgram.programId)) {
+		if (data[0] === 2) return "CB setComputeUnitLimit";
+		if (data[0] === 3) return "CB setComputeUnitPrice";
+		return "ComputeBudget";
+	}
+	if (ix.programId.equals(PUMP_PROGRAM_ID)) {
+		const disc = data.subarray(0, 8);
+		if (disc.equals(Buffer.from(PUMP_CREATE_V2_DISCRIMINATOR)))
+			return "create_v2";
+		if (disc.equals(Buffer.from(PUMP_EXTEND_ACCOUNT_DISCRIMINATOR)))
+			return "extend_account";
+		if (disc.equals(Buffer.from(PUMP_BUY_DISCRIMINATOR))) return "buy";
+		return "pump";
+	}
+	return "ATA createIdempotent";
 }
 
 /** Bounded on-chain wait for the launch's FRESH mint account to appear
@@ -239,6 +270,10 @@ export function LaunchPanel({
 	// curve. Explicit, always visible, OFF by default: the normal
 	// fill-and-graduate plan is untouched when it is off.
 	const [testLaunch, setTestLaunch] = useState(false);
+	// Creator dev buy (fill path): folded into tx A, quoted FIRST against the
+	// fresh curve, spent from the creator's own SOL. Default 0.05 SOL (the
+	// StonkHouse shape); operator-editable.
+	const [creatorDevBuySol, setCreatorDevBuySol] = useState("0.05");
 	const [tipSol, setTipSol] = useState(DEFAULT_TIP_SOL);
 	const [busy, setBusy] = useState(false);
 	const [statusLines, setStatusLines] = useState<string[]>([]);
@@ -291,6 +326,21 @@ export function LaunchPanel({
 			);
 		}
 		return lamports;
+	};
+
+	/** Parses the creator dev buy field (SOL) into lamports. Empty or 0 means
+	 *  "no creator buy": tx A stays the legacy create-only tx and every buy is
+	 *  packed as before. */
+	const parseCreatorDevBuyLamports = (): bigint => {
+		const raw = creatorDevBuySol.trim();
+		if (raw === "") return BigInt(0);
+		const n = Number(raw);
+		if (!Number.isFinite(n) || n < 0) {
+			throw new Error(
+				`creator dev buy must be a non-negative SOL amount, got "${raw}"`,
+			);
+		}
+		return BigInt(Math.round(n * LAMPORTS_PER_SOL));
 	};
 
 	const handleLaunch = async () => {
@@ -465,13 +515,34 @@ export function LaunchPanel({
 			const fillTarget = isTestLaunch
 				? TEST_LAUNCH_DEV_BUY_LAMPORTS
 				: fillGross;
+			// The creator's OWN dev buy is FOLDED into tx A. On the fill path it
+			// is the operator's input; the test path keeps its fixed small test
+			// buy. It is quoted FIRST and, on the fill path, subtracted from the
+			// dev-wallet target so the sequence still reaches the curve fill.
+			const creatorDevBuyLamports = parseCreatorDevBuyLamports();
+			const devFillTarget = isTestLaunch
+				? fillTarget
+				: fillGross - creatorDevBuyLamports;
 			if (isTestLaunch) {
 				log(
 					`test buy: creator's own ${(Number(fillTarget) / LAMPORTS_PER_SOL).toFixed(6)} SOL and up to ${(Number(fillTarget) / LAMPORTS_PER_SOL).toFixed(6)} SOL per selected dev wallet, each sized by its spendable capacity (curve NOT filled) -> curve stays OPEN`,
 				);
 			} else {
+				if (creatorDevBuyLamports <= BigInt(0)) {
+					throw new Error(
+						"creator dev buy must be > 0 on the fill path: enter the creator's own dev buy in the Advanced section (default 0.05 SOL).",
+					);
+				}
+				if (devFillTarget <= BigInt(0)) {
+					throw new Error(
+						`creator dev buy ${(Number(creatorDevBuyLamports) / LAMPORTS_PER_SOL).toFixed(6)} SOL already covers the ${(Number(fillGross) / LAMPORTS_PER_SOL).toFixed(6)} SOL fill gross; lower it so the selected dev wallets carry the remainder.`,
+					);
+				}
 				log(
 					`fill    : net ${(Number(fill.costLamports) / LAMPORTS_PER_SOL).toFixed(6)} SOL -> gross target ${(Number(fillGross) / LAMPORTS_PER_SOL).toFixed(6)} SOL`,
+				);
+				log(
+					`creator : dev buy ${(Number(creatorDevBuyLamports) / LAMPORTS_PER_SOL).toFixed(6)} SOL gross (folded into tx A, quoted FIRST; dev wallets carry the remaining ${(Number(devFillTarget) / LAMPORTS_PER_SOL).toFixed(6)} SOL gross)`,
 				);
 			}
 			const capacities: bigint[] = [];
@@ -515,12 +586,17 @@ export function LaunchPanel({
 					);
 				}
 			}
-			if (!isTestLaunch && totalCapacity < fillGross) {
+			if (!isTestLaunch && totalCapacity < devFillTarget) {
 				throw new Error(
-					`dev wallets can commit at most ${(Number(totalCapacity) / LAMPORTS_PER_SOL).toFixed(6)} SOL but the curve fill needs ${(Number(fillGross) / LAMPORTS_PER_SOL).toFixed(6)} SOL. Fund/disperse more SOL to the selected dev wallets (a separate, earlier tx) before launching.`,
+					`dev wallets can commit at most ${(Number(totalCapacity) / LAMPORTS_PER_SOL).toFixed(6)} SOL but their share of the fill is ${(Number(devFillTarget) / LAMPORTS_PER_SOL).toFixed(6)} SOL (the creator's own dev buy covers the rest). Fund/disperse more SOL to the selected dev wallets (a separate, earlier tx) before launching.`,
 				);
 			}
 			const buys: BuyAllocation[] = [];
+			// The folded creator buy (null when the operator set it to 0).
+			let creatorDevBuy: {
+				wallet: Keypair;
+				solInLamports: bigint;
+			} | null = null;
 			if (isTestLaunch) {
 				// Creator first: the reference launch pack's first buy is the
 				// creator's. Then EVERY selected dev wallet that can afford a buy
@@ -528,7 +604,10 @@ export function LaunchPanel({
 				// spendable capacity (the same clamp the fill path uses).
 				const creatorBudget =
 					fillTarget < capacities[0] ? fillTarget : capacities[0];
-				buys.push({ wallet: walletKps[0].kp, solInLamports: creatorBudget });
+				creatorDevBuy = {
+					wallet: walletKps[0].kp,
+					solInLamports: creatorBudget,
+				};
 				for (let i = 1; i < walletKps.length; i++) {
 					if (capacities[i] <= BigInt(0)) continue;
 					const budget =
@@ -539,19 +618,31 @@ export function LaunchPanel({
 					});
 				}
 			} else {
-				// Proportional GROSS allocation; the last wallet also carries the
-				// integer-division remainder so the total reaches the target.
+				// Proportional GROSS allocation of the DEV share; the last wallet
+				// also carries the integer-division remainder so the dev total
+				// reaches its target.
 				let allocated = BigInt(0);
 				for (let i = 0; i < walletKps.length; i++) {
 					const isLast = i === walletKps.length - 1;
 					let budget = isLast
-						? fillTarget - allocated
-						: (capacities[i] * fillTarget) / totalCapacity;
+						? devFillTarget - allocated
+						: (capacities[i] * devFillTarget) / totalCapacity;
 					if (budget > capacities[i]) budget = capacities[i];
 					if (budget < BigInt(0)) budget = BigInt(0);
 					allocated += budget;
 					buys.push({ wallet: walletKps[i].kp, solInLamports: budget });
 				}
+				if (creatorDevBuyLamports > BigInt(0)) {
+					creatorDevBuy = {
+						wallet: creator,
+						solInLamports: creatorDevBuyLamports,
+					};
+				}
+			}
+			if (creatorDevBuy) {
+				log(
+					`  plan  creator ${creatorDevBuy.wallet.publicKey.toBase58().slice(0, 12)}... commits ${(Number(creatorDevBuy.solInLamports) / LAMPORTS_PER_SOL).toFixed(6)} SOL gross (folded into tx A)`,
+				);
 			}
 			for (const b of buys) {
 				log(
@@ -610,20 +701,20 @@ export function LaunchPanel({
 				creator.publicKey,
 				"confirmed",
 			);
-			// TEST LAUNCH has no MigrateV2 and the dev wallets fund their OWN
-			// buys, but the creator still funds its own small buy, so require the
-			// create margin plus that buy.
-			const requiredMargin =
-				createMargin +
-				(isTestLaunch ? TEST_LAUNCH_DEV_BUY_LAMPORTS : BigInt(0));
+			// The creator's own dev buy is FOLDED into tx A, so it is ADDITIONAL
+			// creator spend: the margin must include it (the explicit MigrateV2
+			// reserve is already inside createMargin and only exists on the
+			// graduate path).
+			const creatorDevBuySpend = creatorDevBuy
+				? creatorDevBuy.solInLamports
+				: BigInt(0);
+			const requiredMargin = createMargin + creatorDevBuySpend;
 			log(
-				isTestLaunch
-					? `fund    : dev wallets spend their OWN SOL; creator covers the create tx AND its own ${(Number(fillTarget) / LAMPORTS_PER_SOL).toFixed(6)} SOL dev buy (needs >= ${(Number(requiredMargin) / LAMPORTS_PER_SOL).toFixed(4)} SOL; no MigrateV2)`
-					: `fund    : dev wallets spend their OWN SOL; creator covers the create + MigrateV2 txs (needs >= ${(Number(requiredMargin) / LAMPORTS_PER_SOL).toFixed(4)} SOL)`,
+				`fund    : dev wallets spend their OWN SOL; creator covers the create tx${isTestLaunch ? "" : " + MigrateV2"} AND its own ${(Number(creatorDevBuySpend) / LAMPORTS_PER_SOL).toFixed(6)} SOL dev buy (needs >= ${(Number(requiredMargin) / LAMPORTS_PER_SOL).toFixed(4)} SOL)`,
 			);
 			if (creatorBal < requiredMargin) {
 				throw new Error(
-					`creator balance ${(Number(creatorBal) / LAMPORTS_PER_SOL).toFixed(4)} SOL too low; need >= ${(Number(requiredMargin) / LAMPORTS_PER_SOL).toFixed(4)} SOL for the create ${isTestLaunch ? "+ own dev buy" : "+ MigrateV2"} txs (rent + floor + fees). Dev wallets are NOT funded from the creator anymore: fund/disperse them first.`,
+					`creator balance ${(Number(creatorBal) / LAMPORTS_PER_SOL).toFixed(4)} SOL too low; need >= ${(Number(requiredMargin) / LAMPORTS_PER_SOL).toFixed(4)} SOL for the create tx${isTestLaunch ? "" : " + MigrateV2"} + the creator's own ${(Number(creatorDevBuySpend) / LAMPORTS_PER_SOL).toFixed(6)} SOL dev buy (rent + floor + fees). Dev wallets are NOT funded from the creator anymore: fund/disperse them first.`,
 				);
 			}
 
@@ -661,6 +752,31 @@ export function LaunchPanel({
 				`vanity : mint ${mintKeypair.publicKey.toBase58()} — ADDRESS ends in "pump"`,
 			);
 
+			// The launch ALT is needed BEFORE the sequence is built: the folded
+			// tx A is a V0 message compiled against it. Reuse the cached table for
+			// this cluster (a 17-address table is ~0.005 SOL of rent, refundable
+			// only after deactivation), creating it once otherwise.
+			const ALT_CACHE_KEY = `pumpfun.pumpLookupTable.${solanaNetwork()}`;
+			let cachedAlt: string | null = null;
+			try {
+				cachedAlt = window.localStorage.getItem(ALT_CACHE_KEY);
+			} catch {
+				// storage unavailable: fall through and create a fresh table
+			}
+			const { account: lookupTable, address: altAddress } =
+				await ensurePumpLookupTable(connection, creator, cachedAlt);
+			try {
+				window.localStorage.setItem(
+					ALT_CACHE_KEY,
+					altAddress.toBase58(),
+				);
+			} catch {
+				// storage unavailable: the table still works for this launch
+			}
+			log(
+				`alt     : ${altAddress.toBase58()} (${cachedAlt === altAddress.toBase58() ? "reused" : "created"}; ~0.005 SOL rent, refundable only after deactivation)`,
+			);
+
 			const seq = await buildLaunchSequence({
 				connection,
 				creator,
@@ -668,6 +784,8 @@ export function LaunchPanel({
 				symbol,
 				uri: finalUri,
 				buys,
+				creatorDevBuy,
+				lookupTable,
 				mintKeypair,
 				// ZERO slippage: the plan already sizes the fill, and the buy's
 				// max_sol_cost is the fee-grossed-up chunk cost. Any wallet
@@ -701,14 +819,25 @@ export function LaunchPanel({
 				log(`   ${bt.wallets.length} wallets, ${bt.signedSize} bytes`);
 			}
 
-			log("preflight: simulating create + buy txs...");
-			// The create+buy sandbox overflows the 1232-byte legacy limit after
-			// pump.fun's upgrade, so the pre-flight sims use a shared address
-			// lookup table (created once, reused). Cheap on devnet.
-			const { account: lookupTable } = await ensurePumpLookupTable(
-				connection,
-				creator,
-			);
+			// tx A shape: the folded V0 (or the legacy create-only tx when the
+			// creator dev buy is 0). Log the instruction list, the serialized
+			// size and the CU ceiling it stamps.
+			if (seq.createTx instanceof VersionedTransaction) {
+				const msg = TransactionMessage.decompile(seq.createTx.message, {
+					addressLookupTableAccounts: [lookupTable],
+				});
+				log(
+					`tx A    : [${msg.instructions.map(txAIxLabel).join(", ")}] ${seq.createTx.serialize().length} bytes, CU limit ${CREATE_BUY_CU_LIMIT}`,
+				);
+			} else {
+				const legacyBytes =
+					seq.createTx.serializeMessage().length + 1 + 64 * 2;
+				log(
+					`tx A    : [${seq.createTx.instructions.map(txAIxLabel).join(", ")}] ~${legacyBytes} bytes (legacy create-only; creator dev buy = 0)`,
+				);
+			}
+
+			log("preflight: simulating tx A + buy txs...");
 			const pre = await preflightLaunch(connection, seq, lookupTable);
 			log(`   create: ${pre.create.unitsConsumed} CU, ok`);
 			for (const c of pre.buyChunks) {
@@ -857,8 +986,11 @@ export function LaunchPanel({
 					// signed base64 variants leave this page. Each attempt
 					// re-assembles with a fresh blockhash at the same tip
 					// (safe: a landed create makes later attempts revert).
+					// Tier 2 needs a separate V0 pass: the folded tx A is a
+					// VersionedTransaction, but the relay assembler still takes
+					// legacy txs (Tier 2 is unreachable today).
 					tier2Result = await submitBundleViaFanoutWithRetry({
-						txs: bundleTxs,
+						txs: bundleTxs as Transaction[],
 						signersByTx: bundleSigners,
 						tipPayer: creator,
 						initialTipLamports: tier2TipLamports,
@@ -1528,6 +1660,24 @@ export function LaunchPanel({
 								</div>
 							</div>
 						)}
+					</div>
+
+					{/* Creator's own dev buy: FOLDED into tx A, quoted FIRST
+                    against the fresh curve. Default 0.05 SOL (the StonkHouse
+                    shape). 0 keeps tx A as the legacy create-only tx. */}
+					<div className="lg:col-span-4">
+						<Field
+							label="Creator Dev Buy (SOL)"
+							aside="folded into tx A">
+							<Input
+								value={creatorDevBuySol}
+								onChange={(e) =>
+									setCreatorDevBuySol(e.target.value)
+								}
+								placeholder="0.05"
+								spellCheck={false}
+							/>
+						</Field>
 					</div>
 
 					{/* Buy sizing for the selected dev wallets: MAX. Every

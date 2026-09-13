@@ -9,11 +9,16 @@
 //     tracks (any valid base58 Solana mint; a launch pre-fills it).
 //   - Managed-wallet tabs (radio `tabs-lift`, name="managed-tabs"):
 //       * BUY / SELL tab (M8A, 2026-09-03): FIRST tab + defaultChecked.
-//         Manual batch trade over the CHECKED keyed wallets: Buy MAX spends
-//         each wallet's TOTAL SOL balance (down to a flat 0.002 SOL keep)
-//         on the curve / sell sellPct% of each wallet's own token balance
-//         (lib/batch-trade.ts, concurrent per-wallet signed
-//         txs). Global keyboard shortcuts b/B = buy max, s/S = sell (only
+//         Manual batch trade over the CHECKED keyed wallets. Buy MAX spends
+//         each wallet's TOTAL SOL balance (down to a flat 0.002 SOL keep);
+//         Sell sells sellPct% of each wallet's own token balance. BOTH route
+//         to the canonical PumpSwap POOL when the mint has already GRADUATED
+//         (the curve is closed after migration, so the round routes itself;
+//         see runManualTrade): buy via buySelectedWalletsMigrated, sell via
+//         Sell All's per-wallet pool leg (sellSelectedWalletsMigrated). Each
+//         wallet's trade is its own signed tx, concurrent
+//         (lib/batch-trade.ts). Global keyboard shortcuts b/B = buy max,
+//         s/S = sell (only
 //         while this tab is active, the FIRST managed-tabs radio), d/D =
 //         deselect (any tab). Reverses the M4 "manual Buy/Sell omitted by
 //         spec" decision (the v4 gap closure; see
@@ -41,23 +46,29 @@
 import { LAMPORTS_PER_SOL, PublicKey } from "@solana/web3.js";
 import { useEffect, useRef, useState } from "react";
 import {
+	autoVenueFor,
 	clampAutoCount,
 	clampAutoDurationMs,
 	fireAutoBuy,
+	fireAutoBuyPool,
 	fireAutoSell,
+	fireAutoSellPool,
 	parseAutoMinSol,
 	parseAutoSellPct,
 	pickRandomKeyedWallets,
 	readAutoCurveState,
 	type AutoCurveInfo,
 	type AutoRoundResult,
+	type AutoVenue,
 	type AutoWallet,
 } from "../lib/auto";
 import { makeAppConnection } from "../lib/connection";
 import { friendlyTxError } from "../lib/tx-errors";
 import {
 	buySelectedWallets,
+	buySelectedWalletsMigrated,
 	sellSelectedWallets,
+	sellSelectedWalletsMigrated,
 	type ManualBatchResult,
 } from "../lib/batch-trade";
 import { readToken2022Metadata } from "../lib/bundle";
@@ -72,6 +83,7 @@ import {
 } from "../lib/disperse";
 import { shortAddress } from "../lib/format";
 import { isValidPubkey } from "../lib/managed-wallets";
+import { canonicalMigratedPoolPda } from "../lib/migrate";
 import { DUST_SOL_LAMPORTS } from "../lib/params";
 import { formatSolLamports } from "../lib/sell-all";
 import { Roster, type RosterApi } from "./roster";
@@ -188,10 +200,11 @@ export function TradePanel({
 	// round is scheduled at round START (never in the .finally), so the
 	// countdown keeps ticking while the round builds and sends.
 	//
-	// Graduation guard: before each round the curve state is fetched; a
-	// graduated curve stops the bot with GRADUATED (buy/sell revert on-chain
-	// after graduation, and post-graduation PumpSwap trading is out of M5
-	// scope).
+	// Venue gate: before each round the curve state is fetched once. A
+	// graduated curve (complete = 1) has no tradable curve left, so the round
+	// is routed to the canonical PumpSwap pool that replaced it (the same
+	// `complete` flag every other surface trusts); the bot never stops on
+	// graduation. It stops only when the mint has no curve at all.
 
 	const [autoRunning, setAutoRunning] = useState(false);
 	const [autoStatus, setAutoStatus] = useState<string | null>(null);
@@ -318,10 +331,14 @@ export function TradePanel({
 		selectedKeyedRef.current = selectedKeyedWallets;
 	});
 
-	// The manual engine needs the curve's creator for the buy instruction and
-	// must stop when the curve is missing or already graduated (curve buy/sell
-	// revert after graduation; post-graduation PumpSwap trading is the Sell
-	// All button's job in the Launch card, not the manual tab's).
+	// The manual engine needs the curve's creator for the curve buy/sell
+	// instructions and must stop when the curve is missing. A GRADUATED curve
+	// (curve buy/sell revert on-chain) is NOT a dead end: the round moves to
+	// the venue that succeeded the curve, the canonical PumpSwap pool, BUY
+	// through lib/swap.ts buyMigratedPool (sized by buySelectedWalletsMigrated)
+	// and SELL through Sell All's per-wallet pool leg
+	// (sellSelectedWalletsMigrated), so the panel's buy AND sell keep working
+	// after graduation.
 	const runManualTrade = async (side: "buy" | "sell") => {
 		// A click while the previous round is STILL settling is queued
 		// (never dropped, never run concurrently): the finally fires it the
@@ -364,27 +381,57 @@ export function TradePanel({
 			if (read.kind === "missing") {
 				throw new Error("CURVE NOT FOUND FOR MINT");
 			}
-			if (read.curve.graduated) {
-				throw new Error(
-					"CURVE GRADUATED: USE THE SELL ALL BUTTON BELOW LAUNCH (MANUAL BUY/SELL TRADES THE CURVE)",
-				);
+			const graduated = read.curve.graduated;
+			// Derived once per round, and only for a graduated mint: the
+			// curve's own buys and sells never touch the pool key.
+			const poolKey = graduated
+				? canonicalMigratedPoolPda(mintPk)[0]
+				: null;
+			let result: ManualBatchResult;
+			if (graduated && side === "buy") {
+				// Curve closed: the mint trades on the canonical PumpSwap pool
+				// now, so this BUY MAX goes there. Same MAX budget rule (total
+				// balance down to the flat 0.002 SOL keep), zero slippage.
+				result = await buySelectedWalletsMigrated({
+					connection,
+					mint: mintPk,
+					poolKey: poolKey as PublicKey,
+					wallets,
+				});
+			} else if (graduated) {
+				// SELL on a graduated mint: the same pool, through Sell All's
+				// per-wallet pool leg (fresh quote per attempt, folded floors
+				// over the CHECKED subset, its own retry budgets), so the sell
+				// % keeps working here and Sell All is no longer the only exit.
+				result = await sellSelectedWalletsMigrated({
+					connection,
+					mint: mintPk,
+					poolKey: poolKey as PublicKey,
+					wallets,
+					sellPct: pct ?? 100,
+				});
+			} else if (side === "buy") {
+				result = await buySelectedWallets({
+					connection,
+					mint: mintPk,
+					curve: read.curve,
+					wallets,
+				});
+			} else {
+				result = await sellSelectedWallets({
+					connection,
+					mint: mintPk,
+					curve: read.curve,
+					wallets,
+					sellPct: pct ?? 100,
+				});
 			}
-			const result =
-				side === "buy"
-					? await buySelectedWallets({
-							connection,
-							mint: mintPk,
-							curve: read.curve,
-							wallets,
-						})
-					: await sellSelectedWallets({
-							connection,
-							mint: mintPk,
-							curve: read.curve,
-							wallets,
-							sellPct: pct ?? 100,
-						});
-			setManualReport({ side, pct, result });
+			setManualReport({
+				side,
+				pct,
+				result,
+				venue: graduated ? "pumpSwap" : "curve",
+			});
 			// The batch moved real balances; refresh the roster columns so the SOL /
 			// token cells reflect the landed txs without waiting for the 5s poll.
 			api.refreshBalances();
@@ -830,17 +877,17 @@ export function TradePanel({
 		}, autoCfgRef.current.sellDurationMs);
 	};
 
-	/** The curve gate for a round: reads the graduated flag (and the creator
-	 *  needed by the buy accounts). ok=false with `stop` halts the bot (missing
-	 *  or graduated curve); ok=false with `retry` reschedules (transient RPC). */
+	/** The venue gate for a round: reads the curve once (the graduated flag and
+	 *  the creator needed by the curve buy accounts) and derives the venue. A
+	 *  graduated curve routes the round to the canonical PumpSwap pool instead
+	 *  of stopping the bot. ok=false with `stop` halts the bot (no curve at
+	 *  all); ok=false with `retry` reschedules (transient RPC). */
 	const readRoundGate = async (
 		mintPk: PublicKey,
-	): Promise<{
-		ok: boolean;
-		curve?: AutoCurveInfo;
-		stop?: string;
-		retry?: string;
-	}> => {
+	): Promise<
+		| { ok: true; curve: AutoCurveInfo; venue: AutoVenue }
+		| { ok: false; stop?: string; retry?: string }
+	> => {
 		const connection = getEngine();
 		let read;
 		try {
@@ -854,10 +901,11 @@ export function TradePanel({
 		if (read.kind === "missing") {
 			return { ok: false, stop: "CURVE NOT FOUND FOR MINT" };
 		}
-		if (read.curve.graduated) {
-			return { ok: false, stop: "AUTO STOPPED: GRADUATED" };
-		}
-		return { ok: true, curve: read.curve };
+		return {
+			ok: true,
+			curve: read.curve,
+			venue: autoVenueFor(mintPk, read.curve),
+		};
 	};
 
 	async function autoBuyTick() {
@@ -905,23 +953,36 @@ export function TradePanel({
 		// later even when the round below bails early.
 		setCheckedRef.current(new Set(wallets.map((w) => w.address)));
 		scheduleDeselect();
+		const venue = gate.venue;
+		const buyLabel =
+			venue.kind === "pumpSwap" ? "AUTO BUY (PUMPSWAP)" : "AUTO BUY";
 		setAutoStatus(
-			`AUTO BUY: ${wallets.length} RANDOM WALLET${wallets.length === 1 ? "" : "S"}...`,
+			`${buyLabel}: ${wallets.length} RANDOM WALLET${wallets.length === 1 ? "" : "S"}...`,
 		);
 		// Round-start scheduling: the next round fires the instant this round's
 		// window ends, regardless of how long the build + send takes.
 		scheduleAutoBuy();
 		const connection = getEngine();
-		void fireAutoBuy({
-			connection,
-			mint: mintPk,
-			curve: gate.curve as AutoCurveInfo,
-			wallets,
-			minSolLamports: cfg.buyMinSolLamports,
-		})
+		const round =
+			venue.kind === "pumpSwap"
+				? fireAutoBuyPool({
+						connection,
+						mint: mintPk,
+						poolKey: venue.poolKey,
+						wallets,
+						minSolLamports: cfg.buyMinSolLamports,
+					})
+				: fireAutoBuy({
+						connection,
+						mint: mintPk,
+						curve: gate.curve,
+						wallets,
+						minSolLamports: cfg.buyMinSolLamports,
+					});
+		void round
 			.then((res) => {
 				if (autoRunningRef.current) {
-					setAutoStatus(autoRoundStatus("AUTO BUY", res));
+					setAutoStatus(autoRoundStatus(buyLabel, res));
 				}
 			})
 			.catch((e) => {
@@ -982,24 +1043,39 @@ export function TradePanel({
 		autoLockRef.current = true;
 		setCheckedRef.current(new Set(wallets.map((w) => w.address)));
 		scheduleDeselect();
+		const venue = gate.venue;
+		const sellLabel =
+			venue.kind === "pumpSwap" ? "AUTO SELL (PUMPSWAP)" : "AUTO SELL";
 		setAutoStatus(
-			`AUTO SELL: ${wallets.length} RANDOM WALLET${wallets.length === 1 ? "" : "S"}...`,
+			`${sellLabel}: ${wallets.length} RANDOM WALLET${wallets.length === 1 ? "" : "S"}...`,
 		);
 		scheduleAutoSell();
 		const connection = getEngine();
-		void fireAutoSell({
-			connection,
-			mint: mintPk,
-			curve: gate.curve as AutoCurveInfo,
-			wallets,
-			sellPct: cfg.sellPct,
-			// The hub (FIRST roster wallet) is the sweep destination: every
-			// wallet whose sell confirms sends the sale proceeds to it.
-			hub: walletsRef.current[0]?.address ?? undefined,
-		})
+		const round =
+			venue.kind === "pumpSwap"
+				? fireAutoSellPool({
+						connection,
+						mint: mintPk,
+						poolKey: venue.poolKey,
+						wallets,
+						sellPct: cfg.sellPct,
+						hub: walletsRef.current[0]?.address ?? undefined,
+					})
+				: fireAutoSell({
+						connection,
+						mint: mintPk,
+						curve: gate.curve,
+						wallets,
+						sellPct: cfg.sellPct,
+						// The hub (FIRST roster wallet) is the sweep destination:
+						// every wallet whose sell confirms sends the sale proceeds
+						// to it.
+						hub: walletsRef.current[0]?.address ?? undefined,
+					});
+		void round
 			.then((res) => {
 				if (autoRunningRef.current) {
-					setAutoStatus(autoRoundStatus("AUTO SELL", res));
+					setAutoStatus(autoRoundStatus(sellLabel, res));
 				}
 			})
 			.catch((e) => {
@@ -1044,7 +1120,9 @@ export function TradePanel({
 			parts.push(`BUY EVERY ${Math.round(cfg.buyDurationMs / 1000)}S`);
 		if (cfg.sellOn)
 			parts.push(`SELL EVERY ${Math.round(cfg.sellDurationMs / 1000)}S`);
-		setAutoStatus(`AUTO RUNNING · ${parts.join(" · ")}`);
+		setAutoStatus(
+			`AUTO RUNNING · ${parts.join(" · ")}${gate.venue.kind === "pumpSwap" ? " (PUMPSWAP)" : ""}`,
+		);
 		// First rounds fire immediately, then every duration (v4 round-start).
 		if (cfg.buyOn) {
 			autoBuyEndRef.current = Date.now() + cfg.buyDurationMs;
@@ -1217,9 +1295,16 @@ export function TradePanel({
 								size; Buy MAX spends each CHECKED keyed wallet's TOTAL
 								SOL balance (down to a flat 0.002 SOL keep) on the curve —
 								the buy's max_sol_cost IS the budget, so a price tick up
-								reverts cleanly, never an overdraw; Sell sells sellPct% of
-								each wallet's own token balance (lib/batch-trade.ts, one
-								signed tx per wallet, concurrent). The buttons disable while
+								reverts cleanly, never an overdraw — or, when the mint has
+								GRADUATED (curve closed), on the canonical PumpSwap pool
+								with the same budget rule and zero slippage
+								(buySelectedWalletsMigrated). Sell sells sellPct% of
+								each wallet's own token balance on the curve, or the same
+								sellPct% of each wallet's balance on that pool once
+								graduated (sellSelectedWalletsMigrated, Sell All's
+								per-wallet pool leg: fresh quote per attempt, folded
+								floors, retry budgets) — lib/batch-trade.ts, one signed
+								tx per wallet, concurrent. The buttons disable while
 								the M5 auto bot runs, nothing is selected, or inside the
 								fixed +3s click lock (manualBusy): a Buy/Sell click locks
 								BOTH buttons for exactly 3s from the click, then they unlock
@@ -1245,7 +1330,7 @@ export function TradePanel({
 										onClick={() =>
 											void runManualTrade("buy")
 										}
-										title="Spends each selected wallet's TOTAL SOL balance (down to a flat 0.002 SOL keep) on the curve"
+										title="Spends each selected wallet's TOTAL SOL balance (down to a flat 0.002 SOL keep) on the curve, or on the PumpSwap pool when the mint already graduated"
 										disabled={
 											manualBusy ||
 											autoRunning ||
@@ -1757,11 +1842,18 @@ export function TradePanel({
 
 /* ---------- M8A manual buy/sell report (counts + signatures) ---------- */
 
+/** The venue a manual round traded: the pump.fun bonding curve, or the
+ *  PumpSwap AMM pool the curve migrates to at graduation. */
+type ManualVenue = "curve" | "pumpSwap";
+
 /** A finished manual batch trade, ready for the report view. */
 interface ManualBatchReport {
 	side: "buy" | "sell";
 	/** Sell % used; null = Buy MAX (the buy side spends down to the flat 0.002 SOL keep). */
 	pct: number | null;
+	/** Which venue the round traded (a graduated mint's BUY MAX goes to the
+	 *  PumpSwap pool; everything else trades the curve). */
+	venue: ManualVenue;
 	result: ManualBatchResult;
 }
 
@@ -1777,16 +1869,18 @@ function parseManualPct(raw: string, fallback: number): number {
 	return Math.min(100, n);
 }
 
-/** Compact per-batch report: side + pct headline (Buy is MAX), then each
- *  confirmed signature as an ExplorerLink (the v4 batch pattern wording). */
+/** Compact per-batch report: side + pct headline (Buy is MAX) tagged with the
+ *  venue when it was the PumpSwap pool, then each confirmed signature as an
+ *  ExplorerLink (the v4 batch pattern wording). */
 function ManualReportView({ report }: { report: ManualBatchReport }) {
-	const { side, pct, result } = report;
+	const { side, pct, result, venue } = report;
 	const verb = side === "buy" ? "BOUGHT" : "SOLD";
 	const total = result.completed + result.skipped + result.failed;
 	return (
 		<div className="reveal-up flex flex-col gap-1 border-2 border-ink px-2 py-1.5">
 			<p className="label-mono !text-[11px] font-bold">
-				{side === "buy" ? "BUY MAX" : `SELL ${pct}%`}: {verb}{" "}
+				{side === "buy" ? "BUY MAX" : `SELL ${pct}%`}
+				{venue === "pumpSwap" ? " · PUMPSWAP" : ""}: {verb}{" "}
 				{result.completed}/{total} · SKIPPED {result.skipped} · FAILED{" "}
 				{result.failed}
 			</p>

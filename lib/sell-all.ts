@@ -65,7 +65,7 @@ import {
   lookupMigratedPool,
   sendRawWithRetry,
 } from "./migrate";
-import { sellMigratedPool } from "./swap";
+import { sellMigratedPool, poolPercentFloor } from "./swap";
 import { friendlyTxError, isSlippageRevert } from "./tx-errors";
 import { OnlinePumpAmmSdk, PUMP_AMM_PROGRAM_ID, PumpAmmSdk } from "@pump-fun/pump-swap-sdk";
 import { foldCurveSells, foldPoolSells, type SellSequenceStep } from "./sell-fold";
@@ -97,6 +97,21 @@ export type SellRoute = "curve" | "pumpSwap";
  *  fill and silently turning a loud revert into a bad fill. This is a guard
  *  rail, not a knob to widen. */
 export const MAX_SLIPPAGE_PCT = 25;
+
+/** The share of a wallet's own balance one sell takes, in raw token units,
+ *  FLOORED: a partial sell cannot take more than the wallet holds, and it
+ *  takes the lower whole raw unit. 100 (or above) sells the whole bag EXACTLY,
+ *  so the full-balance default stays byte-identical to the behaviour sell-all
+ *  has always had. 0 / blank / non-finite yields 0, which the callers report
+ *  as SKIPPED (there is nothing to sell). Exported so the offline suite pins
+ *  it. */
+export function pctTokens(tokens: bigint, pct: number): bigint {
+  const n = Number(pct);
+  if (!Number.isFinite(n) || n <= 0) return BigInt(0);
+  if (n >= 100) return tokens;
+  const pctNum = BigInt(Math.round(n * 100));
+  return (tokens * pctNum) / BigInt(10_000);
+}
 
 /** R2: reads the live curve to (re-)quote ONE attempt. The curve leg must call
  *  this on every attempt and never reuse a run-level snapshot — a retry against
@@ -148,6 +163,12 @@ export interface SellAllOptions {
    *  leg's min_sol_output AND passed to the PumpSwap SDK's sell leg. Values
    *  above MAX_SLIPPAGE_PCT are rejected outright rather than clamped. */
   slippagePct?: number;
+  /** Share of each wallet's OWN balance to sell, percent in (0, 100]. Default
+   *  100 = the whole bag (the sell-all contract). A partial sell is sized from
+   *  the wallet's live balance and planned through the SAME fold, so the
+   *  folded floors match the amounts actually sold. Values outside (0, 100]
+   *  are rejected: a sell of nothing is a no-op, not a report. */
+  sellPct?: number;
   /** STAGE 2: plan the whole sell sequence with FOLDED FLOORS (default true).
    *  Each wallet's floor then reflects the reserves its PREDECESSORS' sells
    *  leave, so a concurrent fan-out cannot trip floors that only held for the
@@ -366,11 +387,23 @@ async function sellOneCurve(
    *  the state its predecessors' sells leave while never being tighter than
    *  the quote we would have used anyway. Retries ignore it: the fold is a
    *  snapshot of a plan, the fresh read is the truth. */
-  foldedMinSolOut?: bigint
+  foldedMinSolOut?: bigint,
+  /** Share of the wallet's own balance to sell, percent in (0, 100]. Default
+   *  100 = the whole bag (the sell-all contract). A partial sell freezes its
+   *  amount from the FIRST read, so a retry can never re-sell a position that
+   *  already landed (see `remaining` below). */
+  sellPct: number = 100
 ): Promise<SellOutcome> {
   const address = wallet.publicKey.toBase58();
   const slippageBps = BigInt(Math.round(slippagePct * 100));
   let firstBalance = BigInt(0);
+  /** Tokens this sell sets out to take and the balance it must leave behind,
+   *  both frozen at the first read. `remaining` generalises the "balance
+   *  drained" lost-confirm detector to a PARTIAL sell: a wallet that is
+   *  already at (or below) its target remainder has sold, it must not sell
+   *  again. At the 100% default remaining is 0, i.e. exactly the old check. */
+  let soldTokens = BigInt(0);
+  let remaining = BigInt(0);
   let lastSolBefore = BigInt(0);
   let lastErr: unknown = null;
   let attempts = 0;
@@ -382,11 +415,22 @@ async function sellOneCurve(
     attempts += 1;
     try {
       const balance = await walletTokenBalance(connection, wallet.publicKey, mint);
-      if (attempts === 1) firstBalance = balance;
-      if (balance <= BigInt(0)) {
-        // Zero now: either it was always zero (skip) or a previous attempt
-        // actually landed but its confirm was lost (report as sold).
-        if (firstBalance > BigInt(0)) {
+      if (attempts === 1) {
+        firstBalance = balance;
+        soldTokens = pctTokens(firstBalance, sellPct);
+        remaining = firstBalance - soldTokens;
+      }
+      if (soldTokens <= BigInt(0)) {
+        // Nothing to sell: a zero balance, or a percentage so small on this
+        // balance that it floors to zero raw units (the curve sell would
+        // revert on a zero input).
+        return skippedOutcome(address, "curve");
+      }
+      if (balance <= remaining) {
+        // At (or below) the target remainder: either there was nothing to
+        // sell (skip) or a previous attempt landed and its confirm was lost
+        // (report as sold, for exactly the tokens this sell removed).
+        if (soldTokens > BigInt(0)) {
           let solNow = lastSolBefore;
           try {
             solNow = BigInt(
@@ -400,7 +444,7 @@ async function sellOneCurve(
             route: "curve",
             status: "sold",
             reason: "balance drained after a previous attempt (signature lost to RPC)",
-            tokenSold: firstBalance,
+            tokenSold: soldTokens,
             solReceivedLamports: BigInt(
               Math.max(0, Number(solNow - lastSolBefore))
             ),
@@ -423,7 +467,7 @@ async function sellOneCurve(
         break;
       }
       const quote = quotePumpSell({
-        tokensIn: balance,
+        tokensIn: soldTokens,
         virtualSolReserves: fresh.virtualSolReserves,
         virtualTokenReserves: fresh.virtualTokenReserves,
         slippageBps,
@@ -443,7 +487,7 @@ async function sellOneCurve(
         seller: wallet.publicKey,
         creator: fresh.creator,
         feeRecipient,
-        tokensIn: balance,
+        tokensIn: soldTokens,
         minSolOutput,
       });
       const tx = new Transaction({ feePayer: wallet.publicKey });
@@ -458,7 +502,7 @@ async function sellOneCurve(
         address,
         route: "curve",
         status: "sold",
-        tokenSold: balance,
+        tokenSold: soldTokens,
         solReceivedLamports: BigInt(Math.max(0, Number(solAfter - lastSolBefore))),
         signature,
         attempts,
@@ -508,10 +552,19 @@ async function sellOnePumpSwap(
   wallet: Keypair,
   slippagePct: number,
   /** STAGE 2 folded floor (lamports), first attempt only; see sellOneCurve. */
-  foldedMinQuoteOut?: bigint
+  foldedMinQuoteOut?: bigint,
+  /** Share of the wallet's own balance to sell, percent in (0, 100]. Default
+   *  100 = the whole bag; see sellOneCurve for the frozen-amount rule. */
+  sellPct: number = 100
 ): Promise<SellOutcome> {
   const address = wallet.publicKey.toBase58();
   let firstBalance = BigInt(0);
+  /** Frozen target of this sell (see sellOneCurve): the amount taken and the
+   *  balance it must leave, both from the first read, so a partial sell that
+   *  landed with a lost confirm is never sold a second time. At 100% the
+   *  remainder is 0, i.e. exactly the old drain check. */
+  let soldTokens = BigInt(0);
+  let remaining = BigInt(0);
   let lastSolBefore = BigInt(0);
   let lastErr: unknown = null;
   let attempts = 0;
@@ -523,31 +576,40 @@ async function sellOnePumpSwap(
     attempts += 1;
     try {
       const balance = await walletTokenBalance(connection, wallet.publicKey, mint);
-      if (attempts === 1) firstBalance = balance;
-      if (balance <= BigInt(0)) {
-        if (firstBalance > BigInt(0)) {
-          let solNow = lastSolBefore;
-          try {
-            solNow = BigInt(
-              await connection.getBalance(wallet.publicKey, "confirmed")
-            );
-          } catch {
-            // keep the last known before-balance; the report falls back to 0
-          }
-          return {
-            address,
-            route: "pumpSwap",
-            status: "sold",
-            reason: "balance drained after a previous attempt (signature lost to RPC)",
-            tokenSold: firstBalance,
-            solReceivedLamports: BigInt(
-              Math.max(0, Number(solNow - lastSolBefore))
-            ),
-            attempts,
-            retriedOnSlippage,
-          };
-        }
+      if (attempts === 1) {
+        firstBalance = balance;
+        soldTokens = pctTokens(firstBalance, sellPct);
+        remaining = firstBalance - soldTokens;
+      }
+      if (soldTokens <= BigInt(0)) {
+        // Nothing to sell: a zero balance, or a percentage so small on this
+        // balance that it floors to zero raw units.
         return skippedOutcome(address, "pumpSwap");
+      }
+      if (balance <= remaining) {
+        // At (or below) the target remainder: a previous attempt landed and
+        // its confirm was lost (report as sold, for exactly the tokens this
+        // sell removed).
+        let solNow = lastSolBefore;
+        try {
+          solNow = BigInt(
+            await connection.getBalance(wallet.publicKey, "confirmed")
+          );
+        } catch {
+          // keep the last known before-balance; the report falls back to 0
+        }
+        return {
+          address,
+          route: "pumpSwap",
+          status: "sold",
+          reason: "balance drained after a previous attempt (signature lost to RPC)",
+          tokenSold: soldTokens,
+          solReceivedLamports: BigInt(
+            Math.max(0, Number(solNow - lastSolBefore))
+          ),
+          attempts,
+          retriedOnSlippage,
+        };
       }
       lastSolBefore = BigInt(
         await connection.getBalance(wallet.publicKey, "confirmed")
@@ -559,7 +621,7 @@ async function sellOnePumpSwap(
         connection,
         poolKey,
         seller: wallet,
-        baseAmount: balance,
+        baseAmount: soldTokens,
         slippagePct,
         // STAGE 2: the folded floor replaces the percent-derived min-out on the
         // first attempt only. It is conservative on both counts the fold
@@ -574,7 +636,7 @@ async function sellOnePumpSwap(
         address,
         route: "pumpSwap",
         status: "sold",
-        tokenSold: balance,
+        tokenSold: soldTokens,
         solReceivedLamports: BigInt(
           Math.max(0, Number(solAfter - lastSolBefore))
         ),
@@ -614,6 +676,57 @@ async function sellOnePumpSwap(
   });
 }
 
+/** The manual Sell's per-wallet pool leg (a graduated mint has no tradable
+ *  curve: every curve sell reverts). Exposed so the trade panel can sell a
+ *  CHECKED subset of the roster with the SAME policy Sell All uses on the pool:
+ *  a fresh quote per attempt (inside sellMigratedPool), its own slippage
+ *  re-quote and transient-RPC budgets, the WSOL account closed in the same tx
+ *  so the proceeds land as NATIVE SOL, and an honest per-wallet outcome instead
+ *  of a thrown error. `sellPct` sizes the sell from the wallet's LIVE balance
+ *  (100 = the whole bag).
+ *
+ *  The sell-all guard rails apply here too, BEFORE any network call, so a
+ *  manual caller cannot slip past them: slippage above MAX_SLIPPAGE_PCT and a
+ *  sellPct outside (0, 100] are refused. */
+export async function sellOneWalletOnPool(opts: {
+  connection: Connection;
+  mint: PublicKey;
+  poolKey: PublicKey;
+  wallet: Keypair;
+  /** Share of the wallet's own balance to sell, percent in (0, 100]. */
+  sellPct: number;
+  /** Slippage band percent (default 5, the band the Sell All button passes). */
+  slippagePct?: number;
+  /** STAGE 2 folded floor (lamports), first attempt only. */
+  minOutLamports?: bigint;
+}): Promise<SellOutcome> {
+  const slippagePct = opts.slippagePct ?? 5;
+  if (
+    !Number.isFinite(slippagePct) ||
+    slippagePct < 0 ||
+    slippagePct > MAX_SLIPPAGE_PCT
+  ) {
+    throw new Error(
+      `slippagePct ${slippagePct} is outside the allowed range [0, ${MAX_SLIPPAGE_PCT}] ` +
+        `(MAX_SLIPPAGE_PCT guard rail: refusing to widen slippage to force a fill)`
+    );
+  }
+  if (!Number.isFinite(opts.sellPct) || opts.sellPct <= 0 || opts.sellPct > 100) {
+    throw new Error(
+      `sellPct ${opts.sellPct} is outside the allowed range (0, 100] (a sell of nothing is a no-op, not a report)`
+    );
+  }
+  return sellOnePumpSwap(
+    opts.connection,
+    opts.mint,
+    opts.poolKey,
+    opts.wallet,
+    slippagePct,
+    opts.minOutLamports,
+    opts.sellPct
+  );
+}
+
 /** The SELL ALL entry point. Reads the pump.fun curve state once to choose
  *  the route, then sells every keyed wallet's full balance concurrently.
  *  Never throws for a per-wallet failure: each wallet's error is captured in
@@ -642,6 +755,18 @@ export async function sellAllManagedWallets(
     throw new Error(
       `slippagePct ${slippagePct} is outside the allowed range [0, ${MAX_SLIPPAGE_PCT}] ` +
         `(MAX_SLIPPAGE_PCT guard rail: refusing to widen slippage to force a fill)`
+    );
+  }
+
+  // Partial sells are a first-class case since 2026-09-13 (the manual Sell
+  // passes the roster % input). Validated here, before any network call: the
+  // legs size themselves from the live balance with `pctTokens`, which floors,
+  // so a percentage that rounds to zero raw units reports SKIPPED per wallet
+  // rather than sending a zero-input sell.
+  const sellPct = opts.sellPct ?? 100;
+  if (!Number.isFinite(sellPct) || sellPct <= 0 || sellPct > 100) {
+    throw new Error(
+      `sellPct ${sellPct} is outside the allowed range (0, 100] (a sell of nothing is a no-op, not a report)`
     );
   }
 
@@ -733,6 +858,7 @@ export async function sellAllManagedWallets(
         curveVirtualSolReserves: curve.virtualSolReserves,
         curveVirtualTokenReserves: curve.virtualTokenReserves,
         slippagePct,
+        sellPct,
       });
     } catch {
       sequence = { steps: [], floors: new Map<string, bigint>() };
@@ -781,7 +907,8 @@ export async function sellAllManagedWallets(
               wallet,
               slippagePct,
               feeRecipient,
-              foldedFloors.get(w.address)
+              foldedFloors.get(w.address),
+              sellPct
             );
           }
           return await sellOnePumpSwap(
@@ -790,7 +917,8 @@ export async function sellAllManagedWallets(
             poolKey as PublicKey,
             wallet,
             slippagePct,
-            foldedFloors.get(w.address)
+            foldedFloors.get(w.address),
+            sellPct
           );
         } catch (e) {
           const msg = e instanceof Error ? e.message : String(e);
@@ -871,6 +999,12 @@ export interface SellSequencePlanOptions {
   curveVirtualSolReserves: bigint;
   curveVirtualTokenReserves: bigint;
   slippagePct: number;
+  /** Share of each wallet's balance the plan sells, percent in (0, 100].
+   *  Default 100. The fold's step amounts ARE the amounts to be sold, so this
+   *  must match what the legs will send or the folded floors would be sized
+   *  for a different trade (a smaller sell has a smaller floor, so a stale
+   *  100% plan would set floors far above what a 50% sell can fetch). */
+  sellPct?: number;
   /** Highest tier total (93 + 2 + 30) by default: conservative by design. */
   poolFeeBpsTotal?: bigint;
 }
@@ -902,7 +1036,10 @@ export async function planSellSequence(
         wallet.publicKey,
         opts.mint
       );
-      if (tokens > BigInt(0)) balances.push({ address: w.address, tokens });
+      // The fold plans the amounts the legs will actually send: a partial
+      // sell folds the partial amount, not the whole balance.
+      const selling = pctTokens(tokens, opts.sellPct ?? 100);
+      if (selling > BigInt(0)) balances.push({ address: w.address, tokens: selling });
     } catch {
       // One unreadable balance drops that wallet from the plan; the others'
       // floors stay valid because a missing seller only means LESS price
@@ -1879,14 +2016,28 @@ async function sellAllAsBundle(opts: BundleRunOptions): Promise<SellAllReport> {
     // read lib/swap.ts quotes from).
     const state = await onlineSdk.swapSolanaState(poolKey, wallet.publicKey);
     const base = new BN(tokensIn.toString());
-    const instructions =
+    // An explicit (folded) floor goes to the instruction DIRECTLY, so it must
+    // never be tighter than the SDK's own percent floor for this same state.
+    // poolPercentFloor is pure math over the state we just read (see its doc
+    // for the measured 1-lamport case), so the looser of the two is used and a
+    // folded floor can only ever loosen the trade.
+    const floor =
       foldedMinSolOut === undefined
+        ? undefined
+        : (() => {
+            const percentFloor = poolPercentFloor(
+              state,
+              tokensIn,
+              opts.slippagePct
+            );
+            return foldedMinSolOut < percentFloor
+              ? foldedMinSolOut
+              : percentFloor;
+          })();
+    const instructions =
+      floor === undefined
         ? await sdk.sellBaseInput(state, base, opts.slippagePct)
-        : await sdk.sellInstructions(
-            state,
-            base,
-            new BN(foldedMinSolOut.toString())
-          );
+        : await sdk.sellInstructions(state, base, new BN(floor.toString()));
     return { address, wallet, instructions };
   };
 

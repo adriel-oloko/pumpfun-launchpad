@@ -55,8 +55,20 @@ D : 1 signature   => base  5 000 + priority 25 000 = 30 000 lamports
 Instruction shape:
 
 ```
-A : ComputeBudget(setComputeUnitLimit), ComputeBudget(setComputeUnitPrice),
-    create_v2 (pump 6EF8rrecth…), ExtendAccount, ATA createIdempotent, Buy
+A : VERSIONED v0 message through an address lookup table (13 static account
+    keys + 1 ALT carrying 13 loaded addresses; 896 bytes serialized, 198,662
+    CU consumed, NO tip instruction — the reference was not sent through
+    Helius Sender). Instructions, exact order:
+      ComputeBudget(setComputeUnitLimit), ComputeBudget(setComputeUnitPrice),
+      create_v2 (pump 6EF8rrecth…, 16 accounts),
+      extend_account (pump 6EF8rrecth…), no args, 8 data bytes;
+        discriminator [234,102,194,203,150,72,62,229] =
+        sha256("global:extend_account")[0:8]; five accounts in exact order:
+        bonding_curve (the account extended), user (=creator, signer),
+        system_program, pump event authority, pump program;
+      ATA createIdempotent (payer=creator, ata, owner=creator, mint,
+        system, token2022),
+      Buy (pump 6EF8rrecth…, 18 accounts)
 B,C: ComputeBudget x2, ATA createIdempotent x2, Buy x2   (one buy per wallet, each into that wallet's own ATA)
 D : ComputeBudget x2, MigrateV2 (pump), which CPIs:
       PumpSwap CreatePool  -> creates the canonical pool + LP mint
@@ -154,7 +166,9 @@ lib/bundle/launch.ts:162-196  BuildLaunchOptions — the creator no longer pays 
 ```
 
 Done when: a built launch sequence shows 4 txs with signer counts 2, 2, 2, 1 and
-the creator absent from tx B and tx C.
+the creator absent from tx B and tx C. The tx-A fold (PLAN-TXA-FOLD.md) does
+not move this: tx A is still signed by exactly [creator, mint] (2) with the
+creator as fee payer, so the counts remain 2, 2, 2, 1.
 
 ### C3. Same-slot pack, with an explicit MigrateV2 as the last transaction
 

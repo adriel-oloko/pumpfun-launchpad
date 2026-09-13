@@ -38,6 +38,9 @@ const pump = nodeRequire("../lib/pump.ts") as typeof import("../lib/pump");
 const launch = nodeRequire(
   "../lib/bundle/launch.ts"
 ) as typeof import("../lib/bundle/launch");
+const lookup = nodeRequire(
+  "../lib/bundle/lookup.ts"
+) as typeof import("../lib/bundle/lookup");
 const migrate = nodeRequire(
   "../lib/migrate.ts"
 ) as typeof import("../lib/migrate");
@@ -81,6 +84,15 @@ function mainnetSeed() {
     virtualTokenReserves: VTOK,
     realTokenReserves: RTOK,
   };
+}
+
+/** The synthetic launch ALT, carrying the same fallback fee recipient the
+ *  fake connection's null global read resolves to. */
+function syntheticAlt(authority: PublicKey) {
+  return lookup.syntheticPumpLookupTable(
+    pump.pumpFeeRecipientFallback(),
+    authority
+  );
 }
 
 describe("(a) chunk quoting is monotonic; the final buy takes rTok", () => {
@@ -777,7 +789,7 @@ describe("stage ui: graduate:false keeps the curve open", () => {
     expect(seq.signersByTx.length).to.equal(2);
   });
 
-  it("test launch: 5 selected dev wallets each plan a capacity-sized buy plus the creator's own buy, with NO migrate", async () => {
+  it("test launch (folded): 5 selected dev wallets pack 5 buys; the creator's buy folds into tx A with NO migrate", async () => {
     const TEST_LAUNCH_DEV_BUY_LAMPORTS = BigInt(10_000_000);
     /** The UI's per-wallet test-launch size: min(capacity, TEST_LAUNCH_DEV_BUY). */
     const planBuy = (capacity: bigint) =>
@@ -814,17 +826,14 @@ describe("stage ui: graduate:false keeps the curve open", () => {
       expect(devBudgets[i] <= devCapacities[i]).to.equal(true);
     }
 
-    // The TEST LAUNCH plan: creator first (the reference pack's first buy),
-    // then one buy per selected dev wallet. 5 selected wallets -> 5 dev buys
-    // plus the creator's own = 6.
-    const buys = [
-      { wallet: creator, solInLamports: creatorBudget },
-      ...devWallets.map((wallet, i) => ({
-        wallet,
-        solInLamports: devBudgets[i],
-      })),
-    ];
-    expect(buys.length).to.equal(6);
+    // The FOLDED TEST LAUNCH plan: the creator's buy is `creatorDevBuy` and
+    // folds into tx A; the 5 selected dev wallets are the packed buys. This
+    // is a folded-shape test: the count moved from 6 packed buys to 5.
+    const devBuys = devWallets.map((wallet, i) => ({
+      wallet,
+      solInLamports: devBudgets[i],
+    }));
+    expect(devBuys.length).to.equal(5);
 
     const seq = await launch.buildLaunchSequence({
       connection: fakeConnection(),
@@ -832,13 +841,15 @@ describe("stage ui: graduate:false keeps the curve open", () => {
       name: "Test",
       symbol: "TEST",
       uri: "https://example.com/test.json",
-      buys,
+      buys: devBuys,
+      creatorDevBuy: { wallet: creator, solInLamports: creatorBudget },
+      lookupTable: syntheticAlt(creator.publicKey),
       mintKeypair: Keypair.generate(),
       slippageBps: ZERO,
       graduate: false,
     });
     const packed = seq.buyTxs.reduce((a, bt) => a + bt.wallets.length, 0);
-    expect(packed).to.equal(6);
+    expect(packed).to.equal(5);
     // The curve stays OPEN: a NON-graduating launch carries NO MigrateV2.
     expect(seq.migrateIx).to.equal(null);
     expect(seq.migrateTx).to.equal(null);
@@ -846,7 +857,7 @@ describe("stage ui: graduate:false keeps the curve open", () => {
     expect(seq.signersByTx.length).to.equal(1 + seq.buyTxs.length);
   });
 
-  it("test launch: an unaffordable selected dev wallet is skipped, still NO migrate", async () => {
+  it("test launch (folded): an unaffordable selected dev wallet is skipped, still NO migrate", async () => {
     const TEST_LAUNCH_DEV_BUY_LAMPORTS = BigInt(10_000_000);
     const planBuy = (capacity: bigint) =>
       TEST_LAUNCH_DEV_BUY_LAMPORTS < capacity
@@ -858,15 +869,14 @@ describe("stage ui: graduate:false keeps the curve open", () => {
     const creator = Keypair.generate();
     const devWallets = devCapacities.map(() => Keypair.generate());
 
-    const buys = [
-      { wallet: creator, solInLamports: planBuy(creatorCapacity) },
-      ...devCapacities.flatMap((capacity, i) =>
-        capacity <= BigInt(0)
-          ? []
-          : [{ wallet: devWallets[i], solInLamports: planBuy(capacity) }]
-      ),
-    ];
-    expect(buys.length).to.equal(3); // creator + 2 affordable dev wallets
+    // FOLDED SHAPE: the creator's buy is `creatorDevBuy` (tx A); only the 2
+    // affordable dev wallets are packed. The count moved from 3 to 2.
+    const devBuys = devCapacities.flatMap((capacity, i) =>
+      capacity <= BigInt(0)
+        ? []
+        : [{ wallet: devWallets[i], solInLamports: planBuy(capacity) }]
+    );
+    expect(devBuys.length).to.equal(2);
 
     const seq = await launch.buildLaunchSequence({
       connection: fakeConnection(),
@@ -874,7 +884,12 @@ describe("stage ui: graduate:false keeps the curve open", () => {
       name: "Skip",
       symbol: "SKIP",
       uri: "https://example.com/skip.json",
-      buys,
+      buys: devBuys,
+      creatorDevBuy: {
+        wallet: creator,
+        solInLamports: planBuy(creatorCapacity),
+      },
+      lookupTable: syntheticAlt(creator.publicKey),
       mintKeypair: Keypair.generate(),
       slippageBps: ZERO,
       graduate: false,
@@ -882,7 +897,7 @@ describe("stage ui: graduate:false keeps the curve open", () => {
     expect(seq.migrateIx).to.equal(null);
     expect(seq.migrateTx).to.equal(null);
     const packed = seq.buyTxs.reduce((a, bt) => a + bt.wallets.length, 0);
-    expect(packed).to.equal(3);
+    expect(packed).to.equal(2);
   });
 });
 
@@ -1137,5 +1152,223 @@ describe("stage 3: measured byte-budget sell packing", () => {
     expect(msg).to.contain("4");
     expect(msg).to.match(/perWallet/);
     expect(sellAll.sellBundleTxCapError(9, 5, 4)).to.equal(msg);
+  });
+});
+
+// TX A FOLD (PLAN-TXA-FOLD.md): the reference launch's first transaction is a
+// V0 message carrying create_v2 + extend_account + the creator's own ATA
+// createIdempotent + dev buy, signed by exactly [creator, mint] with the
+// creator as fee payer. Offline: synthetic ALT, fake connection, no RPC.
+describe("txa fold: the creator dev buy folded into a V0 tx A", () => {
+  const MAX_NAME = "N".repeat(32);
+  const MAX_SYMBOL = "S".repeat(10);
+  const MAX_URI = "u".repeat(200);
+
+  function fakeConnection(): import("@solana/web3.js").Connection {
+    return {
+      rpcEndpoint: "https://api.devnet.solana.com",
+      getLatestBlockhash: async () => ({
+        blockhash: "11111111111111111111111111111111",
+        lastValidBlockHeight: 1,
+      }),
+      getAccountInfo: async () => null,
+    } as unknown as import("@solana/web3.js").Connection;
+  }
+
+  function readU64(buf: Buffer, offset: number): bigint {
+    let v = BigInt(0);
+    for (let i = 7; i >= 0; i--) {
+      v = (v << BigInt(8)) | BigInt(buf[offset + i]);
+    }
+    return v;
+  }
+
+  function ixKind(
+    ix: import("@solana/web3.js").TransactionInstruction
+  ): string {
+    const data = Buffer.from(ix.data);
+    if (ix.programId.equals(web3.ComputeBudgetProgram.programId)) {
+      if (data[0] === 2) return "cb_limit";
+      if (data[0] === 3) return "cb_price";
+      return "cb";
+    }
+    if (ix.programId.equals(pump.PUMP_PROGRAM_ID)) {
+      const disc = data.subarray(0, 8);
+      if (disc.equals(Buffer.from(pump.PUMP_CREATE_V2_DISCRIMINATOR)))
+        return "create_v2";
+      if (disc.equals(Buffer.from(pump.PUMP_EXTEND_ACCOUNT_DISCRIMINATOR)))
+        return "extend_account";
+      if (disc.equals(Buffer.from(pump.PUMP_BUY_DISCRIMINATOR))) return "buy";
+      return "pump";
+    }
+    return "ata";
+  }
+
+  /** Builds a folded launch: creatorDevBuy in tx A, `devCount` packed wallets. */
+  async function buildFolded(devCount: number) {
+    const creator = Keypair.generate();
+    const alt = syntheticAlt(creator.publicKey);
+    const devWallets = Array.from({ length: devCount }, () =>
+      Keypair.generate()
+    );
+    const buys = devWallets.map((wallet) => ({
+      wallet,
+      solInLamports: BigInt(3_000_000),
+    }));
+    const creatorBuy = { wallet: creator, solInLamports: BigInt(50_000_000) };
+    const mintKeypair = Keypair.generate();
+    const seq = await launch.buildLaunchSequence({
+      connection: fakeConnection(),
+      creator,
+      name: MAX_NAME,
+      symbol: MAX_SYMBOL,
+      uri: MAX_URI,
+      buys,
+      creatorDevBuy: creatorBuy,
+      lookupTable: alt,
+      mintKeypair,
+      slippageBps: ZERO,
+      graduate: true,
+    });
+    return { creator, alt, devWallets, buys, creatorBuy, mintKeypair, seq };
+  }
+
+  it("PUMP_EXTEND_ACCOUNT_DISCRIMINATOR == sha256('global:extend_account')[0:8]", () => {
+    const { createHash } = nodeRequire("crypto") as typeof import("crypto");
+    const hash = createHash("sha256").update("global:extend_account").digest();
+    expect(pump.PUMP_EXTEND_ACCOUNT_DISCRIMINATOR).to.deep.equal([
+      ...hash.subarray(0, 8),
+    ]);
+  });
+
+  it("buildPumpExtendAccountIx has the five IDL accounts in exact order", () => {
+    const creator = Keypair.generate();
+    const [bondingCurve] = pump.pumpBondingCurvePda(
+      Keypair.generate().publicKey
+    );
+    const ix = pump.buildPumpExtendAccountIx({
+      bondingCurve,
+      user: creator.publicKey,
+    });
+    expect(ix.programId.toBase58()).to.equal(pump.PUMP_PROGRAM_ID.toBase58());
+    expect([...ix.data]).to.deep.equal(pump.PUMP_EXTEND_ACCOUNT_DISCRIMINATOR);
+    expect(ix.keys.map((k) => k.pubkey.toBase58())).to.deep.equal([
+      bondingCurve.toBase58(),
+      creator.publicKey.toBase58(),
+      web3.SystemProgram.programId.toBase58(),
+      pump.PUMP_EVENT_AUTHORITY.toBase58(),
+      pump.PUMP_PROGRAM_ID.toBase58(),
+    ]);
+    // Flags per the official IDL: `account` (the curve) writable, `user`
+    // writable + signer, the other three read-only. A read-only `user` still
+    // compiles because the creator is the fee payer, so assert it here.
+    expect(ix.keys.map((k) => [k.isWritable, k.isSigner])).to.deep.equal([
+      [true, false],
+      [true, true],
+      [false, false],
+      [false, false],
+      [false, false],
+    ]);
+    expect(ix.keys[1].isSigner).to.equal(true);
+  });
+
+  it("tx A carries CB limit, CB price, create_v2, extend_account, ATA, buy; signs [creator, mint]", async () => {
+    const { creator, alt, mintKeypair, seq } = await buildFolded(5);
+    expect(seq.createTx instanceof web3.VersionedTransaction).to.equal(true);
+    const v0 = seq.createTx as InstanceType<typeof web3.VersionedTransaction>;
+    const msg = web3.TransactionMessage.decompile(v0.message, {
+      addressLookupTableAccounts: [alt],
+    });
+    const kinds = msg.instructions.map(ixKind);
+    expect(kinds).to.deep.equal([
+      "cb_limit",
+      "cb_price",
+      "create_v2",
+      "extend_account",
+      "ata",
+      "buy",
+    ]);
+    const staticKeys = v0.message.staticAccountKeys;
+    const required = v0.message.header.numRequiredSignatures;
+    expect(required).to.equal(2);
+    expect(staticKeys[0].toBase58()).to.equal(creator.publicKey.toBase58());
+    expect(
+      staticKeys.slice(0, required).map((k) => k.toBase58())
+    ).to.deep.equal([
+      creator.publicKey.toBase58(),
+      mintKeypair.publicKey.toBase58(),
+    ]);
+    // PRINT (required): tx A's instruction list, signer list, serialized size.
+    console.log(`   tx A instructions: [${kinds.join(", ")}]`);
+    console.log(
+      `   tx A signers     : [${staticKeys
+        .slice(0, required)
+        .map((k) => k.toBase58())
+        .join(", ")}] (fee payer ${staticKeys[0].toBase58()})`
+    );
+    console.log(`   tx A serialized  : ${v0.serialize().length} bytes (no tip)`);
+  });
+
+  it("the folded buy is NOT packed; packed count is ceil((n-1)/2)", async () => {
+    const { creator, devWallets, seq } = await buildFolded(5);
+    // n total buys = 1 creator + 5 dev -> packed = ceil(5/2) = 3 txs.
+    expect(seq.buyTxs.length).to.equal(Math.ceil(devWallets.length / 2));
+    const packedWallets = seq.buyTxs.flatMap((bt) => bt.wallets);
+    expect(packedWallets.length).to.equal(devWallets.length);
+    for (const bt of seq.buyTxs) {
+      // The creator is never a packed BUYER/signer of a buy tx.
+      expect(
+        bt.wallets.some((w) => w.publicKey.equals(creator.publicKey))
+      ).to.equal(false);
+    }
+  });
+
+  it("tx A + a 5,000-lamport tip fits 1232 bytes at max metadata", async () => {
+    const { creator, alt, seq } = await buildFolded(5);
+    const v0 = seq.createTx as InstanceType<typeof web3.VersionedTransaction>;
+    const msg = web3.TransactionMessage.decompile(v0.message, {
+      addressLookupTableAccounts: [alt],
+    });
+    const tipIx = web3.SystemProgram.transfer({
+      fromPubkey: creator.publicKey,
+      toPubkey: Keypair.generate().publicKey,
+      lamports: 5_000,
+    });
+    const withTip = new web3.TransactionMessage({
+      payerKey: creator.publicKey,
+      recentBlockhash: seq.blockhash.blockhash,
+      instructions: [...msg.instructions, tipIx],
+    }).compileToV0Message([alt]);
+    const bytes = new web3.VersionedTransaction(withTip).serialize().length;
+    console.log(`   tx A with 5,000-lamport tip: ${bytes} bytes (limit 1232)`);
+    expect(bytes).to.be.at.most(1232);
+  });
+
+  it("the folded buy's tokensOut/maxSolCost equal the first quoteLaunchBuys quote", async () => {
+    const { creator, alt, buys, creatorBuy, seq } = await buildFolded(5);
+    const v0 = seq.createTx as InstanceType<typeof web3.VersionedTransaction>;
+    const msg = web3.TransactionMessage.decompile(v0.message, {
+      addressLookupTableAccounts: [alt],
+    });
+    const buyIx = msg.instructions.find((ix) => ixKind(ix) === "buy");
+    if (!buyIx) throw new Error("tx A carries no buy instruction");
+    const data = Buffer.from(buyIx.data);
+    const tokensOut = readU64(data, 8);
+    const maxSolCost = readU64(data, 16);
+    const seed = await launch.resolveLaunchCurveSeed(fakeConnection());
+    const expected = launch.quoteLaunchBuys(
+      [
+        { wallet: creatorBuy.wallet, solInLamports: creatorBuy.solInLamports },
+        ...buys,
+      ],
+      ZERO,
+      seed,
+      true
+    );
+    expect(tokensOut).to.equal(expected[0].tokensOut);
+    expect(maxSolCost).to.equal(expected[0].maxSolCost);
+    expect(creator.publicKey.toBase58()).to.equal(
+      creatorBuy.wallet.publicKey.toBase58()
+    );
   });
 });

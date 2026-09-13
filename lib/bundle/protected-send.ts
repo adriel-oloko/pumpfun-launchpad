@@ -45,7 +45,10 @@ import {
   PublicKey,
   SystemProgram,
   Transaction,
+  TransactionMessage,
+  VersionedTransaction,
 } from "@solana/web3.js";
+import type { AddressLookupTableAccount } from "@solana/web3.js";
 import { DEFAULT_PRIORITY_FEE_MICRO_LAMPORTS } from "../fees";
 import { solanaNetwork } from "../network";
 import { isBlockhashExpiredError } from "../tx-errors";
@@ -114,6 +117,9 @@ export interface ProtectedSendOptions {
    *  carry none; with this flag it skips that so a tx never ends up with TWO
    *  compute-unit-price instructions. */
   skipPriorityFeeIx?: boolean;
+  /** The launch ALT, required to decompile/recompile a V0 tx (the folded tx A
+   *  from lib/bundle/launch.ts) so the Sender tip can be appended LAST. */
+  lookupTable?: AddressLookupTableAccount;
 }
 
 /** The Sender tip (lamports) actually paid on mainnet, 0 on devnet. A flat
@@ -174,17 +180,139 @@ async function senderSend(base64: string): Promise<string> {
 }
 
 /**
+ * V0-protected send for the FOLDED launch tx A (lib/bundle/launch.ts builds
+ * it as a versioned message against the launch ALT). Per attempt: decompile
+ * the V0 message with the ALT, append the flat 5,000-lamport Sender tip LAST
+ * on mainnet (payer = signers[0]), recompile V0 with the ALT and re-sign.
+ * Mainnet POSTs to Helius Sender SWQOS-only; devnet sends over plain raw RPC
+ * (no tip). A stale/expired blockhash is retried with a fresh one; a confirm
+ * timeout or an on-chain revert is surfaced (never silently re-fired).
+ */
+async function sendProtectedVersioned(
+  connection: Connection,
+  tx: VersionedTransaction,
+  signers: Keypair[],
+  opts: ProtectedSendOptions
+): Promise<{ signature: string }> {
+  if (!opts.lookupTable) {
+    throw new Error(
+      `${opts.label ?? "tx"}: a V0 tx requires its lookupTable so the Sender tip can be appended`
+    );
+  }
+  const alt = opts.lookupTable;
+  const isMainnet = solanaNetwork() === "mainnet";
+  const attempts = opts.attempts ?? 3;
+  const confirmTimeoutMs = opts.confirmTimeoutMs ?? 45_000;
+  const label = opts.label ?? "tx";
+  const tipLamports = opts.tipLamports ?? HELIUS_SENDER_SWQOS_TIP_LAMPORTS;
+  const tipPayer = signers[0];
+  if (!tipPayer) throw new Error(`${label}: no signer to pay the tip`);
+  const tipAccount = opts.tipAccount ?? pickSenderTipAccount();
+
+  let lastErr: unknown = null;
+  for (let attempt = 0; attempt < attempts; attempt++) {
+    const latest = await connection.getLatestBlockhash("confirmed");
+
+    // Decompile the V0 message back to instructions with the ALT, then append
+    // the tip transfer LAST (the tip must be the final instruction) and
+    // recompile. `skipPriorityFeeIx` keeps the tx's own setComputeUnitPrice ix.
+    const decompiled = TransactionMessage.decompile(tx.message, {
+      addressLookupTableAccounts: [alt],
+    });
+    const instructions = [...decompiled.instructions];
+    if (!opts.skipPriorityFeeIx) {
+      instructions.unshift(
+        ComputeBudgetProgram.setComputeUnitPrice({
+          microLamports: DEFAULT_PRIORITY_FEE_MICRO_LAMPORTS,
+        })
+      );
+    }
+    if (isMainnet) {
+      instructions.push(
+        SystemProgram.transfer({
+          fromPubkey: tipPayer.publicKey,
+          toPubkey: tipAccount,
+          lamports: tipLamports,
+        })
+      );
+    }
+    const message = new TransactionMessage({
+      payerKey: decompiled.payerKey,
+      recentBlockhash: latest.blockhash,
+      instructions,
+    }).compileToV0Message([alt]);
+    const v0 = new VersionedTransaction(message);
+    v0.sign(signers);
+
+    let signature: string;
+    try {
+      const bytes = v0.serialize();
+      if (isMainnet) {
+        signature = await senderSend(Buffer.from(bytes).toString("base64"));
+      } else {
+        signature = await connection.sendRawTransaction(bytes);
+      }
+    } catch (e) {
+      lastErr = e;
+      if (isBlockhashExpiredError(errMsg(e)) && attempt + 1 < attempts) {
+        await sleepMs(400);
+        continue;
+      }
+      throw e instanceof Error ? e : new Error(String(e));
+    }
+
+    try {
+      const confirmed = await withTimeout(
+        connection.confirmTransaction(
+          {
+            signature,
+            blockhash: latest.blockhash,
+            lastValidBlockHeight: latest.lastValidBlockHeight,
+          },
+          "confirmed"
+        ),
+        confirmTimeoutMs,
+        `${label} (${signature}) confirm timed out after ${confirmTimeoutMs}ms; the tx may still land`
+      );
+      if (confirmed.value.err) {
+        throw new Error(
+          `${label} (${signature}) failed on chain: ${JSON.stringify(
+            confirmed.value.err
+          )}`
+        );
+      }
+      return { signature };
+    } catch (e) {
+      lastErr = e;
+      const msg = errMsg(e);
+      if (isBlockhashExpiredError(msg) && attempt + 1 < attempts) {
+        await sleepMs(400);
+        continue;
+      }
+      throw e instanceof Error ? e : new Error(String(e));
+    }
+  }
+  throw lastErr instanceof Error
+    ? lastErr
+    : new Error(`${label} failed after ${attempts} attempts`);
+}
+
+/**
  * Sends ONE signed tx with front-running protection. Mainnet: Helius Sender
  * SWQOS-only (priority fee + flat 5,000-lamport tip, mev-protect) confirmed
  * on-chain by signature. Devnet: plain sendAndConfirmWithRetry (no block
- * engine).
+ * engine). A V0 tx (the folded launch tx A) is handled by
+ * sendProtectedVersioned above; legacy txs keep the exact behaviour below.
  */
 export async function sendProtectedTx(
   connection: Connection,
-  tx: Transaction,
+  tx: Transaction | VersionedTransaction,
   signers: Keypair[],
   opts: ProtectedSendOptions = {}
 ): Promise<{ signature: string }> {
+  if (tx instanceof VersionedTransaction) {
+    return sendProtectedVersioned(connection, tx, signers, opts);
+  }
   if (solanaNetwork() !== "mainnet") {
     return sendAndConfirmWithRetry(connection, tx, signers, {
       attempts: opts.attempts,

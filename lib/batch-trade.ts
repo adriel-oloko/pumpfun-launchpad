@@ -37,12 +37,33 @@
 // this module runs (the trade panel's round gate) and passed in, so both
 // the gate and the batch quote against the same snapshot.
 //
+// MIGRATED VENUE (2026-09): a GRADUATED mint (curve `complete` = 1) has no
+// tradable curve left (curve buy/sell revert on-chain), so the manual BUY MAX
+// routes to the PumpSwap AMM instead: buySelectedWalletsMigrated buys on the
+// canonical pool through lib/swap.ts's buyMigratedPool (the official
+// @pump-fun/pump-swap-sdk quotes base out for an EXACT SOL input and wraps the
+// SOL itself). The budget follows the curve leg's rule exactly (total balance
+// minus the flat 0.002 SOL keep, the 5,000-lamport base fee, and only the
+// rents the tx must actually create) and the buy is quoted at ZERO slippage,
+// so the whole budget is committed: maxQuoteAmountIn IS the budget and a tick
+// up reverts cleanly instead of overdrawing the wallet below its keep. The
+// SELL routes there too: sellSelectedWalletsMigrated sells sellPct% of each
+// selected wallet's balance on the same pool through lib/sell-all.ts's
+// per-wallet pool leg (sellOneWalletOnPool) under the identical policy Sell All
+// uses (fresh quote per attempt, folded floors over the selected subset, its
+// own retry budgets), so a graduated mint no longer has to leave this panel to
+// be sold.
+//
 // All amounts are bigint (no bigint literals, project target is ES2017);
 // every tx is signed manually with the wallet's Keypair (anchor Wallet is
 // Node-only in the browser, and the anchor Program is gone entirely).
 
 import bs58 from "bs58";
-import { TOKEN_2022_PROGRAM_ID, getAssociatedTokenAddressSync } from "@solana/spl-token";
+import {
+  TOKEN_2022_PROGRAM_ID,
+  TOKEN_PROGRAM_ID,
+  getAssociatedTokenAddressSync,
+} from "@solana/spl-token";
 import { Connection, Keypair, PublicKey, Transaction } from "@solana/web3.js";
 import {
   AUTO_CONFIRM_TIMEOUT_MS,
@@ -55,18 +76,38 @@ import {
   walletTokenBalance,
 } from "./bundle/launch";
 import type { SendTx } from "./bundle/protected-send";
+import { WSOL_MINT } from "./migrate";
 import { MAX_BUY_KEEP_SOL_LAMPORTS } from "./params";
 import {
   buildPumpBuyIx,
   quotePumpBuy,
   resolvePumpFeeRecipient,
 } from "./pump";
+import {
+  MAX_SLIPPAGE_PCT,
+  planFoldedFloors,
+  sellOneWalletOnPool,
+} from "./sell-all";
+import { buyMigratedPool } from "./swap";
 
 /** Single-signature legacy tx base fee (lamports). A manual buy is one signer
  *  (the wallet) on a plain raw-RPC tx, so the base fee is exactly 5,000 — the
  *  max-buy budget reserves it precisely so the wallet lands exactly at its
  *  0.002 SOL keep. */
 const MANUAL_TX_BASE_FEE_LAMPORTS: bigint = BigInt(5_000);
+
+/** Token-2022 ATA size: 165 bytes of SPL account data + the 1-byte account
+ *  type + the 4-byte ImmutableOwner extension header. The MAX-buy budget
+ *  reserves this rent only when the wallet's ATA for the mint does not exist
+ *  yet (the buy's idempotent ATA-create ix bills the buyer). */
+const TOKEN_2022_ATA_RENT_BYTES = 170;
+
+/** Legacy SPL Token ATA size: the WSOL account a PumpSwap buy wraps its SOL
+ *  into. Reserved only when the buyer has no WSOL ATA yet — the SDK creates
+ *  it inside the buy tx and CLOSES it at the end of that same tx, so the rent
+ *  comes straight back to the wallet; it only has to be AVAILABLE at send
+ *  time. */
+const WSOL_ATA_RENT_BYTES = 165;
 
 /** Final outcome of one manual batch trade (the v4 batch pattern). */
 export interface ManualBatchResult {
@@ -293,7 +334,7 @@ export async function buySelectedWallets(
     return { completed: 0, failed: 0, skipped: 0, signatures: [] };
   }
   const ataRent = await connection.getMinimumBalanceForRentExemption(
-    170,
+    TOKEN_2022_ATA_RENT_BYTES,
     "confirmed"
   );
   const latest = await connection.getLatestBlockhash("confirmed");
@@ -338,4 +379,284 @@ export async function sellSelectedWallets(
     )
   );
   return tally(settled);
+}
+
+/* ------------------------------------------------------------------ */
+/* Migrated venue: the manual BUY MAX once the curve graduated         */
+/* ------------------------------------------------------------------ */
+
+export interface BuyMigratedSelectedOptions {
+  connection: Connection;
+  /** The graduated mint (it IS the PumpSwap pool's base mint). */
+  mint: PublicKey;
+  /** The canonical PumpSwap pool the mint migrated to (derive it with
+   *  canonicalMigratedPoolPda, lib/migrate.ts). */
+  poolKey: PublicKey;
+  /** Selected keyed managed wallets to buy for. */
+  wallets: AutoWallet[];
+  /** Slippage PERCENT for the pool quote (the SDK's 0-100 unit), default 0:
+   *  the whole budget is committed, exactly like the curve leg's zero-slippage
+   *  MAX buy. The SDK's `maxQuoteAmountIn` is `quoteLamports * (1 + s/100)` and
+   *  it WRAPS that figure as WSOL, so a band cannot be paid for out of thin
+   *  air: it has to come out of the budget (quoteLamports = budget / (1 +
+   *  s/100)), which leaves the band's share unbought. See the module header. */
+  slippagePct?: number;
+}
+
+/** MAX-buy budget for ONE wallet on the migrated venue: the wallet's total SOL
+ *  minus the flat 0.002 SOL keep (MAX_BUY_KEEP_SOL_LAMPORTS), its own
+ *  5,000-lamport base tx fee, and the rent of any account the buy tx has to
+ *  CREATE (the Token-2022 base ATA, and the WSOL account the SDK wraps the SOL
+ *  into). Callers pass 0 for an ATA that already exists. Returns 0 when
+ *  nothing is left to spend (the caller reports that wallet as skipped). Pure:
+ *  the SDK wraps exactly the budget figure as WSOL, so the wallet ends at its
+ *  keep. */
+export function poolBuyBudgetLamports(opts: {
+  liveLamports: bigint;
+  /** Rent of the mint's Token-2022 ATA (0 when it already exists). */
+  baseAtaRentLamports: bigint;
+  /** Rent of the wallet's WSOL ATA (0 when it already exists). The SDK closes
+   *  that account inside the buy tx, so this rent comes back to the wallet. */
+  wsolAtaRentLamports: bigint;
+}): bigint {
+  const budget =
+    opts.liveLamports -
+    MAX_BUY_KEEP_SOL_LAMPORTS -
+    MANUAL_TX_BASE_FEE_LAMPORTS -
+    opts.baseAtaRentLamports -
+    opts.wsolAtaRentLamports;
+  return budget > BigInt(0) ? budget : BigInt(0);
+}
+
+/** One MAX-buy worker on the migrated venue: sizes the wallet's budget, then
+ *  buys with it on the PumpSwap pool (lib/swap.ts). Resolves the confirmed
+ *  signature, or null when skipped (the live balance cannot cover the keep +
+ *  the rents + the base fee). Throws on build/send/confirm errors so the
+ *  settled count reports the wallet as failed. */
+async function buyMigratedOne(
+  connection: Connection,
+  mint: PublicKey,
+  poolKey: PublicKey,
+  wallet: AutoWallet,
+  /** Rent of the two possibly-missing ATAs, read once per batch. */
+  rent: { baseAtaLamports: bigint; wsolAtaLamports: bigint },
+  slippagePct: number
+): Promise<string | null> {
+  const kp = Keypair.fromSecretKey(bs58.decode(wallet.key));
+  const live = BigInt(await connection.getBalance(kp.publicKey, "confirmed"));
+  // The ATAs the buy tx creates when they are missing (the same derivations
+  // the SDK uses: base under the mint's Token-2022 program, quote = WSOL
+  // under the legacy token program).
+  const baseAta = getAssociatedTokenAddressSync(
+    mint,
+    kp.publicKey,
+    false,
+    TOKEN_2022_PROGRAM_ID
+  );
+  const wsolAta = getAssociatedTokenAddressSync(
+    WSOL_MINT,
+    kp.publicKey,
+    false,
+    TOKEN_PROGRAM_ID
+  );
+  const [baseInfo, wsolInfo] = await Promise.all([
+    connection.getAccountInfo(baseAta, "confirmed"),
+    connection.getAccountInfo(wsolAta, "confirmed"),
+  ]);
+  const budget = poolBuyBudgetLamports({
+    liveLamports: live,
+    baseAtaRentLamports: baseInfo ? BigInt(0) : rent.baseAtaLamports,
+    wsolAtaRentLamports: wsolInfo ? BigInt(0) : rent.wsolAtaLamports,
+  });
+  if (budget <= BigInt(0)) return null;
+  const { signature } = await buyMigratedPool({
+    connection,
+    poolKey,
+    buyer: kp,
+    quoteLamports: budget,
+    slippagePct,
+  });
+  return signature;
+}
+
+/**
+ * MAX-buys the mint on the PumpSwap pool for every selected keyed wallet
+ * (the graduated route): each spends its TOTAL SOL balance minus the flat
+ * 0.002 SOL keep and the mechanical costs described above, one signed tx per
+ * wallet, concurrently (Promise.allSettled, the v4 batch pattern), tallied
+ * into the same ManualBatchResult shape the curve leg returns. The pool
+ * account is read ONCE before the batch: a mint that reports graduated but has
+ * no pool behind it fails the whole run with a clean error instead of firing
+ * N wallets into a dead pool.
+ */
+export async function buySelectedWalletsMigrated(
+  opts: BuyMigratedSelectedOptions
+): Promise<ManualBatchResult> {
+  const { connection, mint, poolKey, wallets, slippagePct = 0 } = opts;
+  if (wallets.length === 0) {
+    return { completed: 0, failed: 0, skipped: 0, signatures: [] };
+  }
+  const poolInfo = await connection.getAccountInfo(poolKey, "confirmed");
+  if (!poolInfo) {
+    throw new Error(
+      `PUMPSWAP POOL ${poolKey.toBase58()} NOT FOUND (NOT MIGRATED?)`
+    );
+  }
+  const [baseAtaRent, wsolAtaRent] = await Promise.all([
+    connection.getMinimumBalanceForRentExemption(
+      TOKEN_2022_ATA_RENT_BYTES,
+      "confirmed"
+    ),
+    connection.getMinimumBalanceForRentExemption(
+      WSOL_ATA_RENT_BYTES,
+      "confirmed"
+    ),
+  ]);
+  const rent = {
+    baseAtaLamports: BigInt(baseAtaRent),
+    wsolAtaLamports: BigInt(wsolAtaRent),
+  };
+  const settled = await Promise.allSettled(
+    wallets.map((w) =>
+      buyMigratedOne(connection, mint, poolKey, w, rent, slippagePct)
+    )
+  );
+  return tally(settled);
+}
+
+/* ------------------------------------------------------------------ */
+/* Migrated venue: the manual SELL on the graduated mint's pool        */
+/* ------------------------------------------------------------------ */
+
+/** The slippage band the manual Sell passes on the pool leg: the SAME 5 the
+ *  Sell All button uses (lib/sell-all.ts default), never a UI knob. The engine
+ *  itself refuses anything above MAX_SLIPPAGE_PCT. */
+export const MANUAL_POOL_SELL_SLIPPAGE_PCT = 5;
+
+export interface SellMigratedSelectedOptions {
+  connection: Connection;
+  /** The graduated mint (it IS the PumpSwap pool's base mint). */
+  mint: PublicKey;
+  /** The canonical PumpSwap pool the mint migrated to (derive it with
+   *  canonicalMigratedPoolPda, lib/migrate.ts). */
+  poolKey: PublicKey;
+  /** Selected keyed managed wallets to sell for. */
+  wallets: AutoWallet[];
+  /** % of each wallet's OWN balance to sell, in (0, 100]. */
+  sellPct: number;
+  /** Slippage band percent for the pool quote (default 5). */
+  slippagePct?: number;
+}
+
+/**
+ * Sells sellPct% of every selected keyed wallet's own balance on the PumpSwap
+ * pool (the graduated route: the curve is closed, so a curve sell reverts).
+ *
+ * This reuses Sell All's policy rather than re-implementing it: the same fold
+ * plans each wallet's floor against the reserves its predecessors' sells leave
+ * (a concurrent fan-out cannot trip floors that only held for the snapshot
+ * state), every attempt re-quotes the live pool inside `sellOneWalletOnPool`,
+ * and a slippage revert is retried on its own budget against that fresh quote.
+ * Each wallet signs and pays for its own tx and the SDK closes its WSOL account
+ * in the same tx, so the proceeds land as NATIVE SOL.
+ *
+ * The fold is planned for the SELECTED subset AND the SELECTED percentage: the
+ * plan's step amounts are the amounts the legs send, so a stale 100% plan would
+ * set floors a partial sell cannot meet. Skipped = zero balance (or a
+ * percentage that floors to zero raw units); failed = a build/send/confirm
+ * error that survived the retry budgets.
+ */
+export async function sellSelectedWalletsMigrated(
+  opts: SellMigratedSelectedOptions
+): Promise<ManualBatchResult> {
+  const { connection, mint, poolKey, wallets, sellPct } = opts;
+  if (wallets.length === 0) {
+    return { completed: 0, failed: 0, skipped: 0, signatures: [] };
+  }
+  const slippagePct = opts.slippagePct ?? MANUAL_POOL_SELL_SLIPPAGE_PCT;
+  // Guard rails FIRST, before any network call, the same way Sell All validates
+  // its own: a manual round must not be able to widen slippage past the ceiling
+  // or ask for a sell of nothing, and the caller has to see the real reason
+  // rather than a per-wallet failure count.
+  if (!Number.isFinite(sellPct) || sellPct <= 0 || sellPct > 100) {
+    throw new Error(
+      `sellPct ${sellPct} is outside the allowed range (0, 100] (a sell of nothing is a no-op, not a report)`
+    );
+  }
+  if (
+    !Number.isFinite(slippagePct) ||
+    slippagePct < 0 ||
+    slippagePct > MAX_SLIPPAGE_PCT
+  ) {
+    throw new Error(
+      `slippagePct ${slippagePct} is outside the allowed range [0, ${MAX_SLIPPAGE_PCT}] ` +
+        `(MAX_SLIPPAGE_PCT guard rail: refusing to widen slippage to force a fill)`
+    );
+  }
+  // Pre-flight, once: a mint that reports graduated without a pool behind it
+  // fails the run with one clean error instead of N wallet-side failures.
+  const poolInfo = await connection.getAccountInfo(poolKey, "confirmed");
+  if (!poolInfo) {
+    throw new Error(
+      `PUMPSWAP POOL ${poolKey.toBase58()} NOT FOUND (NOT MIGRATED?)`
+    );
+  }
+  // Folded floors over the SELECTED subset, the same plan Sell All builds.
+  // Non-fatal by design (the sell-all rule): an empty plan means every wallet
+  // quotes fresh inside its own leg, which is the pre-fold behaviour and is
+  // only ever worse in that it may revert once and retry. A planning failure
+  // (one transient RPC read) must never abort a sell that would otherwise land.
+  let floors = new Map<string, bigint>();
+  try {
+    floors = await planFoldedFloors({
+      connection,
+      mint,
+      wallets,
+      route: "pumpSwap",
+      poolKey,
+      // Unused on the pool route: the fold reads the pool's own reserves.
+      curveVirtualSolReserves: BigInt(0),
+      curveVirtualTokenReserves: BigInt(0),
+      slippagePct,
+      sellPct,
+    });
+  } catch {
+    floors = new Map<string, bigint>();
+  }
+  const settled = await Promise.allSettled(
+    wallets.map(async (w) => {
+      const kp = Keypair.fromSecretKey(bs58.decode(w.key));
+      return await sellOneWalletOnPool({
+        connection,
+        mint,
+        poolKey,
+        wallet: kp,
+        sellPct,
+        slippagePct,
+        minOutLamports: floors.get(w.address),
+      });
+    })
+  );
+  let completed = 0;
+  let failed = 0;
+  let skipped = 0;
+  const signatures: string[] = [];
+  for (const r of settled) {
+    if (r.status !== "fulfilled") {
+      // A rejected worker (an unreadable key, say) is a failure for that
+      // wallet, and the count stays visible.
+      failed += 1;
+      continue;
+    }
+    const outcome = r.value;
+    if (outcome.status === "sold") {
+      completed += 1;
+      if (outcome.signature) signatures.push(outcome.signature);
+    } else if (outcome.status === "skipped") {
+      skipped += 1;
+    } else {
+      failed += 1;
+    }
+  }
+  return { completed, failed, skipped, signatures };
 }

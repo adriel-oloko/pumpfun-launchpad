@@ -12,9 +12,17 @@
 // creator, buyers, and their mint/creator/buyer-derived PDAs) stay in the
 // message as full pubkeys.
 //
-// The ALT is created once (cheap) and reused for every launch on the same
-// cluster. It is only needed for SIMULATION — the real create/buy txs fit
-// under 1232 bytes on their own and stay legacy.
+// The ALT is now part of the REAL launch, not just the simulation sandbox:
+// the folded tx A (create_v2 + extend_account + the creator's own ATA create
+// + dev buy) is a V0 message compiled against it (lib/bundle/launch.ts), and
+// the pre-flight sandbox uses the same table. The table is created ONCE per
+// cluster and cached — a 17-address table is ~0.005 SOL of rent, refundable
+// only after deactivation; the launch panel caches the address in
+// localStorage keyed by network so a relaunch reuses it instead of paying
+// the rent again.
+//
+// It is not a fallback: the legacy create-only path and every buy tx stay
+// legacy and do not reference it.
 
 import {
   AddressLookupTableAccount,
