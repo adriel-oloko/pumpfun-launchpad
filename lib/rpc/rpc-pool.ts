@@ -36,24 +36,24 @@
  * NO SECRETS IN CODE. Endpoints come from env vars or the public defaults.
  */
 
-import { RPC_LIMITER } from './rpc-limiter'
+import { RPC_LIMITER } from "./rpc-limiter";
 
-const normalize = (u: string): string => u.replace(/\/+$/, '')
+const normalize = (u: string): string => u.replace(/\/+$/, "");
 
 /** Comma-separated env var -> trimmed, non-empty, normalized URL list. */
 function envEndpoints(envName: string): string[] {
-    const raw = process.env[envName]
-    if (!raw) return []
-    return raw
-        .split(',')
-        .map((s) => s.trim())
-        .filter(Boolean)
-        .map(normalize)
+	const raw = process.env[envName];
+	if (!raw) return [];
+	return raw
+		.split(",")
+		.map((s) => s.trim())
+		.filter(Boolean)
+		.map(normalize);
 }
 
 /** Env override first, public defaults last, de-duplicated. */
 function buildPool(envName: string, defaults: string[]): string[] {
-    return [...new Set([...envEndpoints(envName), ...defaults].map(normalize))]
+	return [...new Set([...envEndpoints(envName), ...defaults].map(normalize))];
 }
 
 /**
@@ -65,11 +65,11 @@ function buildPool(envName: string, defaults: string[]): string[] {
  * (Helius/Triton/QuickNode) via the env var.
  */
 export const MAINNET_RPC_POOL: string[] = buildPool(
-    'NEXT_PUBLIC_SOLANA_RPC_MAINNET',
-    [
-        'https://mainnet.helius-rpc.com/?api-key=03a5d09b-993b-417b-b2d0-a43581cbce7e',
-    ]
-)
+	"NEXT_PUBLIC_SOLANA_RPC_MAINNET",
+	[
+		"https://alien-billowing-voice.solana-mainnet.quiknode.pro/63ad5544cf41a4110f8a9bc5e8b2fa31420b620f",
+	],
+);
 
 /**
  * Devnet pool: env NEXT_PUBLIC_SOLANA_RPC_DEVNET + keyed Helius default.
@@ -82,30 +82,30 @@ export const MAINNET_RPC_POOL: string[] = buildPool(
  * var if you want it as a fallback.
  */
 export const DEVNET_RPC_POOL: string[] = buildPool(
-    'NEXT_PUBLIC_SOLANA_RPC_DEVNET',
-    [
-        'https://devnet.helius-rpc.com/?api-key=03a5d09b-993b-417b-b2d0-a43581cbce7e',
-    ]
-)
+	"NEXT_PUBLIC_SOLANA_RPC_DEVNET",
+	[
+		"https://devnet.helius-rpc.com/?api-key=03a5d09b-993b-417b-b2d0-a43581cbce7e",
+	],
+);
 
 /** How long a failing URL is taken out of rotation (ms). */
-const BACKOFF_MS = 45_000
+const BACKOFF_MS = 45_000;
 
 /** Max endpoints tried per logical request before giving up. */
-const RETRY_ATTEMPTS = 3
+const RETRY_ATTEMPTS = 3;
 
 /** Per-attempt ceiling (ms) so a hung endpoint fails over instead of eating
  *  the whole transport budget. */
-const ATTEMPT_TIMEOUT_MS = 10_000
+const ATTEMPT_TIMEOUT_MS = 10_000;
 
 /** Timestamp until which each URL is cooling down (0 = healthy). */
-const backoffUntil = new Map<string, number>()
+const backoffUntil = new Map<string, number>();
 
 /** Round-robin cursor. */
-let rrIndex = 0
+let rrIndex = 0;
 
 function markBackoff(url: string): void {
-    backoffUntil.set(url, Date.now() + BACKOFF_MS)
+	backoffUntil.set(url, Date.now() + BACKOFF_MS);
 }
 
 /** Next healthy pool URL (round-robin, skipping cooldown'd endpoints), or
@@ -114,17 +114,17 @@ function markBackoff(url: string): void {
  *  would instantly re-hammer a throttled endpoint (the old behavior turned a
  *  brief 429 into a sustained failure loop). */
 function pickNextUrl(pool: string[]): string | null {
-    const now = Date.now()
-    const start = rrIndex % pool.length
-    for (let i = 0; i < pool.length; i++) {
-        const idx = (start + i) % pool.length
-        const url = pool[idx]
-        if ((backoffUntil.get(url) ?? 0) <= now) {
-            rrIndex = (idx + 1) % pool.length
-            return url
-        }
-    }
-    return null
+	const now = Date.now();
+	const start = rrIndex % pool.length;
+	for (let i = 0; i < pool.length; i++) {
+		const idx = (start + i) % pool.length;
+		const url = pool[idx];
+		if ((backoffUntil.get(url) ?? 0) <= now) {
+			rrIndex = (idx + 1) % pool.length;
+			return url;
+		}
+	}
+	return null;
 }
 
 /** When every endpoint is cooling, sleep until the soonest one recovers
@@ -132,21 +132,21 @@ function pickNextUrl(pool: string[]): string | null {
  *  instead of clearing it and hammering the throttled endpoint. Capped so a
  *  pathological single-endpoint pool still surfaces its failure promptly. */
 function sleepUntilHealthy(pool: string[]): Promise<void> {
-    const now = Date.now()
-    const soonest = Math.min(...pool.map((url) => backoffUntil.get(url) ?? 0))
-    const wait = Math.min(Math.max(soonest - now, 0) + 25, 46_000)
-    return new Promise((resolve) => setTimeout(resolve, wait))
+	const now = Date.now();
+	const soonest = Math.min(...pool.map((url) => backoffUntil.get(url) ?? 0));
+	const wait = Math.min(Math.max(soonest - now, 0) + 25, 46_000);
+	return new Promise((resolve) => setTimeout(resolve, wait));
 }
 
 /** Combine the caller's signal with a per-attempt timeout so a slow URL
  *  aborts and failover can move on. Falls back to the caller's signal alone
  *  where AbortSignal.any is unavailable (very old browsers). */
 function attemptSignal(outer: AbortSignal | null | undefined): AbortSignal {
-    const attempt = AbortSignal.timeout(ATTEMPT_TIMEOUT_MS)
-    if (!outer) return attempt
-    return typeof AbortSignal.any === 'function'
-        ? AbortSignal.any([outer, attempt])
-        : outer
+	const attempt = AbortSignal.timeout(ATTEMPT_TIMEOUT_MS);
+	if (!outer) return attempt;
+	return typeof AbortSignal.any === "function"
+		? AbortSignal.any([outer, attempt])
+		: outer;
 }
 
 /**
@@ -160,48 +160,48 @@ function attemptSignal(outer: AbortSignal | null | undefined): AbortSignal {
  * once — do not wrap this function in another limiter anywhere.
  */
 export async function rotatingFetch(
-    pool: string[],
-    input: RequestInfo | URL,
-    init?: RequestInit
+	pool: string[],
+	input: RequestInfo | URL,
+	init?: RequestInit,
 ): Promise<Response> {
-    let lastError: unknown = null
-    for (let attempt = 0; attempt < RETRY_ATTEMPTS; attempt++) {
-        const url = pickNextUrl(pool)
-        // All endpoints cooling down: WAIT for the soonest cooldown to expire
-        // instead of re-hammering a throttled endpoint (the old clear() here
-        // amplified a brief 429 into a sustained failure loop). Honor the
-        // caller's abort signal during the wait.
-        if (url === null) {
-            await sleepUntilHealthy(pool)
-            continue
-        }
-        const signal = attemptSignal(init?.signal)
-        try {
-            const response = await RPC_LIMITER.run(() =>
-                fetch(url, { ...init, signal })
-            )
-            // Retryable HTTP statuses: 408 (rate limit), 429 (rate limit),
-            // 5xx (server fault). Everything else, including 4xx like
-            // 401/403, is returned as-is — retrying cannot fix auth/forbidden.
-            if (
-                response.status === 408 ||
-                response.status === 429 ||
-                response.status >= 500
-            ) {
-                markBackoff(url)
-                continue
-            }
-            return response
-        } catch (err) {
-            // Network error / timeout / abort. Record it so the LAST attempt
-            // rethrows something meaningful instead of a bare pool exhaustion.
-            lastError = err
-            markBackoff(url)
-        }
-    }
-    throw lastError instanceof Error
-        ? lastError
-        : new Error(
-              'RPC pool exhausted: every endpoint failed or is cooling down'
-          )
+	let lastError: unknown = null;
+	for (let attempt = 0; attempt < RETRY_ATTEMPTS; attempt++) {
+		const url = pickNextUrl(pool);
+		// All endpoints cooling down: WAIT for the soonest cooldown to expire
+		// instead of re-hammering a throttled endpoint (the old clear() here
+		// amplified a brief 429 into a sustained failure loop). Honor the
+		// caller's abort signal during the wait.
+		if (url === null) {
+			await sleepUntilHealthy(pool);
+			continue;
+		}
+		const signal = attemptSignal(init?.signal);
+		try {
+			const response = await RPC_LIMITER.run(() =>
+				fetch(url, { ...init, signal }),
+			);
+			// Retryable HTTP statuses: 408 (rate limit), 429 (rate limit),
+			// 5xx (server fault). Everything else, including 4xx like
+			// 401/403, is returned as-is — retrying cannot fix auth/forbidden.
+			if (
+				response.status === 408 ||
+				response.status === 429 ||
+				response.status >= 500
+			) {
+				markBackoff(url);
+				continue;
+			}
+			return response;
+		} catch (err) {
+			// Network error / timeout / abort. Record it so the LAST attempt
+			// rethrows something meaningful instead of a bare pool exhaustion.
+			lastError = err;
+			markBackoff(url);
+		}
+	}
+	throw lastError instanceof Error
+		? lastError
+		: new Error(
+				"RPC pool exhausted: every endpoint failed or is cooling down",
+			);
 }
