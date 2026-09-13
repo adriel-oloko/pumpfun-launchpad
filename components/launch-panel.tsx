@@ -1755,7 +1755,7 @@ export function LaunchPanel({
 					</div>
 				) : null}
 
-				<div className="border-t-2 border-white pt-3">
+				<div className="border-t-2 border-white pt-3 hidden">
 					<label
 						className="label-mono flex cursor-pointer items-start gap-2"
 						title="create the coin and dev-buy it from the creator WITHOUT filling/graduating the curve; no MigrateV2; Sell All then routes through the bonding curve">
