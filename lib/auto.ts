@@ -81,11 +81,13 @@ import {
 } from "./bundle/launch";
 import type { SendTx } from "./bundle/protected-send";
 import { WSOL_MINT, canonicalMigratedPoolPda } from "./migrate";
+import { CURVE_SLIPPAGE_BPS } from "./params";
 import {
+  buildPumpBuyExactSolInIx,
   buildPumpBuyIx,
   buildPumpSellIx,
-  capBuySolForSlippage,
   quotePumpBuy,
+  quotePumpBuyExactIn,
   quotePumpSell,
   readPumpCurveState,
   resolvePumpFeeRecipient,
@@ -224,8 +226,9 @@ export function poolSpendableForBuy(opts: {
  *  Pure. NO slippage cap since 2026-09-14: the pool buy goes out EXACT-IN
  *  (buy_exact_quote_in, lib/swap.ts), so the WSOL the tx wraps is the commit
  *  itself and the band is only a floor on the tokens received. (The old
- *  `capBuySolForSlippage` cap existed because the SDK's plain `buy` wrapped
- *  `commit * (1 + s/100)`; it left ~9% of a full-spend round unspent.) */
+ *  `capBuySolForSlippage` cap — since DELETED, no buy shape needs it anymore —
+ *  existed because the SDK's plain `buy` wrapped `commit * (1 + s/100)`; it
+ *  left ~9% of a full-spend round unspent.) */
 export function poolBuyCommitLamports(
   spendableLamports: bigint,
   buyPct?: number
@@ -506,28 +509,27 @@ export async function fireAutoBuy(
         AUTO_TX_FEE_RESERVE_LAMPORTS -
         reserveAta;
       if (spendable <= BigInt(0)) return "skipped";
-      const solInRaw = (spendable * BigInt(pctNum)) / BigInt(10_000);
-      // Slippage ceiling: the buy ix commits max_sol_cost = solIn * 1.10
-      // (10% default slippage), which the spendable base does NOT reserve —
-      // at a high % (the 95 default) a full-slippage fill can overdraw a tiny
-      // wallet below its rent floor. Cap the commit at spendable / 1.10.
-      const maxCommit = capBuySolForSlippage(spendable);
-      const solIn = solInRaw > maxCommit ? maxCommit : solInRaw;
+      const solIn = (spendable * BigInt(pctNum)) / BigInt(10_000);
+      // No slippage cap: the buy is EXACT-IN, so the program spends exactly
+      // `solIn` and the band is a floor on the tokens received, not headroom
+      // the wallet has to fund. (The old cap held the commit at spendable/1.10
+      // for the plain buy's max_sol_cost headroom, which left ~9% unspent.)
       if (solIn <= BigInt(0)) return "skipped";
-      const quote = quotePumpBuy({
+      const quote = quotePumpBuyExactIn({
         solInLamports: solIn,
         virtualSolReserves: vsr,
         virtualTokenReserves: vtr,
+        slippageBps: CURVE_SLIPPAGE_BPS,
       });
       vsr = quote.nextVirtualSolReserves;
       vtr = quote.nextVirtualTokenReserves;
-      const ixs = buildPumpBuyIx({
+      const ixs = buildPumpBuyExactSolInIx({
         mint,
         buyer: kp.publicKey,
         creator,
         feeRecipient,
-        tokensOut: quote.tokensOut,
-        maxSolCost: quote.maxSolCost,
+        spendableSolIn: solIn,
+        minTokensOut: quote.minTokensOut,
       });
       const tx = new Transaction({
         feePayer: kp.publicKey,
@@ -685,6 +687,10 @@ export async function fireAutoSell(
           tokensIn: tokenIn,
           virtualSolReserves: vsr,
           virtualTokenReserves: vtr,
+          // The operator's band (20%): min_sol_output sits this far under the
+          // net quote, so a fill that collapsed past it reverts instead of
+          // dumping the bag. A sell band is a floor, never headroom.
+          slippageBps: CURVE_SLIPPAGE_BPS,
         });
         vsr = vsr + quote.netSolOut;
         vtr = vtr - tokenIn;

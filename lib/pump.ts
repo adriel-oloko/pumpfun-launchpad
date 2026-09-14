@@ -43,8 +43,10 @@ import {
   PublicKey,
   SystemProgram,
   TransactionInstruction,
+  type AccountMeta,
 } from "@solana/web3.js";
 import { solanaNetwork } from "./network";
+import { CURVE_SLIPPAGE_BPS } from "./params";
 
 /* ------------------------------------------------------------------ */
 /* Verified pump.fun constants (M10 prompt table; do not guess)        */
@@ -261,6 +263,13 @@ export const PUMP_CREATE_V2_DISCRIMINATOR: number[] = [
 ];
 export const PUMP_BUY_DISCRIMINATOR: number[] = [
   102, 6, 61, 18, 1, 218, 235, 234, // 0x66063d1201daebea
+];
+/** `buy_exact_sol_in(spendable_sol_in, min_tokens_out, track_volume)`: the
+ *  curve's EXACT-IN buy. Verified from @pump-fun/pump-sdk 2.0.0
+ *  `src/idl/pump.json` (the program's own SDK), which also confirms it
+ *  declares the SAME 16 accounts in the SAME order as `buy`. */
+export const PUMP_BUY_EXACT_SOL_IN_DISCRIMINATOR: number[] = [
+  56, 252, 116, 8, 158, 223, 205, 95, // 0x38fc74089edfcd5f
 ];
 export const PUMP_SELL_DISCRIMINATOR: number[] = [
   51, 230, 133, 164, 1, 127, 131, 173, // 0x33e685a4017f83ad
@@ -536,6 +545,64 @@ export interface PumpBuyQuote {
   nextVirtualTokenReserves: bigint;
 }
 
+export interface PumpBuyExactInQuote {
+  /** Tokens the curve returns for the WHOLE `spendableSolIn` at the quote-time
+   *  reserves (raw units): what the wallet receives IF nothing moved. */
+  tokensOut: bigint;
+  /** The FLOOR handed to `buy_exact_sol_in` as `min_tokens_out`: `tokensOut`
+   *  discounted by the band. The program reverts (BuySlippageBelowMinTokensOut)
+   *  only if the fill would come out below this. */
+  minTokensOut: bigint;
+  /** Simulated virtual sol reserve AFTER this buy (chain quotes). */
+  nextVirtualSolReserves: bigint;
+  /** Simulated virtual token reserve AFTER this buy (chain quotes). */
+  nextVirtualTokenReserves: bigint;
+}
+
+/**
+ * Quotes the curve's EXACT-IN buy: spend `solInLamports` in FULL, with the
+ * slippage band held as a FLOOR on the tokens received (`min_tokens_out`).
+ *
+ * This is what lets "spend the whole MAX budget" and "tolerate an adverse
+ * move" hold at the same time on the curve. The plain `buy` takes a token
+ * amount plus a `max_sol_cost` CEILING, so a band there could only be funded
+ * by committing `budget / (1 + s)` and leaving the difference unspent in the
+ * wallet (the reverted 2026-09-08 shape); `buy_exact_sol_in` spends the input
+ * itself and enforces the floor instead.
+ *
+ * Delegates to `quotePumpBuy` for the curve math so the two shapes can never
+ * disagree on the numbers.
+ */
+export function quotePumpBuyExactIn(opts: {
+  solInLamports: bigint;
+  virtualSolReserves: bigint;
+  virtualTokenReserves: bigint;
+  feeBps?: bigint;
+  slippageBps?: bigint;
+}): PumpBuyExactInQuote {
+  const slippageBps = opts.slippageBps ?? CURVE_SLIPPAGE_BPS;
+  if (slippageBps < BigInt(0) || slippageBps > BigInt(10_000)) {
+    throw new Error(
+      `buy slippageBps ${slippageBps} is outside the allowed range [0, 10000]`
+    );
+  }
+  const q = quotePumpBuy({
+    solInLamports: opts.solInLamports,
+    virtualSolReserves: opts.virtualSolReserves,
+    virtualTokenReserves: opts.virtualTokenReserves,
+    feeBps: opts.feeBps,
+    slippageBps,
+  });
+  const minTokensOut =
+    (q.tokensOut * (BigInt(10_000) - slippageBps)) / BigInt(10_000);
+  return {
+    tokensOut: q.tokensOut,
+    minTokensOut,
+    nextVirtualSolReserves: q.nextVirtualSolReserves,
+    nextVirtualTokenReserves: q.nextVirtualTokenReserves,
+  };
+}
+
 /**
  * Quotes a pump.fun buy from a SOL amount against the curve's VIRTUAL
  * reserves (the exact numbers the program quotes on). Fee = 100 bps (1%)
@@ -716,23 +783,6 @@ export function quotePumpFill(
   };
 }
 
-/** Max SOL a buy may commit given a wallet's spendable balance and the
- *  slippage headroom: spendable / (1 + slippageBps/10000). The buy
- *  instruction's max_sol_cost = solIn * (1 + slippage), so committing the
- *  whole spendable lets a full-slippage fill overdraw the wallet below its
- *  rent floor (the ATA rent + tx fee are reserved OUT of spendable, but the
- *  slippage headroom is not). Buyers must stay at or under this ceiling. */
-export function capBuySolForSlippage(
-  spendableLamports: bigint,
-  slippageBps?: bigint
-): bigint {
-  const slip = slippageBps ?? PUMP_DEFAULT_SLIPPAGE_BPS;
-  if (spendableLamports <= BigInt(0)) return BigInt(0);
-  return (
-    (spendableLamports * BigInt(10_000)) / (BigInt(10_000) + slip)
-  );
-}
-
 /* ------------------------------------------------------------------ */
 /* Instruction builders (hand-built TransactionInstructions)            */
 /* ------------------------------------------------------------------ */
@@ -850,31 +900,22 @@ export function buildPumpExtendAccountIx(opts: {
 }
 
 /**
- * Builds the pump.fun `buy` instruction pair for one buyer:
- *   [createAssociatedTokenAccountIdempotent (buyer ATA, Token-2022), buy]
- * The ATA-create is harmless when the ATA already exists (the proven SDKs do
- * exactly this). buy data = discriminator ++ u64le(tokens_out) ++
- * u64le(max_sol_cost) ++ u8(track_volume=1). The account order below is the
- * official current buy layout (18 accounts, incl. the fee-program leg:
- * creator_vault, volume accumulators, fee_config, fee_program, and the two
- * remaining accounts bonding_curve_v2 + one buyback fee recipient). The
- * token_program account is Token-2022 (this is the SAME instruction the
- * official SDK uses for Token-2022 tokens: createV2AndBuyInstructions passes
- * TOKEN_2022_PROGRAM_ID).
+ * The account list + ATA-create leg both curve BUY instructions share.
+ *
+ * `buy` and `buy_exact_sol_in` declare the SAME 16 accounts in the SAME order
+ * (verified against @pump-fun/pump-sdk 2.0.0 `src/idl/pump.json`), so the 18
+ * metas below (the 16, plus the two remaining accounts the deployed program
+ * expects: bonding_curve_v2 and one buyback fee recipient) serve both. Having
+ * ONE source is what keeps the exact-in path from silently drifting off the
+ * proven `buy` layout.
  */
-export function buildPumpBuyIx(opts: {
+function pumpBuyAccountLeg(opts: {
   mint: PublicKey;
   buyer: PublicKey;
-  /** The curve's recorded creator (from readPumpCurveState; the creator
-   *  vault + the creator fee leg are derived from it). */
   creator: PublicKey;
-  /** The LIVE protocol fee recipient (resolvePumpFeeRecipient). Passing a
-   *  stale/rotated value makes the program revert with Custom 6000. */
   feeRecipient: PublicKey;
-  tokensOut: bigint;
-  maxSolCost: bigint;
-}): TransactionInstruction[] {
-  const { mint, buyer, creator, feeRecipient, tokensOut, maxSolCost } = opts;
+}): { keys: AccountMeta[]; ataIx: TransactionInstruction } {
+  const { mint, buyer, creator, feeRecipient } = opts;
   const [bondingCurve] = pumpBondingCurvePda(mint);
   const associatedBondingCurve = pumpBondingCurveAta(mint);
   const associatedUser = pumpUserAta(mint, buyer);
@@ -893,7 +934,7 @@ export function buildPumpBuyIx(opts: {
     ASSOCIATED_TOKEN_PROGRAM_ID
   );
 
-  const keys = [
+  const keys: AccountMeta[] = [
     { pubkey: PUMP_GLOBAL, isSigner: false, isWritable: false },
     { pubkey: feeRecipient, isSigner: false, isWritable: true },
     { pubkey: mint, isSigner: false, isWritable: false },
@@ -913,10 +954,103 @@ export function buildPumpBuyIx(opts: {
     { pubkey: bondingCurveV2, isSigner: false, isWritable: false },
     { pubkey: PUMP_BUYBACK_FEE_RECIPIENT, isSigner: false, isWritable: true },
   ];
+  return { keys, ataIx };
+}
+
+/**
+ * Builds the pump.fun `buy` instruction pair for one buyer:
+ *   [createAssociatedTokenAccountIdempotent (buyer ATA, Token-2022), buy]
+ * The ATA-create is harmless when the ATA already exists (the proven SDKs do
+ * exactly this). buy data = discriminator ++ u64le(tokens_out) ++
+ * u64le(max_sol_cost) ++ u8(track_volume=1). The account order below is the
+ * official current buy layout (18 accounts, incl. the fee-program leg:
+ * creator_vault, volume accumulators, fee_config, fee_program, and the two
+ * remaining accounts bonding_curve_v2 + one buyback fee recipient). The
+ * token_program account is Token-2022 (this is the SAME instruction the
+ * official SDK uses for Token-2022 tokens: createV2AndBuyInstructions passes
+ * TOKEN_2022_PROGRAM_ID).
+ *
+ * This is the TOKEN-EXACT-OUT shape: `tokensOut` is fixed and `maxSolCost`
+ * ceilings the price. For a MAX buy that has to spend the whole budget AND
+ * carry a band, use `buildPumpBuyExactSolInIx` instead.
+ */
+export function buildPumpBuyIx(opts: {
+  mint: PublicKey;
+  buyer: PublicKey;
+  /** The curve's recorded creator (from readPumpCurveState; the creator
+   *  vault + the creator fee leg are derived from it). */
+  creator: PublicKey;
+  /** The LIVE protocol fee recipient (resolvePumpFeeRecipient). Passing a
+   *  stale/rotated value makes the program revert with Custom 6000. */
+  feeRecipient: PublicKey;
+  tokensOut: bigint;
+  maxSolCost: bigint;
+}): TransactionInstruction[] {
+  const { mint, buyer, creator, feeRecipient, tokensOut, maxSolCost } = opts;
+  const { keys, ataIx } = pumpBuyAccountLeg({
+    mint,
+    buyer,
+    creator,
+    feeRecipient,
+  });
   const data = Buffer.concat([
     Buffer.from(PUMP_BUY_DISCRIMINATOR),
     u64leBytes(tokensOut),
     u64leBytes(maxSolCost),
+    Buffer.from([1]), // track_volume: OptionBool (1 byte; 1 = Some(true)/track)
+  ]);
+  const buyIx = new TransactionInstruction({
+    keys,
+    programId: PUMP_PROGRAM_ID,
+    data,
+  });
+  return [ataIx, buyIx];
+}
+
+/**
+ * Builds the pump.fun `buy_exact_sol_in` instruction pair for one buyer: the
+ * EXACT-IN curve buy.
+ *   [createAssociatedTokenAccountIdempotent (buyer ATA, Token-2022),
+ *    buy_exact_sol_in]
+ * data = discriminator ++ u64le(spendable_sol_in) ++ u64le(min_tokens_out) ++
+ * u8(track_volume=1). SAME accounts as `buy` (one shared leg, see
+ * pumpBuyAccountLeg): the whole `spendableSolIn` is spent and the trade only
+ * reverts if the tokens received would come out below `minTokensOut`
+ * (BuySlippageBelowMinTokensOut).
+ *
+ * Use this for the MAX buy: it commits the entire budget AND carries the band,
+ * which the token-exact-out `buy` cannot do (its `max_sol_cost` ceiling is
+ * headroom the wallet would have to fund out of the same budget).
+ */
+export function buildPumpBuyExactSolInIx(opts: {
+  mint: PublicKey;
+  buyer: PublicKey;
+  /** The curve's recorded creator (creator_vault derivation). */
+  creator: PublicKey;
+  /** The LIVE protocol fee recipient (resolvePumpFeeRecipient). */
+  feeRecipient: PublicKey;
+  /** SOL committed: the program spends ALL of it (lamports). */
+  spendableSolIn: bigint;
+  /** Floor on the tokens received (quotePumpBuyExactIn's `minTokensOut`). */
+  minTokensOut: bigint;
+}): TransactionInstruction[] {
+  const { mint, buyer, creator, feeRecipient, spendableSolIn, minTokensOut } =
+    opts;
+  if (spendableSolIn <= BigInt(0)) {
+    throw new Error(
+      `buy_exact_sol_in spendable_sol_in must be positive, got ${spendableSolIn}`
+    );
+  }
+  const { keys, ataIx } = pumpBuyAccountLeg({
+    mint,
+    buyer,
+    creator,
+    feeRecipient,
+  });
+  const data = Buffer.concat([
+    Buffer.from(PUMP_BUY_EXACT_SOL_IN_DISCRIMINATOR),
+    u64leBytes(spendableSolIn),
+    u64leBytes(minTokensOut),
     Buffer.from([1]), // track_volume: OptionBool (1 byte; 1 = Some(true)/track)
   ]);
   const buyIx = new TransactionInstruction({

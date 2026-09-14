@@ -7,7 +7,7 @@
     "build": "next build",
     "start": "next start",
     "lint": "eslint",
-    "test": "ts-mocha -p ./tsconfig.test.json tests/launch-fill-plan.ts tests/pool-buy-budget.ts tests/pool-sell-pct.ts tests/auto-migrated-venue.ts tests/deposit-plan.ts"
+    "test": "ts-mocha -p ./tsconfig.test.json tests/launch-fill-plan.ts tests/pool-buy-budget.ts tests/pool-sell-pct.ts tests/auto-migrated-venue.ts tests/curve-buy-exact-in.ts tests/deposit-plan.ts"
   },
   "dependencies": {
     "@coral-xyz/anchor": "^0.31.1",

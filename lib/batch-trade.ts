@@ -5,22 +5,25 @@
 // semantics of v4-launchpad's "Buy / Sell" tab but on the pump.fun Solana
 // client:
 //
-//   - Buy (MAX, 2026-09-08; flat-keep commit): for every selected keyed
-//     wallet, spend its TOTAL SOL balance minus a flat 0.002 SOL keep, the
-//     5,000-lamport base tx fee, and the Token-2022 ATA rent ONLY when the
-//     wallet's ATA for this mint does not exist yet, quoted at zero slippage
-//     so max_sol_cost = solIn = budget exactly. NO rent-floor reserve, NO
-//     fee margin, NO slippage-band discount (the old budget / 1.10 sizing
-//     left ~10% of the spendable balance unbought; the 2026-09-08 band
-//     commit is gone). A wallet ends at exactly 0.002 SOL after the buy.
-//     Skipped when the balance cannot cover the keep + ATA rent + base fee.
-//     CURVE ONLY: pump.fun's curve buy takes (tokens_out, max_sol_cost), so
-//     a band there can only be paid for by shrinking solIn to budget / (1+s)
-//     and stranding the difference. The migrated venue has an exact-in shape
-//     and DOES carry a band (below).
+//   - Buy (MAX, 2026-09-08; flat-keep commit, exact-in since 2026-09-14): for
+//     every selected keyed wallet, spend its TOTAL SOL balance minus a flat
+//     0.002 SOL keep, the 5,000-lamport base tx fee, and the Token-2022 ATA
+//     rent ONLY when the wallet's ATA for this mint does not exist yet. The buy
+//     goes out as `buy_exact_sol_in(spendable_sol_in, min_tokens_out)`: the
+//     whole budget is SPENT and CURVE_SLIPPAGE_BPS (20%) is held as a floor on
+//     the tokens received. A wallet ends at exactly 0.002 SOL when the curve
+//     has not moved. Skipped when the balance cannot cover the keep + ATA rent
+//     + base fee.
+//     (History: until 2026-09-14 the curve buy was the token-exact-out
+//     `buy(tokens_out, max_sol_cost)` at ZERO band, because a band on that
+//     shape can only be funded by committing budget / (1 + s) — the reverted
+//     2026-09-08 /1.10 experiment that left ~9% of the balance unbought — and
+//     at a zero band ANY adverse tick reverted with Custom 6002. The curve
+//     program's own exact-in instruction removes that trade-off; it is the twin
+//     of the migrated venue's buy_exact_quote_in.)
 //   - Sell: for every selected keyed wallet, sell sellPct% of the wallet's
 //     current token balance of the tracked mint (walletTokenBalance). The
-//     curve sell carries SELL_SLIPPAGE_BPS (20%) under the net quote as
+//     curve sell carries CURVE_SLIPPAGE_BPS (20%) under the net quote as
 //     min_sol_output (a sell band costs nothing: the floor only stops a
 //     collapsed fill). Skipped when the balance is zero.
 //
@@ -87,10 +90,10 @@ import {
 } from "./bundle/launch";
 import type { SendTx } from "./bundle/protected-send";
 import { WSOL_MINT } from "./migrate";
-import { MAX_BUY_KEEP_SOL_LAMPORTS, SELL_SLIPPAGE_BPS } from "./params";
+import { CURVE_SLIPPAGE_BPS, MAX_BUY_KEEP_SOL_LAMPORTS } from "./params";
 import {
-  buildPumpBuyIx,
-  quotePumpBuy,
+  buildPumpBuyExactSolInIx,
+  quotePumpBuyExactIn,
   resolvePumpFeeRecipient,
 } from "./pump";
 import {
@@ -177,13 +180,13 @@ function pctNum(pct: number): number {
  *  tx fee (the wallet is its own fee payer) plus the Token-2022 ATA rent
  *  ONLY when the wallet's ATA for this mint does not exist yet (the buy's
  *  ATA-create ix bills the wallet; once it exists the rent is skipped so the
- *  wallet buys that much more). Quoted at ZERO slippage so
- *  max_sol_cost = solIn = budget: every lamport above the keep + ATA rent
- *  goes into the curve, and the wallet ends at exactly 0.002 SOL (no
- *  rent-floor reserve, no slippage-band discount). Resolves the confirmed
- *  signature, or null when skipped (live balance cannot cover the keep + ATA
- *  rent + base fee). Throws on build/send/confirm errors so the settled
- *  count reports the wallet as failed. */
+ *  wallet buys that much more). The buy is EXACT-IN
+ *  (`buildPumpBuyExactSolInIx`) at CURVE_SLIPPAGE_BPS (20%) held as a floor on
+ *  the tokens received, so the whole budget is spent AND an adverse tick up to
+ *  the band still lands; the wallet ends at exactly 0.002 SOL at par.
+ *  Resolves the confirmed signature, or null when skipped (live balance cannot
+ *  cover the keep + ATA rent + base fee). Throws on build/send/confirm errors
+ *  so the settled count reports the wallet as failed. */
 async function buyOne(
   connection: Connection,
   mint: PublicKey,
@@ -217,29 +220,29 @@ async function buyOne(
   const budget =
     live - MAX_BUY_KEEP_SOL_LAMPORTS - reserveAta - MANUAL_TX_BASE_FEE_LAMPORTS;
   if (budget <= BigInt(0)) return null;
-  // Full spend at ZERO slippage: solIn = budget, so max_sol_cost = budget =
-  // solIn and the program's cost check can never pull the wallet below its
-  // 0.002 keep. (The 10% band is deliberately gone: under it the quote only
-  // committed budget / 1.10, leaving ~9% of the balance unbought whenever
-  // the curve did not drift.)
+  // Full spend: the exact-in instruction takes the WHOLE budget and spends it,
+  // so the band cannot be "paid for" out of it and nothing is held back.
   const solIn = budget;
   const creator = new PublicKey(curve.creator);
-  const quote = quotePumpBuy({
+  // EXACT-IN: the whole budget is spent, and the band is a FLOOR on the tokens
+  // received (min_tokens_out). The old token-exact-out shape could only carry a
+  // band by committing budget / (1 + s) — the reverted 2026-09-08 shape — and
+  // at a ZERO band any adverse tick reverted with TooMuchSolRequired (6002).
+  const quote = quotePumpBuyExactIn({
     solInLamports: solIn,
     virtualSolReserves: curve.solReserve,
     virtualTokenReserves: curve.tokenReserve,
-    slippageBps: BigInt(0),
+    slippageBps: CURVE_SLIPPAGE_BPS,
   });
-  const ixs = buildPumpBuyIx({
+  const ixs = buildPumpBuyExactSolInIx({
     mint,
     buyer: kp.publicKey,
     creator,
     feeRecipient,
-    tokensOut: quote.tokensOut,
-    // max_sol_cost = solIn = budget: every lamport above the flat keep is
-    // committed; any live-curve tick ABOVE the quote reverts (Custom 6002)
-    // rather than overdrawing the wallet below its 0.002 keep.
-    maxSolCost: budget,
+    // Every lamport above the flat keep is committed; the program spends
+    // exactly this and only reverts if the tokens come out below the floor.
+    spendableSolIn: budget,
+    minTokensOut: quote.minTokensOut,
   });
   const tx = new Transaction({
     feePayer: kp.publicKey,
@@ -292,7 +295,7 @@ async function sellOne(
     // instead of dumping the bag at a wrecked price. A band costs nothing on
     // a sell (it is a floor, not headroom), so it is never a reason a sell
     // fails to land.
-    slippageBps: SELL_SLIPPAGE_BPS,
+    slippageBps: CURVE_SLIPPAGE_BPS,
   });
   const tx = new Transaction({
     feePayer: kp.publicKey,
