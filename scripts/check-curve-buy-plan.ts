@@ -8,7 +8,7 @@
 //   2. sizes a wallet's MAX budget with the manual rule (total balance minus
 //      the flat 0.002 SOL keep, the base fee and the Token-2022 ATA rent),
 //   3. builds the stream the buy goes through (quotePumpBuyExactIn +
-//      buildPumpBuyExactSolInIx at CURVE_SLIPPAGE_BPS) and asserts:
+//      buildPumpBuyExactSolInIx at CURVE_BUY_SLIPPAGE_BPS) and asserts:
 //        - the AMM-side instruction IS buy_exact_sol_in (discriminator), NOT
 //          the plain buy,
 //        - spendable_sol_in IS the whole budget, min_tokens_out IS the banded
@@ -23,7 +23,7 @@
 
 import { Buffer } from "buffer";
 import { Connection, Keypair, PublicKey, Transaction } from "@solana/web3.js";
-import { MAX_BUY_KEEP_SOL_LAMPORTS, CURVE_SLIPPAGE_BPS } from "../lib/params";
+import { MAX_BUY_KEEP_SOL_LAMPORTS, CURVE_BUY_SLIPPAGE_BPS } from "../lib/params";
 import {
   PUMP_BUY_DISCRIMINATOR,
   PUMP_BUY_EXACT_SOL_IN_DISCRIMINATOR,
@@ -131,10 +131,10 @@ async function main(): Promise<void> {
     solInLamports: budget,
     virtualSolReserves: curve.virtualSolReserves,
     virtualTokenReserves: curve.virtualTokenReserves,
-    slippageBps: CURVE_SLIPPAGE_BPS,
+    slippageBps: CURVE_BUY_SLIPPAGE_BPS,
   });
   console.log(
-    `band             ${CURVE_SLIPPAGE_BPS} bps -> expects ${quote.tokensOut.toString()} raw tokens, floor ${quote.minTokensOut.toString()}`
+    `band             ${CURVE_BUY_SLIPPAGE_BPS} bps -> expects ${quote.tokensOut.toString()} raw tokens, floor ${quote.minTokensOut.toString()}`
   );
 
   const ixs = buildPumpBuyExactSolInIx({
@@ -204,10 +204,10 @@ async function main(): Promise<void> {
     solInLamports: budget,
     virtualSolReserves: curve.virtualSolReserves,
     virtualTokenReserves: curve.virtualTokenReserves,
-    slippageBps: CURVE_SLIPPAGE_BPS,
+    slippageBps: CURVE_BUY_SLIPPAGE_BPS,
   });
   console.log(
-    `old shape        the plain buy at ${CURVE_SLIPPAGE_BPS} bps would need max_sol_cost ${plainQuote.maxSolCost.toString()} > budget ${budget} (the band cannot be funded from the budget)`
+    `old shape        the plain buy at ${CURVE_BUY_SLIPPAGE_BPS} bps would need max_sol_cost ${plainQuote.maxSolCost.toString()} > budget ${budget} (the band cannot be funded from the budget)`
   );
   assert(
     plainQuote.maxSolCost > budget,
@@ -224,7 +224,7 @@ async function main(): Promise<void> {
   assert(size <= MAX_TX_BYTES, `tx is ${size} bytes, over the legacy limit`);
 
   console.log(
-    `\nOK: the curve MAX buy is buy_exact_sol_in spending exactly the budget (${budget} lamports) with a ${Number(CURVE_SLIPPAGE_BPS) / 100}% floor of ${minTokensArg} raw tokens, same accounts as buy, and the tx fits the legacy limit.`
+    `\nOK: the curve MAX buy is buy_exact_sol_in spending exactly the budget (${budget} lamports) with a ${Number(CURVE_BUY_SLIPPAGE_BPS) / 100}% floor of ${minTokensArg} raw tokens, same accounts as buy, and the tx fits the legacy limit.`
   );
 }
 

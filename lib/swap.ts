@@ -115,13 +115,19 @@ export function poolPercentFloor(
   );
 }
 
-/** The migrated venue's slippage band, PERCENT (the SDK's 0-100 unit), for
- *  BUY and SELL alike: the operator's standing band for this venue. On a buy
- *  it is a floor on the tokens received (buy_exact_quote_in's
- *  `min_base_amount_out`); on a sell it is a floor on the SOL received
- *  (sellInstructions' `minQuoteAmountOut`). 20 < MAX_SLIPPAGE_PCT (25,
- *  lib/sell-all.ts), so the engine's guard rail still admits it. */
-export const POOL_SLIPPAGE_PCT: number = 20;
+/** The migrated venue's BUY band, PERCENT (the SDK's 0-100 unit): on a buy it
+ *  is a floor on the tokens received (buy_exact_quote_in's
+ *  `min_base_amount_out`). 20 < MAX_SLIPPAGE_PCT, so the engine's guard rail
+ *  still admits it. */
+export const POOL_BUY_SLIPPAGE_PCT: number = 20;
+
+/** The migrated venue's SELL band, PERCENT (the SDK's 0-100 unit): on a sell it
+ *  is a floor on the SOL received (sellInstructions' `minQuoteAmountOut`).
+ *  Value 100 = a ZERO floor: the operator's explicit choice (2026-09-14), so a
+ *  pool sell never reverts on price. The trade-off is on-chain: with no floor
+ *  the fill happens at whatever the pool pays at landing time, with no
+ *  sandwich/adverse-fill protection. */
+export const POOL_SELL_SLIPPAGE_PCT: number = 100;
 
 /** pump_amm `buy` discriminator (IDL:
  *  node_modules/@pump-fun/pump-swap-sdk/src/idl/pump_amm.json). */
@@ -253,7 +259,8 @@ export async function buildMigratedBuyIxs(opts: {
   state: SwapSolanaState;
   /** SOL the buy spends, lamports: the WHOLE figure is committed. */
   spendableQuoteIn: bigint;
-  /** The band (percent) under the quoted tokens, default POOL_SLIPPAGE_PCT. */
+  /** The band (percent) under the quoted tokens, default
+   *  POOL_BUY_SLIPPAGE_PCT. */
   slippagePct?: number;
 }): Promise<{
   ixs: TransactionInstruction[];
@@ -263,7 +270,7 @@ export async function buildMigratedBuyIxs(opts: {
   minBaseAmountOut: bigint;
 }> {
   const { sdk, state, spendableQuoteIn } = opts;
-  const slippagePct = opts.slippagePct ?? POOL_SLIPPAGE_PCT;
+  const slippagePct = opts.slippagePct ?? POOL_BUY_SLIPPAGE_PCT;
   if (spendableQuoteIn <= BigInt(0)) {
     throw new Error(
       `buy spendableQuoteIn must be positive, got ${spendableQuoteIn}`
@@ -318,7 +325,7 @@ export async function buyMigratedPool(opts: {
   /** SOL to spend, lamports. EXACT input: the whole figure is spent, and it
    *  is also the amount the SDK wraps as WSOL, so the wallet must hold it. */
   quoteLamports: bigint;
-  /** Slippage PERCENT in [0, 100] (SDK unit), default POOL_SLIPPAGE_PCT
+  /** Slippage PERCENT in [0, 100] (SDK unit), default POOL_BUY_SLIPPAGE_PCT
    *  (20): the floor on the tokens received. */
   slippagePct?: number;
 }): Promise<MigratedBuyResult> {
@@ -327,7 +334,7 @@ export async function buyMigratedPool(opts: {
     poolKey,
     buyer,
     quoteLamports,
-    slippagePct = POOL_SLIPPAGE_PCT,
+    slippagePct = POOL_BUY_SLIPPAGE_PCT,
   } = opts;
   if (quoteLamports <= BigInt(0)) {
     throw new Error(`buy quoteLamports must be positive, got ${quoteLamports}`);
@@ -384,8 +391,8 @@ export async function sellMigratedPool(opts: {
   seller: Keypair;
   /** Base tokens to sell (raw Token-2022 units). */
   baseAmount: bigint;
-  /** Slippage PERCENT in [0, 100] (SDK unit), default POOL_SLIPPAGE_PCT
-   *  (20): the floor on the SOL received. */
+  /** Slippage PERCENT in [0, 100] (SDK unit), default POOL_SELL_SLIPPAGE_PCT
+   *  (100 = a ZERO floor): the floor on the SOL received. */
   slippagePct?: number;
   /** Stage 2: exact minimum quote out (lamports), used INSTEAD of the
    *  slippagePct derivation when present. The SDK quotes in percent, so a
@@ -401,7 +408,7 @@ export async function sellMigratedPool(opts: {
     poolKey,
     seller,
     baseAmount,
-    slippagePct = POOL_SLIPPAGE_PCT,
+    slippagePct = POOL_SELL_SLIPPAGE_PCT,
     minOutLamports,
   } = opts;
   if (baseAmount <= BigInt(0)) {

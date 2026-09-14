@@ -23,7 +23,7 @@
 import { expect } from "chai";
 import { Buffer } from "buffer";
 import { PublicKey } from "@solana/web3.js";
-import { CURVE_SLIPPAGE_BPS } from "../lib/params";
+import { CURVE_BUY_SLIPPAGE_BPS, CURVE_SELL_SLIPPAGE_BPS } from "../lib/params";
 import {
   PUMP_BUY_DISCRIMINATOR,
   PUMP_BUY_EXACT_SOL_IN_DISCRIMINATOR,
@@ -31,6 +31,7 @@ import {
   buildPumpBuyIx,
   quotePumpBuy,
   quotePumpBuyExactIn,
+  quotePumpSell,
 } from "../lib/pump";
 
 /** A curve state (virtual reserves: 30 SOL in, 1.073B tokens out; the live
@@ -45,29 +46,47 @@ const BUYER = new PublicKey("9WzDXwBbmkg8ZTbNMqUxvQRAyrZzDsGYdLVL9zYtAWWM");
 const CREATOR = new PublicKey("3S8qX1MsMqRbiwKg2cQyx7nis1oHMgaCuc9c4VfvVdPN");
 const FEE_RECIPIENT = new PublicKey("CebN5WGQ4jvEPvsVU4EoHEpgzq1VV7AbicfhtW4xC9iM");
 
+describe("the SELL band (operator: 100% = a zero floor)", () => {
+  it("CURVE_SELL_SLIPPAGE_BPS is 10000 and quotePumpSell floors at zero", () => {
+    expect(CURVE_SELL_SLIPPAGE_BPS).to.equal(BigInt(10_000));
+    const q = quotePumpSell({
+      tokensIn: BigInt(1_000_000_000),
+      virtualSolReserves: VSR,
+      virtualTokenReserves: VTR,
+    });
+    expect(q.minSolOutput).to.equal(BigInt(0));
+    // The gross/net quote is still computed (it is what the UI reports).
+    expect(q.netSolOut > BigInt(0)).to.equal(true);
+  });
+
+  it("the curve buy band is unchanged at 20%", () => {
+    expect(CURVE_BUY_SLIPPAGE_BPS).to.equal(BigInt(2000));
+  });
+});
+
 describe("quotePumpBuyExactIn (curve exact-in: full spend, band as a floor)", () => {
   it("agrees with quotePumpBuy on the tokens, and floors them by the band", () => {
     const q = quotePumpBuyExactIn({
       solInLamports: SOL_IN,
       virtualSolReserves: VSR,
       virtualTokenReserves: VTR,
-      slippageBps: CURVE_SLIPPAGE_BPS,
+      slippageBps: CURVE_BUY_SLIPPAGE_BPS,
     });
     const plain = quotePumpBuy({
       solInLamports: SOL_IN,
       virtualSolReserves: VSR,
       virtualTokenReserves: VTR,
-      slippageBps: CURVE_SLIPPAGE_BPS,
+      slippageBps: CURVE_BUY_SLIPPAGE_BPS,
     });
     expect(q.tokensOut).to.equal(plain.tokensOut);
     expect(q.nextVirtualSolReserves).to.equal(plain.nextVirtualSolReserves);
     expect(q.nextVirtualTokenReserves).to.equal(plain.nextVirtualTokenReserves);
     // 20% off the expected tokens.
     expect(q.minTokensOut).to.equal(
-      (q.tokensOut * (MULT - CURVE_SLIPPAGE_BPS)) / MULT
+      (q.tokensOut * (MULT - CURVE_BUY_SLIPPAGE_BPS)) / MULT
     );
     expect(q.minTokensOut < q.tokensOut).to.equal(true);
-    expect(CURVE_SLIPPAGE_BPS).to.equal(BigInt(2000));
+    expect(CURVE_BUY_SLIPPAGE_BPS).to.equal(BigInt(2000));
   });
 
   it("0 bps pins the floor to the expected tokens; 10000 pins it to zero", () => {

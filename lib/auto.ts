@@ -42,10 +42,11 @@
 //     (autoVenueFor + fireAutoBuyPool / fireAutoSellPool). The venue is chosen
 //     from the SAME curve read the scheduler already does; `complete` = 1 means
 //     the pool. The bot never stops on graduation. The pool rounds trade at the
-//     venue band (POOL_AUTO_SLIPPAGE_PCT = POOL_SLIPPAGE_PCT, 20), and the pool
-//     BUY goes out EXACT-IN, so the band is a floor on the tokens received and
-//     costs no spendable headroom (the commit is buyPct% of spendable, full
-//     stop).
+//     venue bands (POOL_AUTO_BUY_SLIPPAGE_PCT = POOL_BUY_SLIPPAGE_PCT = 20 on
+//     buys, POOL_AUTO_SELL_SLIPPAGE_PCT = POOL_SELL_SLIPPAGE_PCT = 100 on
+//     sells), and the pool BUY goes out EXACT-IN, so the band is a floor on the
+//     tokens received and costs no spendable headroom (the commit is buyPct% of
+//     spendable, full stop).
 //
 // The venue gate lives in the scheduler (components/trade-panel.tsx): before
 // each round it fetches the curve state and derives the venue. This module
@@ -81,7 +82,10 @@ import {
 } from "./bundle/launch";
 import type { SendTx } from "./bundle/protected-send";
 import { WSOL_MINT, canonicalMigratedPoolPda } from "./migrate";
-import { CURVE_SLIPPAGE_BPS } from "./params";
+import {
+  CURVE_BUY_SLIPPAGE_BPS,
+  CURVE_SELL_SLIPPAGE_BPS,
+} from "./params";
 import {
   buildPumpBuyExactSolInIx,
   buildPumpBuyIx,
@@ -94,7 +98,11 @@ import {
   type PumpCurveState,
 } from "./pump";
 import { sellOneWalletOnPool } from "./sell-all";
-import { buyMigratedPool, POOL_SLIPPAGE_PCT } from "./swap";
+import {
+  buyMigratedPool,
+  POOL_BUY_SLIPPAGE_PCT,
+  POOL_SELL_SLIPPAGE_PCT,
+} from "./swap";
 
 /** % of a wallet's spendable SOL balance bought per auto-buy round (v4's
  *  buyPct default). Configurable knob; no UI field exists for it in the AUTO
@@ -118,12 +126,17 @@ export const AUTO_TX_FEE_RESERVE_LAMPORTS: bigint = BigInt(10_000);
  *  fee. Mirrors WITHDRAW_FEE_RESERVE_LAMPORTS in lib/disperse.ts. */
 export const AUTO_SWEEP_FEE_RESERVE_LAMPORTS: bigint = BigInt(10_000);
 
-/** Slippage PERCENT (the PumpSwap SDK's 0-100 unit) the auto pool rounds pass:
- *  the venue band, POOL_SLIPPAGE_PCT (20), so the bot tolerates the same
- *  adverse move the manual Buy MAX / Sell do. On the buy it is a floor on the
- *  tokens received (the bot's pool buy is exact-in, lib/swap.ts), so it needs
- *  no wrap headroom out of the spendable base. */
-export const POOL_AUTO_SLIPPAGE_PCT: number = POOL_SLIPPAGE_PCT;
+/** Slippage PERCENT (the PumpSwap SDK's 0-100 unit) the auto pool BUY rounds
+ *  pass: the venue buy band, POOL_BUY_SLIPPAGE_PCT (20). On the buy it is a
+ *  floor on the tokens received and the bot's pool buy is exact-in
+ *  (lib/swap.ts), so it needs no wrap headroom out of the spendable base. */
+export const POOL_AUTO_BUY_SLIPPAGE_PCT: number = POOL_BUY_SLIPPAGE_PCT;
+
+/** Slippage PERCENT (the PumpSwap SDK's 0-100 unit) the auto pool SELL rounds
+ *  pass: the venue sell band, POOL_SELL_SLIPPAGE_PCT (100 = a ZERO floor, so a
+ *  pool sell round is never refused on price). See the constant's note for the
+ *  on-chain trade-off the operator accepted. */
+export const POOL_AUTO_SELL_SLIPPAGE_PCT: number = POOL_SELL_SLIPPAGE_PCT;
 
 /** A live roster balance for the picker. Matches the shape useRoster keeps. */
 export interface AutoWalletBalance {
@@ -519,7 +532,7 @@ export async function fireAutoBuy(
         solInLamports: solIn,
         virtualSolReserves: vsr,
         virtualTokenReserves: vtr,
-        slippageBps: CURVE_SLIPPAGE_BPS,
+        slippageBps: CURVE_BUY_SLIPPAGE_BPS,
       });
       vsr = quote.nextVirtualSolReserves;
       vtr = quote.nextVirtualTokenReserves;
@@ -687,10 +700,9 @@ export async function fireAutoSell(
           tokensIn: tokenIn,
           virtualSolReserves: vsr,
           virtualTokenReserves: vtr,
-          // The operator's band (20%): min_sol_output sits this far under the
-          // net quote, so a fill that collapsed past it reverts instead of
-          // dumping the bag. A sell band is a floor, never headroom.
-          slippageBps: CURVE_SLIPPAGE_BPS,
+          // The operator's SELL band (CURVE_SELL_SLIPPAGE_BPS, 10000 = a ZERO
+          // floor): a curve sell round is never refused on price.
+          slippageBps: CURVE_SELL_SLIPPAGE_BPS,
         });
         vsr = vsr + quote.netSolOut;
         vtr = vtr - tokenIn;
@@ -836,7 +848,7 @@ export async function fireAutoBuyPool(
         poolKey,
         buyer: kp,
         quoteLamports: commit,
-        slippagePct: POOL_AUTO_SLIPPAGE_PCT,
+        slippagePct: POOL_AUTO_BUY_SLIPPAGE_PCT,
       });
       return "ok";
     })
@@ -933,7 +945,7 @@ export async function fireAutoSellPool(
           poolKey,
           wallet: kp,
           sellPct,
-          slippagePct: POOL_AUTO_SLIPPAGE_PCT,
+          slippagePct: POOL_AUTO_SELL_SLIPPAGE_PCT,
         });
         if (outcome.status === "skipped") return "skipped";
         if (outcome.status === "failed") return "failed";

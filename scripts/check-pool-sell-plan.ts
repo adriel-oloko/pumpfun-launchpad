@@ -99,8 +99,9 @@ async function main(): Promise<void> {
   const foldedFloor = steps[0].minSolOut;
   console.log(`folded floor     ${foldedFloor} lamports (step amount ${steps[0].tokensIn})`);
 
-  // The SDK's own 5% quote for the same amount: the fold's floor may be looser,
-  // never tighter (a tighter floor is a guaranteed revert).
+  // The SDK's own quote for the same amount at the operator's SELL band: the
+  // fold's floor may be looser, never tighter (a tighter floor is a guaranteed
+  // revert).
   const sdkQuote = sellBaseInput({
     base: new BN(amount.toString()),
     slippage: MANUAL_POOL_SELL_SLIPPAGE_PCT,
@@ -115,7 +116,7 @@ async function main(): Promise<void> {
     feeConfig: state.feeConfig,
   });
   console.log(
-    `sdk quote        uiQuote=${sdkQuote.uiQuote.toString()} minQuote=${sdkQuote.minQuote.toString()} (5%)`
+    `sdk quote        uiQuote=${sdkQuote.uiQuote.toString()} minQuote=${sdkQuote.minQuote.toString()} (band ${MANUAL_POOL_SELL_SLIPPAGE_PCT}%)`
   );
   // The SHIPPED helper (lib/swap.ts poolPercentFloor), cross-checked against the
   // SDK's own free quote function just above: they must agree, or every
@@ -167,6 +168,16 @@ async function main(): Promise<void> {
   assert(
     minQuoteAmountOut === expectedFloor,
     `minQuoteAmountOut ${minQuoteAmountOut} != the expected (loosest) floor ${expectedFloor}`
+  );
+  // The operator's SELL band is 100%, so the loosest floor IS zero: the sell
+  // instruction carries no price floor at all and can never be refused on price.
+  assert(
+    MANUAL_POOL_SELL_SLIPPAGE_PCT === 100,
+    `sell band is ${MANUAL_POOL_SELL_SLIPPAGE_PCT}, expected 100`
+  );
+  assert(
+    minQuoteAmountOut === BigInt(0),
+    `minQuoteAmountOut ${minQuoteAmountOut} is not 0 at a 100% sell band`
   );
 
   const wsolAta = getAssociatedTokenAddressSync(

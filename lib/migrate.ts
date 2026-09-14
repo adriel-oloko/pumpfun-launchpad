@@ -450,6 +450,13 @@ export interface MigratedPoolLookup {
 const POOL_COIN_CREATOR_OFFSET = 211;
 const POOL_COIN_CREATOR_END = 243;
 
+/** Offset of `base_mint` in the PumpSwap pool account (after the 8-byte
+ *  discriminator; pool layout table in the migration spec). Used to prove a
+ *  pool discovered at the canonical PDA is THIS launch's pool and not another
+ *  mint's. */
+const POOL_BASE_MINT_OFFSET = 43;
+const POOL_BASE_MINT_END = 75;
+
 export async function lookupMigratedPool(
   connection: Connection,
   mint: PublicKey,
@@ -475,6 +482,118 @@ export async function lookupMigratedPool(
     graduated: curve.complete,
     poolKey,
     poolBump,
+  };
+}
+
+/** The migrate step's outcome. `landed` = send + confirm returned a
+ *  signature; `already-migrated` = the send did not land but the chain shows
+ *  THIS mint's canonical pool; `failed` = nothing on chain proves the
+ *  migration happened. */
+export type MigrateStatus = "landed" | "already-migrated" | "failed";
+
+/** Everything `classifyMigrateOutcome` may look at. Only CHAIN STATE decides:
+ *  `sendError` is diagnostic and is NEVER read to produce a success. */
+export interface MigrateOutcomeInput {
+  /** true when the send + confirm returned a signature */
+  sent: boolean;
+  /** the thrown message when sent is false; null otherwise. DIAGNOSTIC ONLY. */
+  sendError: string | null;
+  /** the canonical pool PDA (base58) the evidence is about. */
+  poolKey: string;
+  /** the canonical pool account is present on chain */
+  poolExists: boolean;
+  /** pool.data[43:75] == this launch's mint (only meaningful when poolExists) */
+  poolBaseMintMatchesMint: boolean;
+  /** curve.complete read AFTER the attempt */
+  curveComplete: boolean;
+  /** this launch's mint (base58), when known, for the reason text. */
+  mint?: string;
+}
+
+export interface MigrateOutcome {
+  status: MigrateStatus;
+  /** names the DECIDING EVIDENCE, never an error code on its own */
+  reason: string;
+}
+
+/**
+ * Pure migrate-outcome classifier. THE DECISION IS CHAIN STATE, NOT ERROR
+ * TEXT: `sendError` is carried for diagnostics and is never read here. The
+ * decision table, in order:
+ *
+ *   sent                                            -> landed
+ *   !sent && poolExists && baseMintMatch            -> already-migrated
+ *   !sent && poolExists && !baseMintMatch           -> failed
+ *   !sent && !poolExists                            -> failed
+ *
+ * A revert may only be accepted when the chain shows THIS mint's canonical
+ * pool; an error code can never produce a success.
+ */
+export function classifyMigrateOutcome(
+  i: MigrateOutcomeInput
+): MigrateOutcome {
+  if (i.sent) {
+    return { status: "landed", reason: "send + confirm returned a signature" };
+  }
+  const curve = `curve.complete=${i.curveComplete ? 1 : 0}`;
+  const mint = i.mint ? ` == ${i.mint}` : "";
+  if (i.poolExists && i.poolBaseMintMatchesMint) {
+    return {
+      status: "already-migrated",
+      reason: `canonical pool ${i.poolKey} exists with baseMint${mint} (${curve})`,
+    };
+  }
+  if (i.poolExists) {
+    return {
+      status: "failed",
+      reason: `canonical pool ${i.poolKey} exists but its base_mint does not match this launch mint${mint} (${curve})`,
+    };
+  }
+  return {
+    status: "failed",
+    reason: `no canonical pool at ${i.poolKey} and ${curve}`,
+  };
+}
+
+/** The chain facts the migrate classifier decides on, read in one pass. */
+export interface MigrateChainState {
+  /** Derived canonical PumpSwap pool PDA for the mint. */
+  poolKey: PublicKey;
+  /** The pool account exists on chain. */
+  poolExists: boolean;
+  /** The pool account's base_mint equals `mint` (false when absent/short). */
+  poolBaseMintMatchesMint: boolean;
+  /** Curve `complete` flag (false when the curve does not exist / read fails). */
+  curveComplete: boolean;
+}
+
+/** Reads the migrate step's decision inputs: the canonical pool account (+ its
+ *  base_mint at [43:75]) and the curve's `complete` flag. Reuses the shared
+ *  PDA derivation and pool offsets; never hand-rolls a replacement. A pool
+ *  account that exists but is too short to hold `base_mint` is reported as NOT
+ *  matching, so it can never be mistaken for this launch's pool. */
+export async function readMigrateChainState(
+  connection: Connection,
+  mint: PublicKey,
+  index: number = CANONICAL_POOL_INDEX
+): Promise<MigrateChainState> {
+  const [poolKey] = canonicalMigratedPoolPda(mint, WSOL_MINT, index);
+  const [curveRead, poolInfo] = await Promise.all([
+    readPumpCurveState(connection, mint),
+    connection.getAccountInfo(poolKey, "confirmed"),
+  ]);
+  const poolExists = poolInfo !== null;
+  let poolBaseMintMatchesMint = false;
+  if (poolInfo && poolInfo.data.length >= POOL_BASE_MINT_END) {
+    poolBaseMintMatchesMint = new PublicKey(
+      poolInfo.data.subarray(POOL_BASE_MINT_OFFSET, POOL_BASE_MINT_END)
+    ).equals(mint);
+  }
+  return {
+    poolKey,
+    poolExists,
+    poolBaseMintMatchesMint,
+    curveComplete: curveRead.kind === "ok" && curveRead.curve.complete,
   };
 }
 

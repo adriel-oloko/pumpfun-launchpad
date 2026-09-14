@@ -145,7 +145,7 @@ import {
 	type SellAllReport,
 	type SellOutcome,
 } from "../lib/sell-all";
-import { POOL_SLIPPAGE_PCT } from "../lib/swap";
+import { POOL_SELL_SLIPPAGE_PCT } from "../lib/swap";
 import { useToasts } from "./toast-stack";
 import {
 	Btn,
@@ -866,6 +866,16 @@ export function LaunchPanel({
 				log(
 					`sent ${sent.length} txs: ${sent.map((s) => s.label).join(", ")}`,
 				);
+				const migrateSent = sent.find((s) => s.label === "migrate");
+				if (migrateSent?.status) {
+					// The migrate outcome comes from the state classifier
+					// (lib/migrate.ts), never from an error string.
+					const statusLabel =
+						migrateSent.status === "already-migrated"
+							? "SKIPPED-ALREADY-MIGRATED"
+							: migrateSent.status.toUpperCase();
+					log(`migrate : ${statusLabel} — ${migrateSent.reason}`);
+				}
 			} else {
 				// Tier 2 (atomic relay bundle: NextBlock PRIMARY, Astralane
 				// Iris + bloXroute OPTIONAL fallbacks). Relay credentials
@@ -909,7 +919,7 @@ export function LaunchPanel({
 				const bundlePack = await assembleLaunchBundle(connection, seq);
 				if (bundlePack.migrateDropped) {
 					log(
-						`tier 2 idempotency: canonical pool ${bundlePack.poolKey.toBase58()} already exists (curve.complete=${bundlePack.curveComplete}); dropping the MigrateV2 tx from the bundle (an atomic bundle cannot swallow its Custom: 6040 revert).`,
+						`tier 2 idempotency: canonical pool ${bundlePack.poolKey.toBase58()} already exists (curve.complete=${bundlePack.curveComplete}); dropping the MigrateV2 tx from the bundle. An atomic bundle cannot contain a transaction that is expected to revert; the pool-exists read is why the migrate tx is dropped.`,
 					);
 				}
 				const bundleTxs = bundlePack.txs;
@@ -1384,11 +1394,12 @@ export function LaunchPanel({
 				connection,
 				mint: new PublicKey(mint),
 				wallets: roster.wallets,
-				// The venue band (20), NOT the old hardcoded 5: this is the single
-				// source of truth for the band on the curve leg's min_sol_output
-				// AND the PumpSwap leg's minQuoteAmountOut. Sell All used to pin 5
+				// The SELL band (100 = a ZERO floor), NOT the old hardcoded 5:
+				// this is the single source of truth for the band on the curve
+				// leg's min_sol_output AND the PumpSwap leg's minQuoteAmountOut,
+				// so an exit is never refused on price. Sell All used to pin 5
 				// here, which silently overrode the engine default.
-				slippagePct: POOL_SLIPPAGE_PCT,
+				slippagePct: POOL_SELL_SLIPPAGE_PCT,
 				submit,
 				foldedFloors: true,
 			});

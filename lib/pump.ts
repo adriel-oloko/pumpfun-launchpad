@@ -46,7 +46,7 @@ import {
   type AccountMeta,
 } from "@solana/web3.js";
 import { solanaNetwork } from "./network";
-import { CURVE_SLIPPAGE_BPS } from "./params";
+import { CURVE_BUY_SLIPPAGE_BPS, CURVE_SELL_SLIPPAGE_BPS } from "./params";
 
 /* ------------------------------------------------------------------ */
 /* Verified pump.fun constants (M10 prompt table; do not guess)        */
@@ -580,7 +580,7 @@ export function quotePumpBuyExactIn(opts: {
   feeBps?: bigint;
   slippageBps?: bigint;
 }): PumpBuyExactInQuote {
-  const slippageBps = opts.slippageBps ?? CURVE_SLIPPAGE_BPS;
+  const slippageBps = opts.slippageBps ?? CURVE_BUY_SLIPPAGE_BPS;
   if (slippageBps < BigInt(0) || slippageBps > BigInt(10_000)) {
     throw new Error(
       `buy slippageBps ${slippageBps} is outside the allowed range [0, 10000]`
@@ -669,7 +669,10 @@ export function quotePumpSell(opts: {
     virtualSolReserves,
     virtualTokenReserves,
     feeBps = PUMP_FEE_BPS,
-    slippageBps = PUMP_DEFAULT_SLIPPAGE_BPS,
+    // The operator's SELL band by default (CURVE_SELL_SLIPPAGE_BPS, 10000 = a
+    // ZERO floor since 2026-09-14), so no sell path can silently pick a tighter
+    // floor: a caller that wants one passes slippageBps explicitly.
+    slippageBps = CURVE_SELL_SLIPPAGE_BPS,
   } = opts;
   if (tokensIn <= BigInt(0)) {
     throw new Error(`sell amount must be positive, got ${tokensIn}`);

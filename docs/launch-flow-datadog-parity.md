@@ -214,9 +214,21 @@ Requirements:
    `package.json`). The reference launches carried no tip inside the four
    transactions and only 17 500-25 000 lamports of priority, so the order came
    from a bundle or private relay, not from a priority-fee race.
-2. Make the migrate idempotent: a revert with `Custom: 6040` means the coin is
-   already migrated. Treat it as success. (Seen on chain: a competitor sent
-   `MigrateV2 + BuyExactQuoteIn` after the winning migrate and reverted 6040.)
+2. Make the migrate outcome STATE-decided: after the attempt, read the canonical
+   PumpSwap pool and the curve's `complete` flag and classify. The pool existing
+   with THIS mint's `base_mint` is what makes the attempt already-migrated; an
+   atomic bundle drops the migrate tx before submitting when that pool is already
+   there. A bare `Custom: 6040` is NOT an already-migrated signal — see the
+   2026-09-13 correction below.
+
+   CORRECTION 2026-09-13: the original text here read "a revert with
+   `Custom: 6040` means the coin is already migrated. Treat it as success." That
+   is wrong. In the pump program 6040 is `BuyNotEnoughSolToCoverRent`; in the
+   PumpSwap AMM it is `BuySlippageBelowMinBaseAmountOut`. The observation behind
+   the claim was a competitor tx whose `migrate_v2` succeeded and whose bundled
+   `pump_amm` buy at the NEXT instruction index reverted 6040; the code belonged
+   to the buy. See docs/MIGRATE_OUTCOME_FIX.md section 2.2. No already-migrated
+   revert has ever been observed; only chain state decides the migrate outcome.
 3. Do not skip the explicit migrate. One open question remains: whether the
    mainnet graduating buy also migrates by itself (the devnet observation in
    the docs says it does; both reference coins show it does not). An explicit,
@@ -585,8 +597,18 @@ in C4.
    every relay in this repo is mainnet only, and the mainnet fee tiers.
 4. Tier 2 idempotency, this pass's work item: before submitting a bundle, read the curve
    and the canonical pool. When the pool already exists, drop the migrate transaction
-   from the bundle instead of sending it (a bundle cannot swallow a single transaction's
-   `Custom: 6040` revert the way the sequential path does).
+   from the bundle instead of sending it (an atomic bundle cannot contain a transaction
+   that is expected to revert). The migrate outcome is state-decided, never an error
+   code: a bare `Custom: 6040` is NOT an already-migrated signal.
+
+   CORRECTION 2026-09-13: the original text here read "a bundle cannot swallow a single
+   transaction's `Custom: 6040` revert the way the sequential path does." That is wrong.
+   In the pump program 6040 is `BuyNotEnoughSolToCoverRent`; in the PumpSwap AMM it is
+   `BuySlippageBelowMinBaseAmountOut`. The observation behind the claim was a competitor
+   tx whose `migrate_v2` succeeded and whose bundled `pump_amm` buy at the NEXT
+   instruction index reverted 6040; the code belonged to the buy. See
+   docs/MIGRATE_OUTCOME_FIX.md section 2.2. No already-migrated revert has ever been
+   observed; only chain state decides the migrate outcome.
 5. This pass's work item: add to package.json
    `"test": "ts-mocha -p ./tsconfig.test.json tests/launch-fill-plan.ts"` so the offline
    suite runs without the test file's own ts-node registration. Keep the other test files

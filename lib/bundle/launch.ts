@@ -74,7 +74,13 @@ import {
   readPumpGlobalParams,
   resolvePumpFeeRecipient,
 } from "../pump";
-import { buildPumpMigrateV2Ix, canonicalMigratedPoolPda } from "../migrate";
+import {
+  buildPumpMigrateV2Ix,
+  canonicalMigratedPoolPda,
+  classifyMigrateOutcome,
+  readMigrateChainState,
+  type MigrateStatus,
+} from "../migrate";
 import { VIRTUAL_TOKEN_RESERVE, virtualSolReserveFallback } from "../params";
 import { solanaNetwork } from "../network";
 import { DEFAULT_PRIORITY_FEE_MICRO_LAMPORTS } from "../fees";
@@ -185,9 +191,12 @@ export interface LaunchSequence {
   lookupTable: AddressLookupTableAccount | null;
   buyTxs: BuyTx[];
   /** Explicit pump.fun MigrateV2 (canonical pool creation) sent AFTER the
-   *  fill buys, in the same slot. Signed by the creator alone. Idempotent:
-   *  a Custom 6040 revert means the coin is already migrated. NULL when the
-   *  build was asked for a create+buys-only sequence (`includeMigrate: false`).
+   *  fill buys, in the same slot. Signed by the creator alone. Idempotent by
+   *  STATE: the sender reads the canonical pool before sending and skips the
+   *  tx when that pool already holds this mint; a revert is only accepted when
+   *  the chain shows this mint's pool (never from an error code). NULL when
+   *  the build was asked for a create+buys-only sequence (`includeMigrate:
+   *  false`).
    */
   migrateIx: TransactionInstruction | null;
   migrateTx: Transaction | null;
@@ -722,7 +731,9 @@ export async function buildLaunchSequence(
   // created the canonical pool in a separate transaction after the fill buys
   // (the fill txs contained no CreatePool), so the launch must not rely on
   // the graduating buy to migrate. Signed by the creator alone and sent in the
-  // same slot; a Custom 6040 revert means it already migrated (idempotent).
+  // same slot. Idempotency is decided by chain state, not error text: the
+  // sender reads the canonical pool before sending and skips the tx when that
+  // pool already holds this mint.
   // `includeMigrate: false` (mainnet pre-migration sell-all test) omits it and
   // the sequence is create + buys only. A NON-graduating launch (`graduate:
   // false`) also omits it automatically: the curve stays open, so there is no
@@ -789,12 +800,12 @@ export interface LaunchBundlePack {
 
 /**
  * Tier 2 idempotency guard (spec section 8 item 4). An atomic relay bundle
- * cannot swallow ONE transaction's `Custom: 6040` (already migrated) revert
- * the way `sendSequentially` does, so before submitting the bundle this reads
- * the curve completion flag and the canonical PumpSwap pool account. When the
- * pool already exists the explicit MigrateV2 (and its signer entry) is dropped
- * from the bundle — otherwise the whole atomic bundle would revert on the
- * already-migrated coin.
+ * cannot contain a transaction that is expected to revert, so before
+ * submitting the bundle this reads the curve completion flag and the canonical
+ * PumpSwap pool account. When the pool already exists the explicit MigrateV2
+ * (and its signer entry) is dropped from the bundle — otherwise the whole
+ * atomic bundle would revert on the already-migrated coin. The decision is the
+ * pool-exists read, never an error code.
  *
  * Pure with respect to the launch: it only READS the chain and never builds or
  * sends a transaction. A fresh mint has neither a curve nor a pool, so the
@@ -1115,11 +1126,14 @@ export async function sendAndConfirmWithRetry(
     : new Error(`${label} failed after ${attempts} send attempts`);
 }
 
-/** True when the message is pump's "already migrated" revert (Custom 6040):
- *  the canonical pool already exists, so the explicit MigrateV2 is
- *  idempotent and its revert is a SUCCESS for the launch. */
-function isAlreadyMigratedRevert(msg: string): boolean {
-  return /custom["\s:]*6040/i.test(msg);
+/** One confirmed launch tx. `status`/`reason` are set on the migrate entry by
+ *  the state classifier (`classifyMigrateOutcome`) and are NEVER derived from
+ *  an error code. */
+export interface SentLaunchTx {
+  label: string;
+  signature: string;
+  status?: MigrateStatus;
+  reason?: string;
 }
 
 /** The confirmed/failed tx signature a sender embeds in its message as
@@ -1143,15 +1157,16 @@ function signatureFromError(msg: string): string {
  *  confirmed are named so the caller never mistakes a partial launch for a
  *  no-op.
  *
- *  The explicit MigrateV2 is idempotent: a `Custom: 6040` (already migrated)
- *  revert on the LAST tx is treated as success (the canonical pool exists).
- *  An atomic relay bundle cannot swallow one tx's revert, so this handling is
- *  Tier 1 only. */
+ *  The explicit MigrateV2's outcome is decided by CHAIN STATE, never by an
+ *  error code: the canonical pool is read before the tx is sent (skip when it
+ *  already holds this mint) and re-read after a failure. A revert is accepted
+ *  only when that pool exists with this mint's base_mint. An atomic relay
+ *  bundle cannot swallow one tx's revert, so this handling is Tier 1 only. */
 export async function sendSequentially(
   connection: Connection,
   seq: LaunchSequence,
   opts: { confirmTimeoutMs?: number; onSignature?: (label: string, sig: string) => void } = {}
-): Promise<{ label: string; signature: string }[]> {
+): Promise<SentLaunchTx[]> {
   const confirmTimeoutMs = opts.confirmTimeoutMs ?? 45_000;
   const txs = sequenceTxs(seq);
   const labels: string[] = [];
@@ -1160,9 +1175,34 @@ export async function sendSequentially(
   for (let i = 0; i < seq.buyTxs.length; i++) labels.push(`buy${i + 1}`);
   if (seq.migrateTx) labels.push("migrate");
 
-  const sent: { label: string; signature: string }[] = [];
+  const sent: SentLaunchTx[] = [];
   for (let i = 0; i < txs.length; i++) {
     const label = labels[i];
+    // MIGRATE PRECONDITION (chain state, never error text): when the canonical
+    // pool for THIS mint already exists the tx would only revert, so drop it
+    // and record the state-decided outcome. A fresh launch has no pool, so the
+    // normal path sends exactly as before.
+    if (label === "migrate") {
+      const state = await readMigrateChainState(connection, seq.pda.mint);
+      if (state.poolExists && state.poolBaseMintMatchesMint) {
+        const outcome = classifyMigrateOutcome({
+          sent: false,
+          sendError: null,
+          poolKey: state.poolKey.toBase58(),
+          poolExists: true,
+          poolBaseMintMatchesMint: true,
+          curveComplete: state.curveComplete,
+          mint: seq.pda.mint.toBase58(),
+        });
+        sent.push({
+          label,
+          signature: "",
+          status: outcome.status,
+          reason: outcome.reason,
+        });
+        continue;
+      }
+    }
     try {
       const { signature } = await sendProtectedTx(
         connection,
@@ -1184,21 +1224,48 @@ export async function sendSequentially(
       sent.push({ label, signature });
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
-      if (label === "migrate" && isAlreadyMigratedRevert(msg)) {
-        // The coin is already migrated (Custom 6040): the canonical pool
-        // exists, so the explicit MigrateV2 did its job. Record the failed
-        // attempt's signature when the sender surfaced it.
-        const signature = signatureFromError(msg);
-        if (opts.onSignature) opts.onSignature(label, signature);
-        sent.push({ label, signature });
-        continue;
-      }
       const partial =
         sent.length > 0
           ? ` NOTE: ${sent.length} earlier launch tx(s) already confirmed (${sent
               .map((s) => s.label)
               .join(", ")}); the token may be partially launched. A fresh launch creates a NEW mint; do not re-send this sequence.`
           : "";
+      if (label === "migrate") {
+        // A revert is accepted ONLY when the chain shows this mint's canonical
+        // pool. Re-read the state; the error text is never the decision. When
+        // the state read itself fails, fall through to the plain partial-state
+        // throw (nothing is swallowed).
+        const state = await readMigrateChainState(connection, seq.pda.mint).catch(
+          () => null
+        );
+        if (state) {
+          const outcome = classifyMigrateOutcome({
+            sent: false,
+            sendError: msg,
+            poolKey: state.poolKey.toBase58(),
+            poolExists: state.poolExists,
+            poolBaseMintMatchesMint: state.poolBaseMintMatchesMint,
+            curveComplete: state.curveComplete,
+            mint: seq.pda.mint.toBase58(),
+          });
+          if (outcome.status === "already-migrated") {
+            // Record the failed attempt's signature when the sender surfaced
+            // one; the classification still comes from the chain state.
+            const signature = signatureFromError(msg);
+            if (signature && opts.onSignature) opts.onSignature(label, signature);
+            sent.push({
+              label,
+              signature,
+              status: outcome.status,
+              reason: outcome.reason,
+            });
+            continue;
+          }
+          throw new Error(
+            `${msg}${partial} | migrate evidence: pool ${state.poolKey.toBase58()} poolExists=${state.poolExists} poolBaseMintMatchesMint=${state.poolBaseMintMatchesMint} curve.complete=${state.curveComplete}; ${outcome.reason}`
+          );
+        }
+      }
       throw new Error(`${msg}${partial}`);
     }
   }

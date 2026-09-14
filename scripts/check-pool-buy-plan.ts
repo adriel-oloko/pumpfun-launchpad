@@ -7,14 +7,14 @@
 //   1. derives the canonical PumpSwap pool (canonicalMigratedPoolPda),
 //   2. sizes a wallet's MAX budget with poolBuyBudgetLamports,
 //   3. builds the instruction stream the buy goes through
-//      (swapSolanaState + buildMigratedBuyIxs at POOL_SLIPPAGE_PCT),
+//      (swapSolanaState + buildMigratedBuyIxs at POOL_BUY_SLIPPAGE_PCT),
 //   4. asserts what the budget rule and the band depend on:
 //        - the AMM instruction IS buy_exact_quote_in (discriminator + args), so
 //          the spend is EXACT and the wallet cannot be overdrawn below its
 //          0.002 SOL keep,
 //        - spendable_quote_in IS the budget (full spend, nothing left behind),
 //        - min_base_amount_out IS the banded floor (base at the live reserves,
-//          less POOL_SLIPPAGE_PCT), which is what makes an adverse tick land
+//          less POOL_BUY_SLIPPAGE_PCT), which is what makes an adverse tick land
 //          instead of reverting with pump_amm 6040,
 //        - the SOL wrap (system transfer into the WSOL ATA) IS the budget: the
 //          wallet holds exactly what the exact-in instruction takes,
@@ -46,7 +46,7 @@ import { poolBuyBudgetLamports } from "../lib/batch-trade";
 import { WSOL_MINT, canonicalMigratedPoolPda } from "../lib/migrate";
 import { readPumpCurveState } from "../lib/pump";
 import {
-  POOL_SLIPPAGE_PCT,
+  POOL_BUY_SLIPPAGE_PCT,
   buildMigratedBuyIxs,
   poolBuyBaseOut,
   poolBuyMinBaseOut,
@@ -123,10 +123,10 @@ async function main(): Promise<void> {
     sdk,
     state,
     spendableQuoteIn: budget,
-    slippagePct: POOL_SLIPPAGE_PCT,
+    slippagePct: POOL_BUY_SLIPPAGE_PCT,
   });
   console.log(
-    `band             ${POOL_SLIPPAGE_PCT}% -> base out ${baseOut.toString()} raw tokens, floor ${minBaseAmountOut.toString()}`
+    `band             ${POOL_BUY_SLIPPAGE_PCT}% -> base out ${baseOut.toString()} raw tokens, floor ${minBaseAmountOut.toString()}`
   );
 
   // 1. The AMM instruction must be buy_exact_quote_in, NOT the SDK's buy.
@@ -156,7 +156,7 @@ async function main(): Promise<void> {
 
   // 2. The floor must be the banded base at the live reserves.
   const expectedBase = poolBuyBaseOut(state, budget);
-  const expectedFloor = poolBuyMinBaseOut(expectedBase, POOL_SLIPPAGE_PCT);
+  const expectedFloor = poolBuyMinBaseOut(expectedBase, POOL_BUY_SLIPPAGE_PCT);
   console.log(
     `expected floor   base ${expectedBase.toString()} * 80% = ${expectedFloor.toString()}`
   );
@@ -224,10 +224,10 @@ async function main(): Promise<void> {
   // budget * (1 + s/100), which a wallet sized to its keep does not hold. This
   // is the reason the exact-in instruction is used.
   const oldWrap =
-    (budget * BigInt(Math.floor((1 + POOL_SLIPPAGE_PCT / 100) * 1e9))) /
+    (budget * BigInt(Math.floor((1 + POOL_BUY_SLIPPAGE_PCT / 100) * 1e9))) /
     BigInt(1_000_000_000);
   console.log(
-    `old shape        the SDK's plain buy at ${POOL_SLIPPAGE_PCT}% would wrap ${oldWrap} lamports > budget ${budget}`
+    `old shape        the SDK's plain buy at ${POOL_BUY_SLIPPAGE_PCT}% would wrap ${oldWrap} lamports > budget ${budget}`
   );
   assert(
     oldWrap > budget,
@@ -244,7 +244,7 @@ async function main(): Promise<void> {
   assert(size <= MAX_TX_BYTES, `tx is ${size} bytes, over the legacy limit`);
 
   console.log(
-    `\nOK: the pool buy is buy_exact_quote_in spending exactly the MAX budget (${budget} lamports) with a ${POOL_SLIPPAGE_PCT}% floor of ${minBaseArg} raw tokens, the WSOL wrap/close nets out, and the tx fits the legacy limit.`
+    `\nOK: the pool buy is buy_exact_quote_in spending exactly the MAX budget (${budget} lamports) with a ${POOL_BUY_SLIPPAGE_PCT}% floor of ${minBaseArg} raw tokens, the WSOL wrap/close nets out, and the tx fits the legacy limit.`
   );
 }
 

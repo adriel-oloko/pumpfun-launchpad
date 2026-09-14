@@ -66,7 +66,7 @@ import {
   sendRawWithRetry,
 } from "./migrate";
 import {
-  POOL_SLIPPAGE_PCT,
+  POOL_SELL_SLIPPAGE_PCT,
   poolPercentFloor,
   sellMigratedPool,
 } from "./swap";
@@ -96,11 +96,19 @@ export interface SellableWallet {
 export type SellRoute = "curve" | "pumpSwap";
 
 /** R3 guard rail (exported): the hard ceiling on `slippagePct`. A value above
- *  this is REJECTED outright, never clamped. Pushing slippage toward 100 sets
- *  the min floor to 0, removing the only protection against a sandwich/adverse
- *  fill and silently turning a loud revert into a bad fill. This is a guard
- *  rail, not a knob to widen. */
-export const MAX_SLIPPAGE_PCT = 25;
+ *  this is REJECTED outright, never clamped.
+ *
+ *  RAISED TO 100 on 2026-09-14 at the operator's direction: the sell band is
+ *  now 100% (a ZERO floor), so an exit can never be refused on price. The
+ *  rail's job is therefore only to keep the number SANE (finite, >= 0, <= 100):
+ *  100 is a legal, chosen value, and it is the only one that removes the
+ *  protection entirely. The old 25 ceiling was there to stop a wider band
+ *  being used as a workaround for a race; the operator has explicitly taken
+ *  that trade-off on the SELL side. The BUY side stays at 20 (see
+ *  POOL_BUY_SLIPPAGE_PCT in lib/swap.ts and CURVE_BUY_SLIPPAGE_BPS in
+ *  lib/params.ts), where the band is a floor on the tokens received and there
+ *  is no reason to give it up. */
+export const MAX_SLIPPAGE_PCT = 100;
 
 /** The share of a wallet's own balance one sell takes, in raw token units,
  *  FLOORED: a partial sell cannot take more than the wallet holds, and it
@@ -163,10 +171,10 @@ export interface SellAllOptions {
   mint: PublicKey;
   /** The managed roster; keyed wallets are sold, watch-only skipped. */
   wallets: SellableWallet[];
-  /** Slippage percent for the quotes (default POOL_SLIPPAGE_PCT, 20),
-   *  applied to the curve leg's min_sol_output AND passed to the PumpSwap
-   *  SDK's sell leg. Values above MAX_SLIPPAGE_PCT are rejected outright
-   *  rather than clamped. */
+  /** Slippage percent for the quotes (default POOL_SELL_SLIPPAGE_PCT, 100 = a
+   *  ZERO floor), applied to the curve leg's min_sol_output AND passed to the
+   *  PumpSwap SDK's sell leg. Values above MAX_SLIPPAGE_PCT are rejected
+   *  outright rather than clamped. */
   slippagePct?: number;
   /** Share of each wallet's OWN balance to sell, percent in (0, 100]. Default
    *  100 = the whole bag (the sell-all contract). A partial sell is sized from
@@ -700,13 +708,13 @@ export async function sellOneWalletOnPool(opts: {
   wallet: Keypair;
   /** Share of the wallet's own balance to sell, percent in (0, 100]. */
   sellPct: number;
-  /** Slippage band percent (default POOL_SLIPPAGE_PCT, 20: the venue band the
-   *  Sell All button passes). */
+  /** Slippage band percent (default POOL_SELL_SLIPPAGE_PCT, 100 = a ZERO floor:
+   *  the band the Sell All button passes). */
   slippagePct?: number;
   /** STAGE 2 folded floor (lamports), first attempt only. */
   minOutLamports?: bigint;
 }): Promise<SellOutcome> {
-  const slippagePct = opts.slippagePct ?? POOL_SLIPPAGE_PCT;
+  const slippagePct = opts.slippagePct ?? POOL_SELL_SLIPPAGE_PCT;
   if (
     !Number.isFinite(slippagePct) ||
     slippagePct < 0 ||
@@ -747,12 +755,13 @@ export async function sellAllManagedWallets(
     poolIndex = CANONICAL_POOL_INDEX,
   } = opts;
 
-  // R3 GUARD RAIL: reject an absurd slippage BEFORE any network call. This is
-  // what stops "just set it to 100%" from becoming the workaround for a race
-  // (at 100 the min floor is 0, removing the only defence against an adverse
-  // fill and converting a loud revert into a silent bad fill). Values above
-  // MAX_SLIPPAGE_PCT are refused, never clamped.
-  const slippagePct = opts.slippagePct ?? POOL_SLIPPAGE_PCT;
+  // R3 GUARD RAIL: keep the band SANE (finite, >= 0, <= MAX_SLIPPAGE_PCT)
+  // BEFORE any network call. Since 2026-09-14 the operator's sell band IS 100
+  // (a zero floor: an exit can never be refused on price, which is the point),
+  // so this check no longer forbids the value it used to; it only refuses a
+  // non-finite/negative/absurd one. Values above MAX_SLIPPAGE_PCT are refused,
+  // never clamped.
+  const slippagePct = opts.slippagePct ?? POOL_SELL_SLIPPAGE_PCT;
   if (
     !Number.isFinite(slippagePct) ||
     slippagePct < 0 ||

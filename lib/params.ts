@@ -59,13 +59,20 @@ export const VIRTUAL_TOKEN_RESERVE: bigint = BigInt(1_073_000_000_000_000);
  *  Unit: basis points (1% = 100 bps, 100% = 10_000 bps). Value: 100 (1%). */
 export const FEE_BPS: bigint = BigInt(100);
 
-/** Slippage band (basis points) every CURVE trade path carries: the buy side's
- *  `min_tokens_out` floor (`buy_exact_sol_in`) and the sell side's
- *  `min_sol_output` floor. A floor costs nothing on either side (it is not
- *  headroom the wallet has to fund), so it is never a reason a trade fails to
- *  land. Unit: basis points. Value: 2000 (20%), the operator's standing band,
- *  the curve twin of the migrated venue's POOL_SLIPPAGE_PCT (lib/swap.ts). */
-export const CURVE_SLIPPAGE_BPS: bigint = BigInt(2000);
+/** Slippage band (basis points) the CURVE BUY carries: the floor on the tokens
+ *  received (`buy_exact_sol_in`'s `min_tokens_out`). Unit: basis points. Value:
+ *  2000 (20%). See CURVE_SELL_SLIPPAGE_BPS for the other side of a trade. */
+export const CURVE_BUY_SLIPPAGE_BPS: bigint = BigInt(2000);
+
+/** Slippage band (basis points) the CURVE SELL carries: `min_sol_output` sits
+ *  this far below the net quote. Unit: basis points. Value: 10000 (100%),
+ *  i.e. the floor is ZERO: the operator's explicit choice, it means a curve
+ *  sell never reverts on price (an exit cannot be blocked by the curve moving).
+ *  The trade-off is on-chain: at a 0 floor there is no protection against a
+ *  sandwich/adverse fill, so the sell always fills at whatever the curve pays
+ *  at landing time. 10000 = 0 is the ONLY value that removes that protection;
+ *  anything below it still refuses a collapsed fill. */
+export const CURVE_SELL_SLIPPAGE_BPS: bigint = BigInt(10_000);
 
 /** SOL dust threshold that gates managed-wallet deletion: a wallet whose SOL
  *  balance is below this is treated as empty and can be removed (per-row x or

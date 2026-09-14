@@ -333,6 +333,105 @@ describe("(C3) buildPumpMigrateV2Ix matches the captured Datadog migration", () 
   });
 });
 
+describe("migrate outcome is decided by chain state, never by an error code", () => {
+  // Real addresses from docs/launch-flow-datadog-parity.md C3a, used only as
+  // strings so the reasons are operator-checkable.
+  const POOL_KEY = "3WkN2cs4rCQthRxnrgqmKgYT28SQJWoqSYzp8eRmPR1D";
+  const MINT = "2G8jCXX6HCTtXmZ8ngS2Z3qs6z2BJzLhdJt7YNsgpump";
+
+  it("1. dropped-error regression: a 0x1798 error with no pool is failed", () => {
+    const out = migrate.classifyMigrateOutcome({
+      sent: false,
+      sendError: "custom program error: 0x1798",
+      poolKey: POOL_KEY,
+      poolExists: false,
+      poolBaseMintMatchesMint: false,
+      curveComplete: false,
+      mint: MINT,
+    });
+    expect(out.status).to.equal("failed");
+  });
+
+  it("2. the same error text with this mint's pool is already-migrated", () => {
+    const out = migrate.classifyMigrateOutcome({
+      sent: false,
+      sendError: "custom program error: 0x1798",
+      poolKey: POOL_KEY,
+      poolExists: true,
+      poolBaseMintMatchesMint: true,
+      curveComplete: true,
+      mint: MINT,
+    });
+    expect(out.status).to.equal("already-migrated");
+  });
+
+  it("3. a bare 6040 code with no pool is never a success", () => {
+    const out = migrate.classifyMigrateOutcome({
+      sent: false,
+      sendError: "Custom: 6040",
+      poolKey: POOL_KEY,
+      poolExists: false,
+      poolBaseMintMatchesMint: false,
+      curveComplete: false,
+      mint: MINT,
+    });
+    expect(out.status).to.equal("failed");
+  });
+
+  it("4. unrelated error text with this mint's pool is already-migrated", () => {
+    const out = migrate.classifyMigrateOutcome({
+      sent: false,
+      sendError: "ChecksumFailed",
+      poolKey: POOL_KEY,
+      poolExists: true,
+      poolBaseMintMatchesMint: true,
+      curveComplete: true,
+      mint: MINT,
+    });
+    expect(out.status).to.equal("already-migrated");
+  });
+
+  it("5. a sent + confirmed migrate is landed", () => {
+    const out = migrate.classifyMigrateOutcome({
+      sent: true,
+      sendError: null,
+      poolKey: POOL_KEY,
+      poolExists: false,
+      poolBaseMintMatchesMint: false,
+      curveComplete: true,
+      mint: MINT,
+    });
+    expect(out.status).to.equal("landed");
+  });
+
+  it("6. a pool whose base_mint is a different mint is failed", () => {
+    const out = migrate.classifyMigrateOutcome({
+      sent: false,
+      sendError: "Custom: 6040",
+      poolKey: POOL_KEY,
+      poolExists: true,
+      poolBaseMintMatchesMint: false,
+      curveComplete: false,
+      mint: MINT,
+    });
+    expect(out.status).to.equal("failed");
+  });
+
+  it("7. no pool and an incomplete curve is failed; the reason names the pool", () => {
+    const out = migrate.classifyMigrateOutcome({
+      sent: false,
+      sendError: "tx migrate (...) failed on chain",
+      poolKey: POOL_KEY,
+      poolExists: false,
+      poolBaseMintMatchesMint: false,
+      curveComplete: false,
+      mint: MINT,
+    });
+    expect(out.status).to.equal("failed");
+    expect(out.reason).to.include(POOL_KEY);
+  });
+});
+
 type MigratedPoolFacts = import("../lib/pool-assertions").MigratedPoolFacts;
 
 describe("(e) section 4 pool assertions (mainnet + devnet reference rows)", () => {

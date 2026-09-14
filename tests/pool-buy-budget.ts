@@ -36,7 +36,7 @@ import {
 } from "../lib/batch-trade";
 import { MAX_BUY_KEEP_SOL_LAMPORTS } from "../lib/params";
 import {
-  POOL_SLIPPAGE_PCT,
+  POOL_BUY_SLIPPAGE_PCT,
   poolBuyMinBaseOut,
   toExactQuoteInBuy,
 } from "../lib/swap";
@@ -149,8 +149,8 @@ describe("poolBuyBudgetLamports (MAX budget on the pool venue)", () => {
 
 describe("poolBuyMinBaseOut (the band's floor on the tokens received)", () => {
   it("at the venue band (20%) the floor is 80% of the quoted base", () => {
-    expect(POOL_SLIPPAGE_PCT).to.equal(20);
-    expect(poolBuyMinBaseOut(BigInt(1_000_000_000), POOL_SLIPPAGE_PCT)).to.equal(
+    expect(POOL_BUY_SLIPPAGE_PCT).to.equal(20);
+    expect(poolBuyMinBaseOut(BigInt(1_000_000_000), POOL_BUY_SLIPPAGE_PCT)).to.equal(
       BigInt(800_000_000)
     );
   });

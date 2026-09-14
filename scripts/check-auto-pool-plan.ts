@@ -8,7 +8,7 @@
 //   2. sizes each section 4.4 spendable with poolBuyCommitLamports,
 //   3. builds the instruction stream the AUTO buy goes through
 //      (swapSolanaState + lib/swap.ts buildMigratedBuyIxs at
-//      POOL_AUTO_SLIPPAGE_PCT) and asserts what the commit rule depends on:
+//      POOL_AUTO_BUY_SLIPPAGE_PCT) and asserts what the commit rule depends on:
 //        - the AMM instruction IS buy_exact_quote_in (discriminator),
 //        - spendable_quote_in IS the commit (full spend of the commit),
 //        - the SOL wrap (system transfer into the WSOL ATA) IS the commit, so
@@ -34,7 +34,8 @@ import {
   PumpAmmSdk,
 } from "@pump-fun/pump-swap-sdk";
 import {
-  POOL_AUTO_SLIPPAGE_PCT,
+  POOL_AUTO_BUY_SLIPPAGE_PCT,
+  POOL_AUTO_SELL_SLIPPAGE_PCT,
   poolBuyCommitLamports,
 } from "../lib/auto";
 import { canonicalMigratedPoolPda } from "../lib/migrate";
@@ -89,14 +90,14 @@ async function main(): Promise<void> {
   );
 
   // The bot's AUTO buy: commit = poolBuyCommitLamports(spendable), exact-in at
-  // POOL_AUTO_SLIPPAGE_PCT. The table is the section 4.4 one.
+  // POOL_AUTO_BUY_SLIPPAGE_PCT. The table is the section 4.4 one.
   for (const spendable of SPENDABLES) {
     const commit = poolBuyCommitLamports(spendable);
     const { ixs, baseOut, minBaseAmountOut } = await buildMigratedBuyIxs({
       sdk,
       state,
       spendableQuoteIn: commit,
-      slippagePct: POOL_AUTO_SLIPPAGE_PCT,
+      slippagePct: POOL_AUTO_BUY_SLIPPAGE_PCT,
     });
     const ammIx = ixs.find(
       (ix) => ix.programId.equals(PUMP_AMM_PROGRAM_ID) && ix.data.length === 25
@@ -119,7 +120,7 @@ async function main(): Promise<void> {
     );
     assert(
       minBaseArg ===
-        poolBuyMinBaseOut(poolBuyBaseOut(state, commit), POOL_AUTO_SLIPPAGE_PCT),
+        poolBuyMinBaseOut(poolBuyBaseOut(state, commit), POOL_AUTO_BUY_SLIPPAGE_PCT),
       `minBaseAmountOut ${minBaseArg} is not the banded floor of the live quote`
     );
     assert(commit <= spendable, `commit ${commit} exceeds spendable ${spendable}`);
@@ -165,7 +166,7 @@ async function main(): Promise<void> {
   const sellIxs = await sdk.sellBaseInput(
     sellState,
     new BN(baseAmount.toString()),
-    POOL_AUTO_SLIPPAGE_PCT
+    POOL_AUTO_SELL_SLIPPAGE_PCT
   );
   const sellIx = sellIxs.find(
     (ix) =>
@@ -176,13 +177,22 @@ async function main(): Promise<void> {
   const baseInArg = sellData.readBigUInt64LE(8);
   const minOutArg = sellData.readBigUInt64LE(16);
   console.log(
-    `SELL balance=${SELL_BALANCE} sellPct=${SELL_PCT} baseAmountIn=${baseInArg} minQuoteAmountOut=${minOutArg} (band ${POOL_AUTO_SLIPPAGE_PCT}%)`
+    `SELL balance=${SELL_BALANCE} sellPct=${SELL_PCT} baseAmountIn=${baseInArg} minQuoteAmountOut=${minOutArg} (band ${POOL_AUTO_SELL_SLIPPAGE_PCT}%)`
   );
   assert(
     baseInArg === baseAmount,
     `sell baseAmountIn ${baseInArg} != pctTokens ${baseAmount}`
   );
-  assert(minOutArg > BigInt(0), "minQuoteAmountOut is zero");
+  // The operator's SELL band is 100%, so the floor on the SOL received is ZERO:
+  // the sell can never be refused on price (that is the chosen trade-off).
+  assert(
+    POOL_AUTO_SELL_SLIPPAGE_PCT === 100,
+    `sell band is ${POOL_AUTO_SELL_SLIPPAGE_PCT}, expected 100`
+  );
+  assert(
+    minOutArg === BigInt(0),
+    `minQuoteAmountOut ${minOutArg} is not 0 at a 100% sell band`
+  );
   const sellTx = new Transaction({ feePayer: seller.publicKey }).add(...sellIxs);
   sellTx.recentBlockhash = (
     await connection.getLatestBlockhash("confirmed")
@@ -196,7 +206,7 @@ async function main(): Promise<void> {
   );
 
   console.log(
-    `\nOK: the AUTO pool buy is buy_exact_quote_in spending exactly the commit (= the WSOL wrap) with a ${POOL_AUTO_SLIPPAGE_PCT}% floor, and both the buy and sell streams fit the legacy limit.`
+    `\nOK: the AUTO pool buy is buy_exact_quote_in spending exactly the commit (= the WSOL wrap) with a ${POOL_AUTO_BUY_SLIPPAGE_PCT}% floor, the sell carries a ${POOL_AUTO_SELL_SLIPPAGE_PCT}% band (minQuoteAmountOut 0), and both streams fit the legacy limit.`
   );
 }
 
