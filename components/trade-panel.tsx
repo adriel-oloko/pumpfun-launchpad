@@ -330,7 +330,7 @@ export function TradePanel({
 	// exactly this long from the click (a fixed cadence, decoupled from the
 	// round's on-chain settlement), then they become clickable again —
 	// whether or not the triggered round has been approved/confirmed yet.
-	const MANUAL_CLICK_LOCK_MS = 3000;
+	const MANUAL_CLICK_LOCK_MS = 2000;
 
 	const [sellPct, setSellPct] = useState("100");
 	const [manualBusy, setManualBusy] = useState(false);
