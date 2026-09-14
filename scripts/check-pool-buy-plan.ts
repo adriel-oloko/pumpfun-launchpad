@@ -1,17 +1,23 @@
 // READ-ONLY mainnet check of the manual BUY MAX wiring on the migrated venue
-// (no keys, no send: it BUILDS exactly what the panel's buy would send and
-// asserts the shape and the numbers against the live pool).
+// (no keys, no send: it BUILDS exactly what the panel's buy would send, through
+// the SHIPPED builder lib/swap.ts `buildMigratedBuyIxs`, and asserts the shape
+// and the numbers against the live pool).
 //
 // For a graduated mint it:
 //   1. derives the canonical PumpSwap pool (canonicalMigratedPoolPda),
 //   2. sizes a wallet's MAX budget with poolBuyBudgetLamports,
 //   3. builds the instruction stream the buy goes through
-//      (swapSolanaState + buyQuoteInput at slippage 0),
-//   4. asserts what the budget rule depends on:
-//        - the SOL wrap (system transfer into the WSOL ATA) IS the budget,
-//        - maxQuoteAmountIn IS the budget (so the wallet cannot be overdrawn
-//          below its 0.002 SOL keep),
-//        - baseAmountOut matches the SDK's own quote and is non-zero,
+//      (swapSolanaState + buildMigratedBuyIxs at POOL_SLIPPAGE_PCT),
+//   4. asserts what the budget rule and the band depend on:
+//        - the AMM instruction IS buy_exact_quote_in (discriminator + args), so
+//          the spend is EXACT and the wallet cannot be overdrawn below its
+//          0.002 SOL keep,
+//        - spendable_quote_in IS the budget (full spend, nothing left behind),
+//        - min_base_amount_out IS the banded floor (base at the live reserves,
+//          less POOL_SLIPPAGE_PCT), which is what makes an adverse tick land
+//          instead of reverting with pump_amm 6040,
+//        - the SOL wrap (system transfer into the WSOL ATA) IS the budget: the
+//          wallet holds exactly what the exact-in instruction takes,
 //        - the WSOL account is created and CLOSED inside the same tx (so its
 //          rent comes back),
 //        - the serialized tx fits the 1232-byte legacy limit.
@@ -19,7 +25,7 @@
 // Run:
 //   ./node_modules/.bin/ts-node -P ./tsconfig.test.json -T scripts/check-pool-buy-plan.ts [mint]
 
-import { BN } from "@coral-xyz/anchor";
+import { Buffer } from "buffer";
 import {
   TOKEN_PROGRAM_ID,
   getAssociatedTokenAddressSync,
@@ -35,11 +41,16 @@ import {
   OnlinePumpAmmSdk,
   PUMP_AMM_PROGRAM_ID,
   PumpAmmSdk,
-  buyQuoteInput,
 } from "@pump-fun/pump-swap-sdk";
 import { poolBuyBudgetLamports } from "../lib/batch-trade";
 import { WSOL_MINT, canonicalMigratedPoolPda } from "../lib/migrate";
 import { readPumpCurveState } from "../lib/pump";
+import {
+  POOL_SLIPPAGE_PCT,
+  buildMigratedBuyIxs,
+  poolBuyBaseOut,
+  poolBuyMinBaseOut,
+} from "../lib/swap";
 
 const RPC =
   process.env.MAINNET_RPC ??
@@ -51,6 +62,10 @@ const MAX_TX_BYTES = 1232;
 /** Token-2022 ATA size / WSOL (legacy) ATA size. */
 const BASE_ATA_BYTES = 170;
 const WSOL_ATA_BYTES = 165;
+/** The program's exact-in discriminator (pump_amm IDL). */
+const EXACT_IN_DISC = Buffer.from([198, 46, 21, 82, 180, 217, 232, 112]);
+/** The SDK's plain-buy discriminator, i.e. what we must NOT be sending. */
+const BUY_DISC = Buffer.from([102, 6, 61, 18, 1, 218, 235, 234]);
 
 function assert(cond: unknown, msg: string): asserts cond {
   if (!cond) throw new Error(`ASSERT FAILED: ${msg}`);
@@ -98,52 +113,64 @@ async function main(): Promise<void> {
   const online = new OnlinePumpAmmSdk(connection);
   const sdk = new PumpAmmSdk();
   const state = await online.swapSolanaState(poolKey, buyer.publicKey);
-  const ixs = await sdk.buyQuoteInput(state, new BN(budget.toString()), 0);
-
-  // The SDK's own quote for the same input/slippage: the ground truth the
-  // instruction args must match.
-  const quote = buyQuoteInput({
-    quote: new BN(budget.toString()),
-    slippage: 0,
-    baseReserve: state.poolBaseAmount,
-    quoteReserve: state.poolQuoteAmount,
-    virtualQuoteReserves: state.pool.virtualQuoteReserves,
-    globalConfig: state.globalConfig,
-    baseMintAccount: state.baseMintAccount,
-    baseMint: state.pool.baseMint,
-    coinCreator: state.pool.coinCreator,
-    creator: state.pool.creator,
-    feeConfig: state.feeConfig,
-  });
   console.log(`pool base        ${state.poolBaseAmount.toString()} raw tokens`);
   console.log(
     `pool quote       ${state.poolQuoteAmount.toString()} lamports (+virtual ${state.pool.virtualQuoteReserves.toString()})`
   );
-  console.log(`quote.base       ${quote.base.toString()} raw tokens out`);
-  console.log(`quote.maxQuote   ${quote.maxQuote.toString()} lamports in (cap)`);
 
-  // The buy instruction: AMM anchor call, 8-byte discriminator +
-  // (base_amount_out u64, max_quote_amount_in u64, track_volume bool).
-  const buyIx = ixs.find(
+  // The SHIPPED stream: what the panel's BUY MAX sends, byte for byte.
+  const { ixs, baseOut, minBaseAmountOut } = await buildMigratedBuyIxs({
+    sdk,
+    state,
+    spendableQuoteIn: budget,
+    slippagePct: POOL_SLIPPAGE_PCT,
+  });
+  console.log(
+    `band             ${POOL_SLIPPAGE_PCT}% -> base out ${baseOut.toString()} raw tokens, floor ${minBaseAmountOut.toString()}`
+  );
+
+  // 1. The AMM instruction must be buy_exact_quote_in, NOT the SDK's buy.
+  const ammIx = ixs.find(
     (ix) => ix.programId.equals(PUMP_AMM_PROGRAM_ID) && ix.data.length === 25
   );
-  assert(buyIx !== undefined, "no buy instruction (25-byte data) in the stream");
-  const buyData = Buffer.from((buyIx as { data: Buffer }).data);
-  const baseOutArg = buyData.readBigUInt64LE(8);
-  const maxQuoteArg = buyData.readBigUInt64LE(16);
+  assert(ammIx !== undefined, "no 25-byte pump_amm instruction in the stream");
+  const data = Buffer.from(ammIx.data);
+  const disc = data.subarray(0, 8);
+  const spendableArg = data.readBigUInt64LE(8);
+  const minBaseArg = data.readBigUInt64LE(16);
   console.log(
-    `buy ix args      baseAmountOut=${baseOutArg} maxQuoteAmountIn=${maxQuoteArg} trackVolume=${buyData[24]}`
+    `buy ix           disc=${disc.toString("hex")} spendableQuoteIn=${spendableArg} minBaseAmountOut=${minBaseArg} trackVolume=${data[24]}`
   );
   assert(
-    baseOutArg === BigInt(quote.base.toString()),
-    `baseAmountOut ${baseOutArg} != SDK quote ${quote.base.toString()}`
+    disc.equals(EXACT_IN_DISC),
+    `instruction is not buy_exact_quote_in (disc=${disc.toString("hex")})`
   );
   assert(
-    maxQuoteArg === BigInt(quote.maxQuote.toString()),
-    `maxQuoteAmountIn ${maxQuoteArg} != SDK quote ${quote.maxQuote.toString()}`
+    !disc.equals(BUY_DISC),
+    "instruction is still the SDK's plain buy: a band would not be expressible"
+  );
+  assert(
+    spendableArg === budget,
+    `spendableQuoteIn ${spendableArg} != budget ${budget} (full spend broken)`
   );
 
-  // The SOL wrap: a system transfer of the budget into the buyer's WSOL ATA.
+  // 2. The floor must be the banded base at the live reserves.
+  const expectedBase = poolBuyBaseOut(state, budget);
+  const expectedFloor = poolBuyMinBaseOut(expectedBase, POOL_SLIPPAGE_PCT);
+  console.log(
+    `expected floor   base ${expectedBase.toString()} * 80% = ${expectedFloor.toString()}`
+  );
+  assert(
+    baseOut === expectedBase,
+    `quoted base ${baseOut} != live quote ${expectedBase}`
+  );
+  assert(
+    minBaseArg === expectedFloor,
+    `minBaseAmountOut ${minBaseArg} != banded floor ${expectedFloor}`
+  );
+  assert(minBaseArg > BigInt(0), "minBaseAmountOut is zero: no floor at all");
+
+  // 3. The WSOL wrap must be the budget itself (the exact-in spend).
   const wsolAta = getAssociatedTokenAddressSync(
     WSOL_MINT,
     buyer.publicKey,
@@ -166,6 +193,10 @@ async function main(): Promise<void> {
     wrapTo.equals(wsolAta),
     `wrap target ${wrapTo.toBase58()} != WSOL ATA ${wsolAta.toBase58()}`
   );
+  assert(
+    wrapLamports === budget,
+    `wrap ${wrapLamports} != budget ${budget} (the wallet would need more SOL than it has)`
+  );
 
   const creates = ixs.filter((ix) =>
     ix.programId.equals(new PublicKey("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL"))
@@ -184,18 +215,23 @@ async function main(): Promise<void> {
 
   assert(closes.length === 1, "the WSOL account is not closed in the same tx");
   assert(
-    wrapLamports === budget,
-    `wrap ${wrapLamports} != budget ${budget} (the wallet would need more SOL than it has)`
-  );
-  assert(
-    maxQuoteArg === budget,
-    `maxQuoteAmountIn ${maxQuoteArg} != budget ${budget} (could overdraw below the keep)`
-  );
-  assert(baseOutArg > BigInt(0), "baseAmountOut is zero: nothing to buy");
-  assert(
     wrapLamports + BigInt(2_000_000) + BigInt(5_000) + BigInt(baseAtaRent) + BigInt(wsolAtaRent) ===
       LIVE_LAMPORTS,
     "budget + keep + fee + rents does not account for the whole live balance"
+  );
+
+  // 4. What the OLD shape would have needed: the SDK's plain buy wraps
+  // budget * (1 + s/100), which a wallet sized to its keep does not hold. This
+  // is the reason the exact-in instruction is used.
+  const oldWrap =
+    (budget * BigInt(Math.floor((1 + POOL_SLIPPAGE_PCT / 100) * 1e9))) /
+    BigInt(1_000_000_000);
+  console.log(
+    `old shape        the SDK's plain buy at ${POOL_SLIPPAGE_PCT}% would wrap ${oldWrap} lamports > budget ${budget}`
+  );
+  assert(
+    oldWrap > budget,
+    "the plain-buy wrap fits inside the budget: the exact-in path would not be needed"
   );
 
   const tx = new Transaction({ feePayer: buyer.publicKey }).add(...ixs);
@@ -208,7 +244,7 @@ async function main(): Promise<void> {
   assert(size <= MAX_TX_BYTES, `tx is ${size} bytes, over the legacy limit`);
 
   console.log(
-    "\nOK: the pool buy wraps and commits exactly the MAX budget, buys a non-zero amount, and returns the WSOL rent."
+    `\nOK: the pool buy is buy_exact_quote_in spending exactly the MAX budget (${budget} lamports) with a ${POOL_SLIPPAGE_PCT}% floor of ${minBaseArg} raw tokens, the WSOL wrap/close nets out, and the tx fits the legacy limit.`
   );
 }
 

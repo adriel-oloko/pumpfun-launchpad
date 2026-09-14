@@ -1,17 +1,21 @@
 // READ-ONLY mainnet check of the AUTO bot's BUY/SELL on the migrated venue (no
-// keys, no send: it BUILDS exactly what the AUTO pool rounds would send and
-// asserts the shape and the numbers against the live pool).
+// keys, no send: it BUILDS exactly what the AUTO pool rounds would send, through
+// the SHIPPED builders, and asserts the shape and the numbers against the live
+// pool).
 //
 // For the frozen graduated pair it:
 //   1. derives the canonical PumpSwap pool (canonicalMigratedPoolPda),
 //   2. sizes each section 4.4 spendable with poolBuyCommitLamports,
 //   3. builds the instruction stream the AUTO buy goes through
-//      (swapSolanaState + buyQuoteInput at the bot's 10% slippage) and asserts
-//      what the commit rule depends on:
-//        - the SDK's maxQuoteAmountIn equals poolBuyWrapLamports(commit, 10)
-//          (the WSOL wrap is that figure),
-//        - the wrap never exceeds the spendable base (headroom >= 0, and exactly
-//          1 lamport at the default 95%),
+//      (swapSolanaState + lib/swap.ts buildMigratedBuyIxs at
+//      POOL_AUTO_SLIPPAGE_PCT) and asserts what the commit rule depends on:
+//        - the AMM instruction IS buy_exact_quote_in (discriminator),
+//        - spendable_quote_in IS the commit (full spend of the commit),
+//        - the SOL wrap (system transfer into the WSOL ATA) IS the commit, so
+//          commit <= spendable holds with no band on top of it (the old
+//          `spendable / 1.10` cap is gone),
+//        - min_base_amount_out IS the banded floor (base at the live reserves
+//          less the band), i.e. the band is real,
 //        - base out is non-zero,
 //        - the serialized tx fits the 1232-byte legacy limit,
 //   4. builds the AUTO sell stream for a SELL % of a synthetic balance through
@@ -22,21 +26,21 @@
 //   ./node_modules/.bin/ts-node -P ./tsconfig.test.json -T scripts/check-auto-pool-plan.ts [mint]
 
 import { BN } from "@coral-xyz/anchor";
-import { Connection, Keypair, PublicKey, Transaction } from "@solana/web3.js";
+import { Buffer } from "buffer";
+import { Connection, Keypair, PublicKey, SystemProgram, Transaction } from "@solana/web3.js";
 import {
   OnlinePumpAmmSdk,
   PUMP_AMM_PROGRAM_ID,
   PumpAmmSdk,
-  buyQuoteInput,
 } from "@pump-fun/pump-swap-sdk";
 import {
   POOL_AUTO_SLIPPAGE_PCT,
   poolBuyCommitLamports,
-  poolBuyWrapLamports,
 } from "../lib/auto";
 import { canonicalMigratedPoolPda } from "../lib/migrate";
 import { readPumpCurveState } from "../lib/pump";
 import { pctTokens } from "../lib/sell-all";
+import { buildMigratedBuyIxs, poolBuyBaseOut, poolBuyMinBaseOut } from "../lib/swap";
 
 const RPC =
   process.env.MAINNET_RPC ??
@@ -48,6 +52,8 @@ const SPENDABLES = [BigInt(10_000_000), BigInt(50_000_000), BigInt(100_000_000)]
 /** The synthetic sell balance (1000 tokens at 6 decimals) and the SELL %. */
 const SELL_BALANCE = BigInt(1_000_000_000);
 const SELL_PCT = 50;
+/** The program's exact-in discriminator (pump_amm IDL). */
+const EXACT_IN_DISC = Buffer.from([198, 46, 21, 82, 180, 217, 232, 112]);
 
 function assert(cond: unknown, msg: string): asserts cond {
   if (!cond) throw new Error(`ASSERT FAILED: ${msg}`);
@@ -82,44 +88,61 @@ async function main(): Promise<void> {
     `pool base        ${state.poolBaseAmount.toString()} raw tokens; quote ${state.poolQuoteAmount.toString()} lamports (+virtual ${state.pool.virtualQuoteReserves.toString()})`
   );
 
-  // The bot's AUTO buy: commit = poolBuyCommitLamports(spendable), wrapped at
-  // POOL_AUTO_SLIPPAGE_PCT (10). The table is the section 4.4 one.
+  // The bot's AUTO buy: commit = poolBuyCommitLamports(spendable), exact-in at
+  // POOL_AUTO_SLIPPAGE_PCT. The table is the section 4.4 one.
   for (const spendable of SPENDABLES) {
     const commit = poolBuyCommitLamports(spendable);
-    const expectedWrap = poolBuyWrapLamports(commit, POOL_AUTO_SLIPPAGE_PCT);
-    // The SDK's own quote for the same input/slippage: the ground truth the
-    // instruction args must match.
-    const quote = buyQuoteInput({
-      quote: new BN(commit.toString()),
-      slippage: POOL_AUTO_SLIPPAGE_PCT,
-      baseReserve: state.poolBaseAmount,
-      quoteReserve: state.poolQuoteAmount,
-      virtualQuoteReserves: state.pool.virtualQuoteReserves,
-      globalConfig: state.globalConfig,
-      baseMintAccount: state.baseMintAccount,
-      baseMint: state.pool.baseMint,
-      coinCreator: state.pool.coinCreator,
-      creator: state.pool.creator,
-      feeConfig: state.feeConfig,
+    const { ixs, baseOut, minBaseAmountOut } = await buildMigratedBuyIxs({
+      sdk,
+      state,
+      spendableQuoteIn: commit,
+      slippagePct: POOL_AUTO_SLIPPAGE_PCT,
     });
-    const maxQuote = BigInt(quote.maxQuote.toString());
-    const base = BigInt(quote.base.toString());
-    const headroom = spendable - maxQuote;
+    const ammIx = ixs.find(
+      (ix) => ix.programId.equals(PUMP_AMM_PROGRAM_ID) && ix.data.length === 25
+    );
+    assert(ammIx !== undefined, "no 25-byte pump_amm buy instruction in the stream");
+    const data = Buffer.from(ammIx.data);
+    const spendableArg = data.readBigUInt64LE(8);
+    const minBaseArg = data.readBigUInt64LE(16);
+    const headroom = spendable - commit;
     console.log(
-      `BUY  spendable=${spendable} commit=${commit} maxQuote=${maxQuote} wrap=${expectedWrap} headroom=${headroom} base=${base}`
+      `BUY  spendable=${spendable} commit=${commit} spendableQuoteIn=${spendableArg} minBaseAmountOut=${minBaseArg} headroom=${headroom} base=${baseOut}`
     );
     assert(
-      maxQuote === expectedWrap,
-      `maxQuoteAmountIn ${maxQuote} != poolBuyWrapLamports ${expectedWrap}`
+      data.subarray(0, 8).equals(EXACT_IN_DISC),
+      `buy is not buy_exact_quote_in (disc=${data.subarray(0, 8).toString("hex")})`
     );
-    assert(headroom >= BigInt(0), `wrap ${maxQuote} exceeds spendable ${spendable}`);
-    assert(base > BigInt(0), "baseAmountOut is zero: nothing to buy");
+    assert(
+      spendableArg === commit,
+      `spendableQuoteIn ${spendableArg} != commit ${commit}`
+    );
+    assert(
+      minBaseArg ===
+        poolBuyMinBaseOut(poolBuyBaseOut(state, commit), POOL_AUTO_SLIPPAGE_PCT),
+      `minBaseAmountOut ${minBaseArg} is not the banded floor of the live quote`
+    );
+    assert(commit <= spendable, `commit ${commit} exceeds spendable ${spendable}`);
+    assert(baseOut > BigInt(0), "base out is zero: nothing to buy");
+    assert(minBaseAmountOut > BigInt(0), "minBaseAmountOut is zero: no floor");
 
-    const ixs = await sdk.buyQuoteInput(
-      state,
-      new BN(commit.toString()),
-      POOL_AUTO_SLIPPAGE_PCT
+    // The wrap is the commit itself (exact-in), so it can never need more SOL
+    // than the spendable base.
+    const wrapIx = ixs.find(
+      (ix) =>
+        ix.programId.equals(SystemProgram.programId) && ix.data.length === 12
     );
+    assert(wrapIx !== undefined, "no system transfer (WSOL wrap) in the stream");
+    const wrapLamports = Buffer.from(wrapIx.data).readBigUInt64LE(4);
+    assert(
+      wrapLamports === commit,
+      `wrap ${wrapLamports} != commit ${commit}`
+    );
+    assert(
+      wrapLamports <= spendable,
+      `wrap ${wrapLamports} exceeds spendable ${spendable}`
+    );
+
     const tx = new Transaction({ feePayer: buyer.publicKey }).add(...ixs);
     tx.recentBlockhash = (
       await connection.getLatestBlockhash("confirmed")
@@ -153,7 +176,7 @@ async function main(): Promise<void> {
   const baseInArg = sellData.readBigUInt64LE(8);
   const minOutArg = sellData.readBigUInt64LE(16);
   console.log(
-    `SELL balance=${SELL_BALANCE} sellPct=${SELL_PCT} baseAmountIn=${baseInArg} minQuoteAmountOut=${minOutArg}`
+    `SELL balance=${SELL_BALANCE} sellPct=${SELL_PCT} baseAmountIn=${baseInArg} minQuoteAmountOut=${minOutArg} (band ${POOL_AUTO_SLIPPAGE_PCT}%)`
   );
   assert(
     baseInArg === baseAmount,
@@ -173,7 +196,7 @@ async function main(): Promise<void> {
   );
 
   console.log(
-    "\nOK: the AUTO pool buy wraps exactly poolBuyWrapLamports(commit, 10) <= spendable (1-lamport headroom at 95%), buys a non-zero amount, and both the buy and sell streams fit the legacy limit."
+    `\nOK: the AUTO pool buy is buy_exact_quote_in spending exactly the commit (= the WSOL wrap) with a ${POOL_AUTO_SLIPPAGE_PCT}% floor, and both the buy and sell streams fit the legacy limit.`
   );
 }
 

@@ -14,9 +14,15 @@
 //     left ~10% of the spendable balance unbought; the 2026-09-08 band
 //     commit is gone). A wallet ends at exactly 0.002 SOL after the buy.
 //     Skipped when the balance cannot cover the keep + ATA rent + base fee.
+//     CURVE ONLY: pump.fun's curve buy takes (tokens_out, max_sol_cost), so
+//     a band there can only be paid for by shrinking solIn to budget / (1+s)
+//     and stranding the difference. The migrated venue has an exact-in shape
+//     and DOES carry a band (below).
 //   - Sell: for every selected keyed wallet, sell sellPct% of the wallet's
-//     current token balance of the tracked mint (walletTokenBalance).
-//     Skipped when the balance is zero.
+//     current token balance of the tracked mint (walletTokenBalance). The
+//     curve sell carries SELL_SLIPPAGE_BPS (20%) under the net quote as
+//     min_sol_output (a sell band costs nothing: the floor only stops a
+//     collapsed fill). Skipped when the balance is zero.
 //
 // Trade execution is the v4 batch pattern used across M5/M6: each wallet's
 // trade is its OWN signed tx (the wallet is the fee payer), fired
@@ -37,22 +43,26 @@
 // this module runs (the trade panel's round gate) and passed in, so both
 // the gate and the batch quote against the same snapshot.
 //
-// MIGRATED VENUE (2026-09): a GRADUATED mint (curve `complete` = 1) has no
-// tradable curve left (curve buy/sell revert on-chain), so the manual BUY MAX
-// routes to the PumpSwap AMM instead: buySelectedWalletsMigrated buys on the
-// canonical pool through lib/swap.ts's buyMigratedPool (the official
-// @pump-fun/pump-swap-sdk quotes base out for an EXACT SOL input and wraps the
-// SOL itself). The budget follows the curve leg's rule exactly (total balance
-// minus the flat 0.002 SOL keep, the 5,000-lamport base fee, and only the
-// rents the tx must actually create) and the buy is quoted at ZERO slippage,
-// so the whole budget is committed: maxQuoteAmountIn IS the budget and a tick
-// up reverts cleanly instead of overdrawing the wallet below its keep. The
-// SELL routes there too: sellSelectedWalletsMigrated sells sellPct% of each
-// selected wallet's balance on the same pool through lib/sell-all.ts's
-// per-wallet pool leg (sellOneWalletOnPool) under the identical policy Sell All
-// uses (fresh quote per attempt, folded floors over the selected subset, its
-// own retry budgets), so a graduated mint no longer has to leave this panel to
-// be sold.
+// MIGRATED VENUE (2026-09, band + exact-in 2026-09-14): a GRADUATED mint
+// (curve `complete` = 1) has no tradable curve left (curve buy/sell revert
+// on-chain), so the manual BUY MAX routes to the PumpSwap AMM instead:
+// buySelectedWalletsMigrated buys on the canonical pool through lib/swap.ts's
+// buyMigratedPool, which builds the program's EXACT-IN buy_exact_quote_in.
+// The budget follows the curve leg's rule exactly (total balance minus the
+// flat 0.002 SOL keep, the 5,000-lamport base fee, and only the rents the tx
+// must actually create) and is spent in FULL, with POOL_SLIPPAGE_PCT (20%)
+// held as a floor on the tokens received rather than as headroom above the
+// price: a fill up to 20% worse still lands, and the wallet still ends at its
+// keep. (Before 2026-09-14 the pool buy used the SDK's plain `buy` at ZERO
+// slippage, where maxQuoteAmountIn == the exact quote-time price, so any tick
+// between the quote and the landing reverted with pump_amm 6040 and only the
+// first buy of a concurrent batch could ever land.) The SELL routes there too:
+// sellSelectedWalletsMigrated sells sellPct% of each selected wallet's balance
+// on the same pool through lib/sell-all.ts's per-wallet pool leg
+// (sellOneWalletOnPool) under the identical policy Sell All uses (fresh quote
+// per attempt, POOL_SLIPPAGE_PCT under the quote, folded floors over the
+// selected subset, its own retry budgets), so a graduated mint no longer has
+// to leave this panel to be sold.
 //
 // All amounts are bigint (no bigint literals, project target is ES2017);
 // every tx is signed manually with the wallet's Keypair (anchor Wallet is
@@ -77,7 +87,7 @@ import {
 } from "./bundle/launch";
 import type { SendTx } from "./bundle/protected-send";
 import { WSOL_MINT } from "./migrate";
-import { MAX_BUY_KEEP_SOL_LAMPORTS } from "./params";
+import { MAX_BUY_KEEP_SOL_LAMPORTS, SELL_SLIPPAGE_BPS } from "./params";
 import {
   buildPumpBuyIx,
   quotePumpBuy,
@@ -88,7 +98,7 @@ import {
   planFoldedFloors,
   sellOneWalletOnPool,
 } from "./sell-all";
-import { buyMigratedPool } from "./swap";
+import { buyMigratedPool, POOL_SLIPPAGE_PCT } from "./swap";
 
 /** Single-signature legacy tx base fee (lamports). A manual buy is one signer
  *  (the wallet) on a plain raw-RPC tx, so the base fee is exactly 5,000 — the
@@ -277,6 +287,12 @@ async function sellOne(
     tokenIn,
     solReserve: curve.solReserve,
     tokenReserve: curve.tokenReserve,
+    // The operator's sell band (20%): min_sol_output sits SELL_SLIPPAGE_BPS
+    // below the net quote, so a fill that has collapsed past it reverts
+    // instead of dumping the bag at a wrecked price. A band costs nothing on
+    // a sell (it is a floor, not headroom), so it is never a reason a sell
+    // fails to land.
+    slippageBps: SELL_SLIPPAGE_BPS,
   });
   const tx = new Transaction({
     feePayer: kp.publicKey,
@@ -394,12 +410,11 @@ export interface BuyMigratedSelectedOptions {
   poolKey: PublicKey;
   /** Selected keyed managed wallets to buy for. */
   wallets: AutoWallet[];
-  /** Slippage PERCENT for the pool quote (the SDK's 0-100 unit), default 0:
-   *  the whole budget is committed, exactly like the curve leg's zero-slippage
-   *  MAX buy. The SDK's `maxQuoteAmountIn` is `quoteLamports * (1 + s/100)` and
-   *  it WRAPS that figure as WSOL, so a band cannot be paid for out of thin
-   *  air: it has to come out of the budget (quoteLamports = budget / (1 +
-   *  s/100)), which leaves the band's share unbought. See the module header. */
+  /** Slippage PERCENT for the pool quote (the SDK's 0-100 unit), default
+   *  POOL_SLIPPAGE_PCT (20). The buy is EXACT-IN (lib/swap.ts): the whole
+   *  budget is spent and this band is a floor on the tokens received
+   *  (buy_exact_quote_in's min_base_amount_out), NOT headroom the wallet has
+   *  to fund, so a larger band never leaves SOL unbought. */
   slippagePct?: number;
 }
 
@@ -492,7 +507,8 @@ async function buyMigratedOne(
 export async function buySelectedWalletsMigrated(
   opts: BuyMigratedSelectedOptions
 ): Promise<ManualBatchResult> {
-  const { connection, mint, poolKey, wallets, slippagePct = 0 } = opts;
+  const { connection, mint, poolKey, wallets, slippagePct = POOL_SLIPPAGE_PCT } =
+    opts;
   if (wallets.length === 0) {
     return { completed: 0, failed: 0, skipped: 0, signatures: [] };
   }
@@ -528,10 +544,11 @@ export async function buySelectedWalletsMigrated(
 /* Migrated venue: the manual SELL on the graduated mint's pool        */
 /* ------------------------------------------------------------------ */
 
-/** The slippage band the manual Sell passes on the pool leg: the SAME 5 the
- *  Sell All button uses (lib/sell-all.ts default), never a UI knob. The engine
- *  itself refuses anything above MAX_SLIPPAGE_PCT. */
-export const MANUAL_POOL_SELL_SLIPPAGE_PCT = 5;
+/** The slippage band the manual Sell passes on the pool leg: POOL_SLIPPAGE_PCT
+ *  (20), the venue's band, which is also what Sell All's pool leg defaults to.
+ *  Never a UI knob. The engine itself refuses anything above
+ *  MAX_SLIPPAGE_PCT (25). */
+export const MANUAL_POOL_SELL_SLIPPAGE_PCT: number = POOL_SLIPPAGE_PCT;
 
 export interface SellMigratedSelectedOptions {
   connection: Connection;
@@ -544,7 +561,7 @@ export interface SellMigratedSelectedOptions {
   wallets: AutoWallet[];
   /** % of each wallet's OWN balance to sell, in (0, 100]. */
   sellPct: number;
-  /** Slippage band percent for the pool quote (default 5). */
+  /** Slippage band percent for the pool quote (default POOL_SLIPPAGE_PCT, 20). */
   slippagePct?: number;
 }
 

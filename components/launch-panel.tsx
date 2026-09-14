@@ -145,6 +145,7 @@ import {
 	type SellAllReport,
 	type SellOutcome,
 } from "../lib/sell-all";
+import { POOL_SLIPPAGE_PCT } from "../lib/swap";
 import { useToasts } from "./toast-stack";
 import {
 	Btn,
@@ -1383,7 +1384,11 @@ export function LaunchPanel({
 				connection,
 				mint: new PublicKey(mint),
 				wallets: roster.wallets,
-				slippagePct: 5,
+				// The venue band (20), NOT the old hardcoded 5: this is the single
+				// source of truth for the band on the curve leg's min_sol_output
+				// AND the PumpSwap leg's minQuoteAmountOut. Sell All used to pin 5
+				// here, which silently overrode the engine default.
+				slippagePct: POOL_SLIPPAGE_PCT,
 				submit,
 				foldedFloors: true,
 			});

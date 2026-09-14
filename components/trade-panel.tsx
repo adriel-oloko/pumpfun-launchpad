@@ -43,8 +43,17 @@
 //   - The roster (import, batch selection, balances) sits inside this card
 //     under the tabs exactly like v4.
 
-import { LAMPORTS_PER_SOL, PublicKey } from "@solana/web3.js";
-import { useEffect, useRef, useState } from "react";
+import {
+	LAMPORTS_PER_SOL,
+	PublicKey,
+	type Connection,
+} from "@solana/web3.js";
+import {
+	useEffect,
+	useRef,
+	useState,
+	type ClipboardEvent,
+} from "react";
 import {
 	autoVenueFor,
 	clampAutoCount,
@@ -81,6 +90,15 @@ import {
 	type DisperseResult,
 	type WithdrawOutcome,
 } from "../lib/disperse";
+import {
+	cascadeAmountText,
+	depositSol,
+	parseAmountList,
+	planDeposit,
+	type DepositAmountRow,
+	type DepositChunkOutcome,
+	type DepositPlan,
+} from "../lib/deposit";
 import { shortAddress } from "../lib/format";
 import { isValidPubkey } from "../lib/managed-wallets";
 import { canonicalMigratedPoolPda } from "../lib/migrate";
@@ -401,7 +419,10 @@ export function TradePanel({
 			if (graduated && side === "buy") {
 				// Curve closed: the mint trades on the canonical PumpSwap pool
 				// now, so this BUY MAX goes there. Same MAX budget rule (total
-				// balance down to the flat 0.002 SOL keep), zero slippage.
+				// balance down to the flat 0.002 SOL keep), spent IN FULL as an
+				// exact-in buy with a 20% floor on the tokens received
+				// (lib/swap.ts buy_exact_quote_in via buildMigratedBuyIxs),
+				// never a band the wallet has to fund.
 				result = await buySelectedWalletsMigrated({
 					connection,
 					mint: mintPk,
@@ -583,6 +604,79 @@ export function TradePanel({
 	const [distributeReport, setDistributeReport] =
 		useState<DistributeReport | null>(null);
 
+	// ---- M-DEPOSIT: manual exact-amount Deposit SOL (docs/DEPOSIT_WINDOW.md)
+	// The modal lists the WHOLE roster in order (hub first) and sends the hub's
+	// SOL to the rows whose typed amounts fit. planDeposit is PURE and is
+	// recomputed every render against the last LIVE reads (hub balance, account
+	// existence, rent floor) for the preview; the DEPOSIT click always re-reads
+	// all three and re-plans before it sends, so the preview never sends.
+	const [depositOpen, setDepositOpen] = useState(false);
+	const [depositRows, setDepositRows] = useState<string[]>([]);
+	const [depositBusy, setDepositBusy] = useState(false);
+	const [depositError, setDepositError] = useState<string | null>(null);
+	const [depositReport, setDepositReport] = useState<DistributeReport | null>(
+		null,
+	);
+	const [depositDropped, setDepositDropped] = useState(0);
+	const [hubLiveLamports, setHubLiveLamports] = useState<bigint | null>(null);
+	const [freshAddresses, setFreshAddresses] = useState<ReadonlySet<string>>(
+		new Set<string>(),
+	);
+	const [floor0Lamports, setFloor0Lamports] = useState<bigint | null>(null);
+
+	// Live preview (pure): parse every recipient row (index 0 is the HUB source
+	// and carries no amount), collect the non-blank/non-zero parseable rows,
+	// and plan against the last live reads. Advisory only.
+	const depositParsed: (bigint | null)[] = depositRows.map((text) =>
+		parseSolInput(text ?? ""),
+	);
+	const depositInvalid: boolean[] = [];
+	for (let i = 0; i < api.wallets.length; i++) {
+		depositInvalid.push(
+			i > 0 &&
+				(depositRows[i] ?? "").trim() !== "" &&
+				depositParsed[i] === null,
+		);
+	}
+	const depositCandidates: DepositAmountRow[] = [];
+	for (let i = 1; i < api.wallets.length; i++) {
+		const amount = depositParsed[i];
+		if (amount !== null && amount > BigInt(0)) {
+			depositCandidates.push({
+				address: api.wallets[i].address,
+				amountLamports: amount,
+			});
+		}
+	}
+	const depositPlan: DepositPlan | null =
+		depositOpen && hubLiveLamports !== null && floor0Lamports !== null
+			? planDeposit({
+					rows: depositCandidates,
+					hubLamports: hubLiveLamports,
+					freshAddresses,
+					floor0Lamports,
+				})
+			: null;
+	const depositCutSet = new Set<string>(
+		depositPlan ? depositPlan.cut.map((c) => c.address) : [],
+	);
+	const depositDefectMap = new Map<string, bigint>(
+		depositPlan
+			? depositPlan.defects.map(
+					(d) => [d.address, d.neededLamports] as [string, bigint],
+				)
+			: [],
+	);
+	const depositNeed = depositPlan
+		? depositPlan.totalLamports + depositPlan.feeLamports
+		: BigInt(0);
+	const depositAnyInvalid = depositInvalid.some(Boolean);
+	const depositReady =
+		depositPlan !== null &&
+		depositPlan.chunks.length > 0 &&
+		!depositAnyInvalid &&
+		!depositBusy;
+
 	const hub = api.wallets[0] ?? null;
 	const hubAddr = hub?.address ?? null;
 	// CHECKED wallets minus the hub: disperse recipients and delete candidates.
@@ -675,6 +769,191 @@ export function TradePanel({
 			});
 		} finally {
 			setDisperseBusy(false);
+		}
+	};
+
+	/** Reads the authoritative deposit inputs (hub balance, recipient account
+	 *  existence, live 0-byte rent floor) and stores them for the live preview.
+	 *  Never sends. readAccountInfos batches getMultipleAccountsInfo under its
+	 *  100-key cap. */
+	const refreshDepositPreview = async () => {
+		const addrs = api.wallets.map((w) => w.address);
+		if (addrs.length === 0) return;
+		try {
+			const connection = makeAppConnection();
+			const [hubBal, infos, floor] = await Promise.all([
+				connection.getBalance(new PublicKey(addrs[0]), "confirmed"),
+				readAccountInfos(connection, addrs),
+				connection.getMinimumBalanceForRentExemption(0, "confirmed"),
+			]);
+			setHubLiveLamports(BigInt(hubBal));
+			const fresh = new Set<string>();
+			addrs.forEach((a, i) => {
+				if (!infos[i]) fresh.add(a);
+			});
+			setFreshAddresses(fresh);
+			setFloor0Lamports(BigInt(floor));
+		} catch (e) {
+			const raw = e instanceof Error ? e.message : String(e);
+			setDepositError(`DEPOSIT PREVIEW FAILED: ${friendlyTxError(raw)}`);
+		}
+	};
+
+	/** Closes the deposit modal. A running deposit cannot be dismissed: its
+	 *  chunks are already in flight. */
+	const closeDepositModal = () => {
+		if (depositBusy) return;
+		setDepositOpen(false);
+	};
+
+	/** Opens the modal: blank every amount row, reset the report/error, then
+	 *  read the live inputs. */
+	const openDepositModal = () => {
+		setDepositRows(api.wallets.map(() => ""));
+		setDepositDropped(0);
+		setDepositError(null);
+		setDepositReport(null);
+		setDepositOpen(true);
+		void refreshDepositPreview();
+	};
+
+	/** One row's amount edit. A single amount (or an empty field) edits only
+	 *  that row; a list of two or more cascades down the rows below it. */
+	const onDepositRowChange = (index: number, value: string) => {
+		const tokens = parseAmountList(value);
+		if (tokens.length <= 1) {
+			setDepositRows((prev) => {
+				const next = prev.slice();
+				next[index] = tokens.length === 1 ? tokens[0] : "";
+				return next;
+			});
+			setDepositDropped(0);
+			return;
+		}
+		const res = cascadeAmountText(depositRows, index, value);
+		setDepositRows(res.rows);
+		setDepositDropped(res.droppedCount);
+	};
+
+	/** The paste cascade (spec 8.2). A single-line <input> applies the HTML
+	 *  value-sanitation algorithm, which STRIPS line breaks before onChange
+	 *  sees them, so a real multi-line clipboard paste is read HERE, where the
+	 *  clipboard text still carries its newlines. The onChange path stays for
+	 *  typed/pasted comma lists and single values. */
+	const onDepositRowPaste = (
+		index: number,
+		e: ClipboardEvent<HTMLInputElement>,
+	) => {
+		const text = e.clipboardData?.getData("text") ?? "";
+		if (parseAmountList(text).length <= 1) return;
+		e.preventDefault();
+		const res = cascadeAmountText(depositRows, index, text);
+		setDepositRows(res.rows);
+		setDepositDropped(res.droppedCount);
+	};
+
+	/** Runs the deposit. Re-reads hub balance, recipient account existence and
+	 *  the live rent floor, re-plans, and sends only the chunks that fit. The
+	 *  sub-floor defect rule lives ENTIRELY in planDeposit: nothing here turns
+	 *  a rent failure into a warning or a success. */
+	const handleDeposit = async () => {
+		if (depositBusy) return;
+		if (!hub) {
+			setDepositError("DEPOSIT FAILED: NO HUB (IMPORT A WALLET FIRST)");
+			return;
+		}
+		if (!hub.key) {
+			setDepositError(
+				"DEPOSIT FAILED: HUB HAS NO KEY (RE-ADD THE HUB SECRET IN THE ROSTER)",
+			);
+			return;
+		}
+		const hubKey = hub.key;
+		const rows: DepositAmountRow[] = [];
+		for (let i = 1; i < api.wallets.length; i++) {
+			const parsed = parseSolInput(depositRows[i] ?? "");
+			if (parsed === null) {
+				setDepositError(
+					`DEPOSIT FAILED: ROW AC-${i + 1} IS NOT A NUMBER`,
+				);
+				return;
+			}
+			if (parsed > BigInt(0)) {
+				rows.push({
+					address: api.wallets[i].address,
+					amountLamports: parsed,
+				});
+			}
+		}
+		if (rows.length === 0) {
+			setDepositError(
+				"DEPOSIT FAILED: NOTHING TO SEND (TYPE AN AMOUNT)",
+			);
+			return;
+		}
+		setDepositBusy(true);
+		setDepositError(null);
+		setDepositReport(null);
+		try {
+			const connection = makeAppConnection();
+			const [hubBal, infos, floor] = await Promise.all([
+				connection.getBalance(new PublicKey(hub.address), "confirmed"),
+				readAccountInfos(
+					connection,
+					rows.map((r) => r.address),
+				),
+				connection.getMinimumBalanceForRentExemption(0, "confirmed"),
+			]);
+			const fresh = new Set<string>();
+			rows.forEach((r, i) => {
+				if (!infos[i]) fresh.add(r.address);
+			});
+			const liveHub = BigInt(hubBal);
+			const liveFloor = BigInt(floor);
+			setHubLiveLamports(liveHub);
+			setFreshAddresses(fresh);
+			setFloor0Lamports(liveFloor);
+			const plan = planDeposit({
+				rows,
+				hubLamports: liveHub,
+				freshAddresses: fresh,
+				floor0Lamports: liveFloor,
+			});
+			if (plan.chunks.length === 0) {
+				setDepositError(
+					`DEPOSIT FAILED: NOTHING FITS (NEED ${formatSolLamports(plan.totalLamports + plan.feeLamports)} · HAVE ${formatSolLamports(liveHub)})`,
+				);
+				return;
+			}
+			const chunks = await depositSol({
+				connection,
+				hub: { address: hub.address, key: hubKey },
+				plan,
+				label: "deposit",
+			});
+			setDepositReport({
+				kind: "deposit",
+				plan,
+				chunks,
+				hub: hub.address,
+			});
+			api.refreshBalances();
+			pushToast({
+				action: "DEPOSITED",
+				amount: `${plan.funded.length} WALLET${plan.funded.length === 1 ? "" : "S"} · ${formatSolLamports(plan.totalLamports)}`,
+				txHash: chunks[0]?.signature,
+			});
+			void refreshDepositPreview();
+		} catch (e) {
+			const raw = e instanceof Error ? e.message : String(e);
+			setDepositError(`DEPOSIT FAILED: ${friendlyTxError(raw)}`);
+			pushToast({
+				action: "DEPOSIT FAILED",
+				amount: "TX REVERTED",
+				tone: "error",
+			});
+		} finally {
+			setDepositBusy(false);
 		}
 	};
 
@@ -1314,8 +1593,9 @@ export function TradePanel({
 								the buy's max_sol_cost IS the budget, so a price tick up
 								reverts cleanly, never an overdraw — or, when the mint has
 								GRADUATED (curve closed), on the canonical PumpSwap pool
-								with the same budget rule and zero slippage
-								(buySelectedWalletsMigrated). Sell sells sellPct% of
+								with the same budget rule and a 20% floor on the tokens
+								received (exact-in, so the whole budget is spent;
+								buySelectedWalletsMigrated). Sell sells sellPct% of
 								each wallet's own token balance on the curve, or the same
 								sellPct% of each wallet's balance on that pool once
 								graduated (sellSelectedWalletsMigrated, Sell All's
@@ -1694,6 +1974,16 @@ export function TradePanel({
 										{disperseMax || "0"} SOL
 									</Btn>
 									<Btn
+										onClick={() => openDepositModal()}
+										disabled={
+											depositBusy ||
+											autoRunning ||
+											api.wallets.length === 0
+										}
+										className="h-full shadow-none!">
+										Deposit
+									</Btn>
+									<Btn
 										invert
 										onClick={() => openWithdrawModal(false)}
 										disabled={
@@ -1852,6 +2142,138 @@ export function TradePanel({
 						</div>
 					</div>
 				) : null}
+
+				{/* M-DEPOSIT modal (docs/DEPOSIT_WINDOW.md): the WHOLE roster in
+        order, hub first; one exact amount per recipient row; the hub row is
+        the SOURCE and takes no amount. A multi-line paste cascades down the
+        rows below the row it landed in. The report stays inside the modal so
+        a second deposit is one click away. */}
+				{depositOpen && hub ? (
+					<div
+						role="dialog"
+						aria-modal="true"
+						aria-label="Deposit SOL to the managed wallets"
+						className="modal-overlay fixed inset-0 z-[100] flex items-center justify-center bg-ink/60 p-4"
+						onClick={closeDepositModal}>
+						<div
+							className="modal-card card-brutal relative w-full max-w-sm bg-paper p-4"
+							onClick={(e) => e.stopPropagation()}>
+							<button
+								type="button"
+								aria-label="Close deposit"
+								className="label-mono absolute right-2 top-2 p-1 text-[14px] opacity-60 hover:opacity-100"
+								onClick={closeDepositModal}>
+								×
+							</button>
+							<span className="label-mono block text-center !text-[13px]">
+								Deposit SOL
+							</span>
+							<p className="label-mono !text-[10px] opacity-60 break-all mt-1">
+								{api.wallets.length > 2
+									? `FROM HUB ${shortAddress(hub.address, 6)} — PASTE A LIST (ONE AMOUNT PER LINE) INTO AC-2 TO FILL AC-3, … LATER WALLETS ARE CUT IF HUB SOL CANNOT COVER THEM`
+									: `FROM HUB ${shortAddress(hub.address, 6)} — PASTE A LIST (ONE AMOUNT PER LINE). LATER WALLETS ARE CUT IF HUB SOL CANNOT COVER THEM`}
+							</p>
+							<div className="mt-3 flex max-h-[52vh] flex-col gap-2 overflow-y-auto pr-1">
+								{api.wallets.map((w, i) => {
+									const isHubRow = i === 0;
+									const label = isHubRow ? "HUB" : `AC-${i + 1}`;
+									const bal = api.balances.get(w.address)?.sol ?? null;
+									const balText =
+										bal === null
+											? "—"
+											: formatSolLamports(bal);
+									const right = isHubRow
+										? `${shortAddress(w.address, 4)} · SOURCE · ${balText}`
+										: `${shortAddress(w.address, 4)} · ${balText}`;
+									let verdict: string | null = null;
+									if (!isHubRow) {
+										if (depositInvalid[i]) {
+											verdict = "NOT A NUMBER";
+										} else if (
+											depositDefectMap.has(w.address)
+										) {
+											verdict = `NEEDS ${formatSolLamports(depositDefectMap.get(w.address) ?? BigInt(0))} TO CREATE`;
+										} else if (depositCutSet.has(w.address)) {
+											verdict = "CUT";
+										}
+									}
+									return (
+										<div key={w.address}>
+											<div className="flex w-full justify-between gap-2 label-mono">
+												<span>{label}</span>
+												<span className="opacity-60">
+													{right}
+												</span>
+											</div>
+											<Input
+												inputMode="decimal"
+												placeholder="0"
+												disabled={isHubRow}
+												aria-label={`Amount for ${label}`}
+												value={depositRows[i] ?? ""}
+												onChange={(e) =>
+													onDepositRowChange(
+														i,
+														e.target.value,
+													)
+												}
+												onPaste={(e) =>
+													onDepositRowPaste(i, e)
+												}
+												className="mt-1 font-mono text-[12px]"
+											/>
+											{verdict ? (
+												<span className="label-mono !text-[10px] font-bold">
+													{verdict}
+												</span>
+											) : null}
+										</div>
+									);
+								})}
+							</div>
+							<p className="label-mono !text-[10px] opacity-60 mt-2">
+								NEED {formatSolLamports(depositNeed)} · HAVE{" "}
+								{hubLiveLamports === null
+									? "—"
+									: formatSolLamports(hubLiveLamports)}{" "}
+								· FEE{" "}
+								{formatSolLamports(
+									depositPlan
+										? depositPlan.feeLamports
+										: BigInt(0),
+								)}{" "}
+								· {depositPlan ? depositPlan.funded.length : 0}{" "}
+								FUNDED · {depositPlan ? depositPlan.cut.length : 0} CUT
+							</p>
+							{depositDropped > 0 ? (
+								<p className="label-mono !text-[10px] opacity-60 mt-1">
+									{depositDropped} VALUES DROPPED (NO MORE ROWS)
+								</p>
+							) : null}
+							{depositError ? (
+								<StatusLine text={depositError} tone="error" />
+							) : null}
+							{depositReport ? (
+								<DistributeReportView report={depositReport} />
+							) : null}
+							<div className="mt-3 flex gap-2">
+								<Btn
+									invert
+									className="flex-1"
+									onClick={closeDepositModal}
+									disabled={depositBusy}>
+									Cancel
+								</Btn>
+								<Btn
+									className="flex-1"
+									onClick={() => void handleDeposit()}
+									disabled={!depositReady}>
+									{depositBusy ? "Depositing..." : "Deposit"}
+								</Btn>
+							</div>
+						</div>
+					</div>
+				) : null}
 			</div>
 		</Card>
 	);
@@ -1929,7 +2351,13 @@ type DistributeReport =
 			/** true = Withdraw All (every keyed wallet, drained to 0/closed). */
 			all: boolean;
 	  }
-	| { kind: "delete"; removed: number; skipped: number; deleted: string[] };
+	| { kind: "delete"; removed: number; skipped: number; deleted: string[] }
+	| {
+			kind: "deposit";
+			plan: DepositPlan;
+			chunks: DepositChunkOutcome[];
+			hub: string;
+	  };
 
 /** SOL amount input parse (Disperse MIN/MAX): a blank field is 0; a
  *  non-numeric or negative value is invalid (null). Converts the decimal
@@ -1940,9 +2368,64 @@ function parseSolInput(raw: string): bigint | null {
 	return BigInt(Math.round(n * LAMPORTS_PER_SOL));
 }
 
+/** Batched getMultipleAccountsInfo (the RPC caps at 100 keys per call): one
+ *  entry per address, in order; a null entry means the account does not exist
+ *  on-chain. Used by the deposit preview/click for the fresh-account gate. */
+type AccountInfos = Awaited<
+	ReturnType<Connection["getMultipleAccountsInfo"]>
+>;
+async function readAccountInfos(
+	connection: Connection,
+	addresses: string[],
+): Promise<AccountInfos> {
+	const out: AccountInfos = [];
+	for (let i = 0; i < addresses.length; i += 100) {
+		const batch = addresses
+			.slice(i, i + 100)
+			.map((a) => new PublicKey(a));
+		const infos = await connection.getMultipleAccountsInfo(
+			batch,
+			"confirmed",
+		);
+		out.push(...infos);
+	}
+	return out;
+}
+
 /** Compact per-action report: headline counts + per-wallet rows for
  *  withdraw, signature + total for disperse, removed list for delete. */
 function DistributeReportView({ report }: { report: DistributeReport }) {
+	if (report.kind === "deposit") {
+		const { plan, chunks, hub } = report;
+		return (
+			<div className="reveal-up flex flex-col gap-1 border-2 border-ink px-2 py-1.5">
+				<p className="label-mono !text-[11px] font-bold break-all">
+					DEPOSITED {plan.funded.length} WALLET
+					{plan.funded.length === 1 ? "" : "S"} ·{" "}
+					{formatSolLamports(plan.totalLamports)} FROM HUB{" "}
+					{shortAddress(hub, 6)}
+				</p>
+				{chunks.map((c) => (
+					<p
+						key={c.signature}
+						className="label-mono !text-[10px] break-all opacity-90">
+						{c.count} TRANSFERS · {formatSolLamports(c.totalLamports)} ·{" "}
+						<ExplorerLink hash={c.signature} />
+					</p>
+				))}
+				{plan.cut.length > 0 ? (
+					<p className="label-mono !text-[10px] opacity-90">
+						CUT {plan.cut.length}
+					</p>
+				) : null}
+				{plan.defects.length > 0 ? (
+					<p className="label-mono !text-[10px] opacity-90">
+						NEEDS FLOOR {plan.defects.length}
+					</p>
+				) : null}
+			</div>
+		);
+	}
 	if (report.kind === "disperse") {
 		const { result, hub } = report;
 		return (

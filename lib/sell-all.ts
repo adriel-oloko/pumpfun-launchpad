@@ -65,7 +65,11 @@ import {
   lookupMigratedPool,
   sendRawWithRetry,
 } from "./migrate";
-import { sellMigratedPool, poolPercentFloor } from "./swap";
+import {
+  POOL_SLIPPAGE_PCT,
+  poolPercentFloor,
+  sellMigratedPool,
+} from "./swap";
 import { friendlyTxError, isSlippageRevert } from "./tx-errors";
 import { OnlinePumpAmmSdk, PUMP_AMM_PROGRAM_ID, PumpAmmSdk } from "@pump-fun/pump-swap-sdk";
 import { foldCurveSells, foldPoolSells, type SellSequenceStep } from "./sell-fold";
@@ -159,9 +163,10 @@ export interface SellAllOptions {
   mint: PublicKey;
   /** The managed roster; keyed wallets are sold, watch-only skipped. */
   wallets: SellableWallet[];
-  /** Slippage percent for the quotes (default 5), applied to the curve
-   *  leg's min_sol_output AND passed to the PumpSwap SDK's sell leg. Values
-   *  above MAX_SLIPPAGE_PCT are rejected outright rather than clamped. */
+  /** Slippage percent for the quotes (default POOL_SLIPPAGE_PCT, 20),
+   *  applied to the curve leg's min_sol_output AND passed to the PumpSwap
+   *  SDK's sell leg. Values above MAX_SLIPPAGE_PCT are rejected outright
+   *  rather than clamped. */
   slippagePct?: number;
   /** Share of each wallet's OWN balance to sell, percent in (0, 100]. Default
    *  100 = the whole bag (the sell-all contract). A partial sell is sized from
@@ -695,12 +700,13 @@ export async function sellOneWalletOnPool(opts: {
   wallet: Keypair;
   /** Share of the wallet's own balance to sell, percent in (0, 100]. */
   sellPct: number;
-  /** Slippage band percent (default 5, the band the Sell All button passes). */
+  /** Slippage band percent (default POOL_SLIPPAGE_PCT, 20: the venue band the
+   *  Sell All button passes). */
   slippagePct?: number;
   /** STAGE 2 folded floor (lamports), first attempt only. */
   minOutLamports?: bigint;
 }): Promise<SellOutcome> {
-  const slippagePct = opts.slippagePct ?? 5;
+  const slippagePct = opts.slippagePct ?? POOL_SLIPPAGE_PCT;
   if (
     !Number.isFinite(slippagePct) ||
     slippagePct < 0 ||
@@ -746,7 +752,7 @@ export async function sellAllManagedWallets(
   // (at 100 the min floor is 0, removing the only defence against an adverse
   // fill and converting a loud revert into a silent bad fill). Values above
   // MAX_SLIPPAGE_PCT are refused, never clamped.
-  const slippagePct = opts.slippagePct ?? 5;
+  const slippagePct = opts.slippagePct ?? POOL_SLIPPAGE_PCT;
   if (
     !Number.isFinite(slippagePct) ||
     slippagePct < 0 ||

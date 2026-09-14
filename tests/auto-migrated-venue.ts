@@ -9,12 +9,14 @@
 //      PDA after it (the same derivation every other surface uses).
 //   2. `poolSpendableForBuy` keeps the curve worker's rule (rent floor + tx fee
 //      reserve) and reserves ONLY the accounts the buy tx actually creates.
-//   3. `poolBuyCommitLamports` applies min(buyPct%, spendable / 1.10), so the
-//      default 95% is always capped by the slippage band.
-//   4. THE INVARIANT: the SDK wraps `commit * (1 + 10%)` as WSOL, and that wrap
-//      must never exceed the spendable base. At 95% the headroom is exactly 1
-//      lamport (integer flooring on both sides) — this is what makes the pool
-//      buy landable on a wallet sized down to its keep.
+//   3. `poolBuyCommitLamports` commits buyPct% of the spendable base with NO
+//      slippage cap: the pool buy is EXACT-IN (buy_exact_quote_in, lib/swap.ts
+//      since 2026-09-14), so the WSOL the tx wraps IS the commit and the band
+//      is a floor on the tokens received, not headroom on top of the price.
+//   4. THE INVARIANT: that wrapped figure never exceeds the spendable base, at
+//      100% it IS the spendable base (the old `spendable / 1.10` cap left ~9%
+//      of a full-spend round unspent), which is what makes the pool buy
+//      landable on a wallet sized down to its keep.
 //   5. `pctTokens` is the auto-sell's %-of-live-balance seam (100% == the whole
 //      bag exactly; a % that floors to zero raw units is a skip, not a zero
 //      sell).
@@ -34,7 +36,6 @@ import {
   fireAutoBuyPool,
   fireAutoSellPool,
   poolBuyCommitLamports,
-  poolBuyWrapLamports,
   poolSpendableForBuy,
   type AutoCurveInfo,
 } from "../lib/auto";
@@ -133,11 +134,32 @@ describe("poolSpendableForBuy (the pool buy's spendable base)", () => {
   });
 });
 
-describe("poolBuyCommitLamports (min(buyPct%, spendable / 1.10))", () => {
-  it("at the default 95% the slippage cap binds", () => {
+describe("poolBuyCommitLamports (buyPct% of spendable, no slippage cap)", () => {
+  it("at the default 95% the commit is 95% of spendable, not a 1/1.10 cap", () => {
     const spendable = BigInt(50_000_000);
-    const cap = (spendable * BigInt(10_000)) / BigInt(11_000);
-    expect(poolBuyCommitLamports(spendable)).to.equal(cap);
+    const commit = poolBuyCommitLamports(spendable);
+    expect(commit).to.equal((spendable * BigInt(9_500)) / BigInt(10_000));
+    expect(commit > (spendable * BigInt(10_000)) / BigInt(11_000)).to.equal(
+      true
+    );
+    expect(commit <= spendable).to.equal(true);
+  });
+
+  it("at 100% the commit IS the whole spendable: exact-in needs no headroom", () => {
+    const spendables = [
+      BigInt(5_000_000), // 0.005 SOL
+      BigInt(10_000_000), // 0.01 SOL
+      BigInt(50_000_000), // 0.05 SOL
+      BigInt(100_000_000), // 0.10 SOL
+      BigInt(1_000_000_000), // 1 SOL
+    ];
+    for (const spendable of spendables) {
+      const commit = poolBuyCommitLamports(spendable, 100);
+      // The WSOL the tx wraps IS this figure (the SDK wraps the buy's
+      // maxQuoteIn, which lib/swap.ts hands in as the exact spend), so it has
+      // to fit the spendable base with no band on top of it.
+      expect(commit, `commit at ${spendable}`).to.equal(spendable);
+    }
   });
 
   it("at a low pct the percentage binds instead", () => {
@@ -150,34 +172,6 @@ describe("poolBuyCommitLamports (min(buyPct%, spendable / 1.10))", () => {
   it("returns 0 for a zero/negative spendable", () => {
     expect(poolBuyCommitLamports(BigInt(0))).to.equal(BigInt(0));
     expect(poolBuyCommitLamports(BigInt(-5))).to.equal(BigInt(0));
-  });
-});
-
-describe("poolBuyWrapLamports (the invariant the pool buy depends on)", () => {
-  it("the wrap never exceeds spendable and headroom is exactly 1 lamport at 95%", () => {
-    const spendables = [
-      BigInt(5_000_000), // 0.005 SOL
-      BigInt(10_000_000), // 0.01 SOL
-      BigInt(50_000_000), // 0.05 SOL
-      BigInt(100_000_000), // 0.10 SOL
-      BigInt(1_000_000_000), // 1 SOL
-    ];
-    for (const spendable of spendables) {
-      const commit = poolBuyCommitLamports(spendable);
-      const wrap = poolBuyWrapLamports(commit, 10);
-      expect(wrap <= spendable, `wrap ${wrap} > spendable ${spendable}`).to.equal(
-        true
-      );
-      expect(spendable - wrap, `headroom at ${spendable}`).to.equal(BigInt(1));
-    }
-  });
-
-  it("a low pct leaves the full slippage band unbought (wrap stays under spendable)", () => {
-    const spendable = BigInt(100_000_000);
-    const commit = poolBuyCommitLamports(spendable, 50);
-    const wrap = poolBuyWrapLamports(commit, 10);
-    expect(wrap).to.equal((spendable / BigInt(2)) * BigInt(11) / BigInt(10));
-    expect(wrap < spendable).to.equal(true);
   });
 });
 

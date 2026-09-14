@@ -59,6 +59,14 @@ export const VIRTUAL_TOKEN_RESERVE: bigint = BigInt(1_073_000_000_000_000);
  *  Unit: basis points (1% = 100 bps, 100% = 10_000 bps). Value: 100 (1%). */
 export const FEE_BPS: bigint = BigInt(100);
 
+/** Slippage band the SELL side of a curve trade carries: `min_sol_output`
+ *  sits this far below the net quote, and on the migrated venue
+ *  sellMigratedPool's percent floor uses the same figure. A sell band costs
+ *  nothing (it is a floor, not headroom): it only refuses a fill that has
+ *  collapsed past it. Unit: basis points. Value: 2000 (20%), the operator's
+ *  standing band for this client. */
+export const SELL_SLIPPAGE_BPS: bigint = BigInt(2000);
+
 /** SOL dust threshold that gates managed-wallet deletion: a wallet whose SOL
  *  balance is below this is treated as empty and can be removed (per-row x or
  *  batch delete). Mirrors v4's 0.0001 ETH dust floor. Unit: lamports. Value:

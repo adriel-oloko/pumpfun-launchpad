@@ -70,3 +70,11 @@ pastes/
 *STAGE*
 *PLAN-*
 *MIGRATION*
+
+# Working docs: prompts, specs, reports, proof/audit artifacts. UNCOMMITTED by
+# design. Never rename or re-slot a doc to slip past these patterns - a doc that
+# dodges the globs is a bug, not a loophole. Hand over the UNC path instead
+# (\\wsl.localhost\Ubuntu\home\adriel\...). To publish one deliberately, negate
+# it here and commit it.
+docs/*.md
+*_PROOF.md

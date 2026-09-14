@@ -41,7 +41,11 @@
 //     the scheduler routes the round to the canonical PumpSwap pool instead
 //     (autoVenueFor + fireAutoBuyPool / fireAutoSellPool). The venue is chosen
 //     from the SAME curve read the scheduler already does; `complete` = 1 means
-//     the pool. The bot never stops on graduation.
+//     the pool. The bot never stops on graduation. The pool rounds trade at the
+//     venue band (POOL_AUTO_SLIPPAGE_PCT = POOL_SLIPPAGE_PCT, 20), and the pool
+//     BUY goes out EXACT-IN, so the band is a floor on the tokens received and
+//     costs no spendable headroom (the commit is buyPct% of spendable, full
+//     stop).
 //
 // The venue gate lives in the scheduler (components/trade-panel.tsx): before
 // each round it fetches the curve state and derives the venue. This module
@@ -88,7 +92,7 @@ import {
   type PumpCurveState,
 } from "./pump";
 import { sellOneWalletOnPool } from "./sell-all";
-import { buyMigratedPool } from "./swap";
+import { buyMigratedPool, POOL_SLIPPAGE_PCT } from "./swap";
 
 /** % of a wallet's spendable SOL balance bought per auto-buy round (v4's
  *  buyPct default). Configurable knob; no UI field exists for it in the AUTO
@@ -113,9 +117,11 @@ export const AUTO_TX_FEE_RESERVE_LAMPORTS: bigint = BigInt(10_000);
 export const AUTO_SWEEP_FEE_RESERVE_LAMPORTS: bigint = BigInt(10_000);
 
 /** Slippage PERCENT (the PumpSwap SDK's 0-100 unit) the auto pool rounds pass:
- *  the bot's existing PUMP_DEFAULT_SLIPPAGE_BPS (1000 bps = 10%), so both
- *  venues tolerate the same adverse move. */
-export const POOL_AUTO_SLIPPAGE_PCT: number = 10;
+ *  the venue band, POOL_SLIPPAGE_PCT (20), so the bot tolerates the same
+ *  adverse move the manual Buy MAX / Sell do. On the buy it is a floor on the
+ *  tokens received (the bot's pool buy is exact-in, lib/swap.ts), so it needs
+ *  no wrap headroom out of the spendable base. */
+export const POOL_AUTO_SLIPPAGE_PCT: number = POOL_SLIPPAGE_PCT;
 
 /** A live roster balance for the picker. Matches the shape useRoster keeps. */
 export interface AutoWalletBalance {
@@ -214,31 +220,19 @@ export function poolSpendableForBuy(opts: {
   return spendable > BigInt(0) ? spendable : BigInt(0);
 }
 
-/** The amount the buy commits: min(buyPct% of spendable, spendable / 1.10).
- *  Pure. The cap is the curve worker's `capBuySolForSlippage` (the pool buy
- *  commits `commit * (1 + slippage/100)` as WSOL, so the commit must leave the
- *  10% band headroom). */
+/** The amount the pool buy commits: buyPct% of spendable (AUTO_BUY_PCT, 95).
+ *  Pure. NO slippage cap since 2026-09-14: the pool buy goes out EXACT-IN
+ *  (buy_exact_quote_in, lib/swap.ts), so the WSOL the tx wraps is the commit
+ *  itself and the band is only a floor on the tokens received. (The old
+ *  `capBuySolForSlippage` cap existed because the SDK's plain `buy` wrapped
+ *  `commit * (1 + s/100)`; it left ~9% of a full-spend round unspent.) */
 export function poolBuyCommitLamports(
   spendableLamports: bigint,
   buyPct?: number
 ): bigint {
   if (spendableLamports <= BigInt(0)) return BigInt(0);
   const pctNum = Math.round((buyPct ?? AUTO_BUY_PCT) * 100);
-  const raw = (spendableLamports * BigInt(pctNum)) / BigInt(10_000);
-  const maxCommit = capBuySolForSlippage(spendableLamports);
-  return raw > maxCommit ? maxCommit : raw;
-}
-
-/** The invariant the pool buy depends on: the SDK wraps
- *  `commit * (1 + slippagePct/100)` as WSOL, and that must never exceed the
- *  spendable base. Pure, exported so the offline test pins it. Reproduces the
- *  SDK's `maxQuote = quote * floor((1 + s/100) * 1e9) / 1e9`. */
-export function poolBuyWrapLamports(
-  commitLamports: bigint,
-  slippagePct: number
-): bigint {
-  const factor = BigInt(Math.floor((1 + slippagePct / 100) * 1e9));
-  return (commitLamports * factor) / BigInt(1_000_000_000);
+  return (spendableLamports * BigInt(pctNum)) / BigInt(10_000);
 }
 
 /* ------------------------------------------------------------------ */
